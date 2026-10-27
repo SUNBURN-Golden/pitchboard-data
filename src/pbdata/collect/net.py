@@ -134,7 +134,7 @@ class Fetcher:
         self.infra.execute("UPDATE host_state SET last_request_at=? WHERE host=?", (self.clock(), host))
 
     # ---- robots ---------------------------------------------------------
-    def _raw_get(self, url: str, accept: str, max_bytes: int, timeout: float = 20.0):
+    def _raw_get(self, url: str, accept: str, max_bytes: int, timeout: float = 10.0):
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": accept, "Accept-Language": "en,ko;q=0.8"})
         self.requests += 1
         try:

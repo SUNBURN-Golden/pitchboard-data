@@ -22,7 +22,8 @@ from .wiki import Api
 
 EXCLUDE_HOSTS = ("wikipedia.org", "wikimedia.org", "wikidata.org", "archive.org", "web.archive.org", "doi.org", "books.google", "amazon.", "worldcat.org",
                  "jstor.org", "ebscohost", "proquest", "facebook.com", "twitter.com", "x.com", "instagram.com", "youtube.com", "goo.gl", "bit.ly",
-                 "lyellcollection", "sciencedirect", "springer", "wiley.com", "tandfonline", "cambridge.org", "oup.com", "nih.gov", "ncbi.", "oclc.org", "isbndb")
+                 "lyellcollection", "sciencedirect", "springer", "wiley.com", "tandfonline", "cambridge.org", "oup.com", "nih.gov", "ncbi.", "oclc.org", "isbndb",
+                 "nla.gov.au", "hathitrust", "chadwyck", "revealdigital", "informit", "elsevier.com", "catalog.", "library.", "libraries.", "loc.gov", "bl.uk", "orgs.", "dbpia", "kyobobook", "yes24", "aladin", "naver.com", "daum.net", "google.", "bing.com", "linkedin.com")
 WIKI_ORIGIN_CLASS = {"literary magazine": "Q1368848", "book publisher": "Q1320047", "literary award": "Q378427"}  # verified via wbsearchentities 2026-10-27
 
 

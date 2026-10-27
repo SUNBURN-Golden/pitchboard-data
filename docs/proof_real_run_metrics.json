@@ -1,0 +1,140 @@
+{
+ "target_lists": [
+  "kr-ko-lit",
+  "us-en-lit",
+  "gb-en-lit",
+  "ca-au-en-lit"
+ ],
+ "per_target": {
+  "kr-ko-lit": {
+   "candidates": 64,
+   "by_state": {
+    "deprioritized": 21,
+    "manual_lead": 8,
+    "new": 28,
+    "registered": 4,
+    "rejected": 3
+   },
+   "new_sources_registered": 4,
+   "new_valid_sources": 1
+  },
+  "us-en-lit": {
+   "candidates": 64,
+   "by_state": {
+    "deprioritized": 31,
+    "manual_lead": 4,
+    "new": 21,
+    "registered": 2,
+    "registered_existing": 1,
+    "rejected": 5
+   },
+   "new_sources_registered": 2,
+   "new_valid_sources": 1
+  },
+  "gb-en-lit": {
+   "candidates": 70,
+   "by_state": {
+    "deprioritized": 14,
+    "manual_lead": 10,
+    "new": 35,
+    "registered": 4,
+    "registered_existing": 3,
+    "rejected": 4
+   },
+   "new_sources_registered": 4,
+   "new_valid_sources": 3
+  },
+  "ca-au-en-lit": {
+   "candidates": 60,
+   "by_state": {
+    "deprioritized": 13,
+    "new": 35,
+    "registered_existing": 8,
+    "rejected": 4
+   },
+   "new_sources_registered": 0,
+   "new_valid_sources": 0
+  }
+ },
+ "new_valid_sources_total": 5,
+ "new_sources_registered_total": 10,
+ "evaluation_precision_registered_over_evaluated": 0.095,
+ "new_outlets": 10,
+ "new_call_editions": 0,
+ "required_field_cells": {
+  "stated": 4,
+  "explicitly_none": 1,
+  "not_stated_in_inspected_scope": 23,
+  "empty": 22
+ },
+ "required_field_coverage_known": 0.1,
+ "required_field_coverage_classified": 0.56,
+ "per_predicate": {
+  "fee.submission": {
+   "stated": 0,
+   "explicitly_none": 1,
+   "not_stated_in_inspected_scope": 6,
+   "empty": 3
+  },
+  "compensation.rate": {
+   "stated": 2,
+   "explicitly_none": 0,
+   "not_stated_in_inspected_scope": 4,
+   "empty": 4
+  },
+  "rights.simultaneous": {
+   "stated": 1,
+   "explicitly_none": 0,
+   "not_stated_in_inspected_scope": 5,
+   "empty": 4
+  },
+  "policy.ai": {
+   "stated": 1,
+   "explicitly_none": 0,
+   "not_stated_in_inspected_scope": 4,
+   "empty": 5
+  },
+  "eligibility.region": {
+   "stated": 0,
+   "explicitly_none": 0,
+   "not_stated_in_inspected_scope": 4,
+   "empty": 6
+  }
+ },
+ "gaps": {
+  "by_state": {
+   "filled": 5,
+   "open": 65
+  },
+  "open_by_class": {
+   "absent_in_source": 18,
+   "not_extracted": 47
+  },
+  "total": 70,
+  "resolution_rate_filled": 0.071,
+  "resolution_rate_filled_or_classified": 0.071,
+  "filled_by_gap_fill_search": 0
+ },
+ "change_latency_s": {
+  "n": 0,
+  "max": null,
+  "avg": null,
+  "detection_bound_hours": "refresh_hours=24 per source (freshness budget)"
+ },
+ "cost": {
+  "verified_facts": 4,
+  "stated_facts": 7,
+  "raw_fetches_logged": 110,
+  "network_requests_ledger": 559,
+  "model_cost_usd": 0.0,
+  "requests_per_verified_fact": 139.75,
+  "requests_per_stated_fact": 79.86
+ },
+ "alerts": {
+  "denied_robots": 5
+ },
+ "jobs": {
+  "done": 355,
+  "pending": 122
+ }
+}

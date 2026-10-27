@@ -72,10 +72,11 @@ def h_discover(ctx: Ctx, p: dict, job) -> dict:
     ids = discover.add_candidates(ctx.svc, cands, t["id"], now, ctx.budget, depth=p.get("depth", 0))
     # candidates are ranked by prior relevance; the first N per run are evaluated (relevance/depth/request budgets)
     for cid in ids:
-        prior = ctx.svc.execute("SELECT prior_relevance, host FROM pb_discovery_candidate WHERE cand_id=?", (cid,)).fetchone()
+        prior = ctx.svc.execute("SELECT prior_relevance, host, label FROM pb_discovery_candidate WHERE cand_id=?", (cid,)).fetchone()
         dup = 1.0 if store.is_seed(prior["host"]) else 0.0
+        lit = 0.25 if prof.LIT_EN.search(prior["host"] + " " + (prior["label"] or "")) or prof.LIT_KO.search(prior["label"] or "") else 0.0
         scheduler.enqueue(ctx.infra, "evaluate", "discovery", {"cand_id": cid}, "evaluate|%s|%s" % (cid, ctx.run_tag),
-                          scheduler.priority(novelty=1.0 - dup, quality=prior["prior_relevance"], cost=0.4, duplication=dup), now, depth=p.get("depth", 0))
+                          scheduler.priority(novelty=1.0 - dup, quality=min(1.0, prior["prior_relevance"] + lit), cost=0.4, duplication=dup), now, depth=p.get("depth", 0))
     ctx.bump("candidates_found", len(cands))
     ctx.bump("candidates_new", len(ids))
     return {"found": len(cands), "new": len(ids), "api_calls": ctx.api.calls}

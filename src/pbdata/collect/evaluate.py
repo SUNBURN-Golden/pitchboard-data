@@ -16,7 +16,8 @@ from . import parse, store
 from .net import FetchResult, Fetcher, normalize_url, origin_of, registered_domain
 
 TRIAL_PAGES = 4
-MIN_RELEVANCE = 0.35
+MIN_RELEVANCE = 0.4
+STRONG_FIELDS = set(prof.REQUIRED) - {"status.declared"}
 
 
 @dataclasses.dataclass
@@ -57,18 +58,23 @@ def trial_crawl(svc: sqlite3.Connection, fetcher: Fetcher, cand: sqlite3.Row, ta
         scores.update(novelty=0.0, duplicate="registered_domain")
         return done("registered_existing", "domain_already_registered")
     entry = normalize_url(cand["url"])
-    first = fetcher.fetch(entry, now_iso=now)
-    if first.outcome == "error" and entry.startswith("http://"):          # plain http unreachable -> upgrade to https (never downgrade)
+    if entry.startswith("http://"):                                        # prefer https; fall back to the given http URL only if https is unusable
         up = "https://" + entry[len("http://"):]
-        alt = fetcher.fetch(up, now_iso=now)
-        if alt.outcome != "error":
-            entry, first = up, alt
+        first = fetcher.fetch(up, now_iso=now)
+        if first.outcome == "ok" or first.outcome.startswith("denied"):
+            entry = up
+        else:
+            alt = fetcher.fetch(entry, now_iso=now)
+            first = alt if alt.outcome == "ok" or first.outcome == "error" else first
+            entry = entry if first is alt else up
+    else:
+        first = fetcher.fetch(entry, now_iso=now)
     pages[entry] = first
     if first.outcome in ("denied_robots", "denied_http", "blocked_network"):
         scores.update(permitted=False, fail=first.outcome)
         return done("rejected", "not_permitted:" + first.outcome + ":" + first.error_class)
     if first.outcome != "ok":
-        scores.update(permitted=True, fail=first.outcome)
+        scores.update(permitted=True, fail=first.outcome, error_class=first.error_class)
         return done("deprioritized", "entry_unusable:" + first.outcome)
     scores["permitted"] = True
     doc = parse.parse_html(first.body, first.final_url) if first.content_type.startswith(("text/html", "application/xhtml")) else None
@@ -110,8 +116,8 @@ def trial_crawl(svc: sqlite3.Connection, fetcher: Fetcher, cand: sqlite3.Row, ta
         return done("deprioritized", "repost_or_aggregator")
     if relevance < MIN_RELEVANCE:
         return done("deprioritized", "low_relevance")
-    if not core and not call_seen:
-        if relevance >= 0.5:
+    if not (core & STRONG_FIELDS) and not call_seen:
+        if relevance >= 0.5 and not core:
             return done("registered", "relevant_pending_site_expansion")
         return done("deprioritized", "not_extractable_no_call_or_fields")
     return done("registered", "ok")
