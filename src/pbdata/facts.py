@@ -229,4 +229,4 @@ def fact_history(conn: sqlite3.Connection, subject_id: str, predicate: str, scop
     if scope_ref:
         sql += " AND scope_ref=?"
         args.append(scope_ref)
-    return conn.execute(sql + " ORDER BY recorded_at, fact_id", args).fetchall()
+    return conn.execute(sql + " ORDER BY rowid", args).fetchall()
