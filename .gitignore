@@ -1,0 +1,22 @@
+# Data lives OUTSIDE this repo (PB_DATA_ROOT, default /workspace/pitchboard/data-root). Never commit:
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+data-root/
+rawstore/
+backups/
+snapshots/
+exports/
+.recovery/
+*.log
+*.pid
+*.lock
+.env
+.env.*
+*.pem
+*.key
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
