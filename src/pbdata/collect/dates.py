@@ -25,6 +25,10 @@ PATTERNS = [
 ]
 # end-of-range pieces that inherit the start's year: "~ 10. 31." / "~ 10월 31일" / "- November 15"
 RANGE_TAIL_KO = re.compile(r"[~∼–\-]\s*(?:(\d{1,2})\s*[./월]\s*(\d{1,2})\s*(?:일|\.)?)")
+# "2026. 9. 14.(월) 10:00 ~ 10. 16.(금)": the start may carry a weekday and a 24h time before the range separator
+RANGE_TAIL = re.compile(r"^(?:[\s.)(월화수목금토일a-zA-Z가-힣]|(?<!\d)\d{1,2}:\d{2}(?::\d{2})?(?!\d)){0,14}?[~∼–\-]\s*(\d{1,2})\s*[./월]\s*(\d{1,2})\s*(?:일|\.)?")
+# 24h clock ("18:00까지", "23:59:59 (KST)"); only read when no am/pm time is present
+TIME24_RE = re.compile(r"(?<![\d:.])([01]?\d|2[0-3]):([0-5]\d)(?::[0-5]\d)?(?![\d:])")
 TIME_RE = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)\b(?:\s*\(?(%s)\)?)?" % "|".join(TZ_ABBR), re.I)
 TZ_RE = re.compile(r"\b(%s)\b" % "|".join(TZ_ABBR))
 
@@ -68,16 +72,23 @@ def find_dates(text: str) -> List[DateHit]:
     # range tail without year ("2026.10.1 ~ 10.31")
     extra: List[DateHit] = []
     for h in hits:
-        tail = re.compile(r"^[\s.)(월화수목금토일a-zA-Z가-힣]{0,12}?[~∼–\-]\s*(\d{1,2})\s*[./월]\s*(\d{1,2})\s*(?:일|\.)?").match(text[h.end:h.end + 40])
+        tail = RANGE_TAIL.match(text[h.end:h.end + 50])
         if tail and not any(a.start == h.end + tail.start(1) for a in hits):
             iso = _mk(h.iso[:4], tail.group(1), tail.group(2))
             if iso and iso >= h.iso:
-                extra.append(DateHit(iso, h.end, h.end + tail.end(), year_explicit=False))
+                extra.append(DateHit(iso, h.end + tail.start(1), h.end + tail.end(), year_explicit=False))
     hits.extend(extra)
     hits.sort(key=lambda h: h.start)
-    for h in hits:
+    for i, h in enumerate(hits):
         window = text[h.end:h.end + 60]
         t = TIME_RE.search(window)
+        if t is None:
+            # a 24h time belongs to this date only if it comes before the next date / range separator
+            nxt = hits[i + 1].start - h.end if i + 1 < len(hits) else len(window)
+            stop = min([nxt] + [k for k in (window.find("~"), window.find("∼"), window.find("–")) if k >= 0])
+            t24 = TIME24_RE.search(window[:max(0, stop)])
+            if t24:
+                h.time = "%02d:%02d" % (int(t24.group(1)), int(t24.group(2)))
         if t:
             hh, mm, ap = int(t.group(1)), int(t.group(2) or 0), t.group(3).lower().replace(".", "")
             if 1 <= hh <= 12:

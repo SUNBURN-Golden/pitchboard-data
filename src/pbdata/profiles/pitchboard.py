@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 from ..collect.dates import find_dates
 from ..collect.parse import Doc, Link, Segment
 
-EXTRACTOR_VERSION = "pb-rules-1"
+EXTRACTOR_VERSION = "pb-rules-2"   # 2: Korean application-period cues, range start with 24h time, HH:MM times
 LABELER_VERSION = "pb-labels-1"
 OCR_EXTRACTOR = "ocr:tesseract+rules"
 
@@ -59,7 +59,9 @@ STANDING_RE = re.compile(r"(rolling (basis|submissions?|deadline)|year[- ]round|
 OPEN_RE = re.compile(r"(submissions? (are |is )?(now |currently )?open|(now|currently) (accepting|open)|open for submissions|접수\s*중|모집\s*중|현재\s*접수)", re.I)
 CLOSED_RE = re.compile(r"(submissions? (are |is )?(now |currently )?closed|closed to submissions|not (currently )?(accepting|open to) (new )?(submissions?|pitches)|접수\s*마감|모집\s*마감|마감되었|접수\s*종료)", re.I)
 
-DEADLINE_CUE = re.compile(r"(deadline|closes?|closing|due( date| by)?|submit by|submissions? (until|through|by)|no later than|apply by|until|through|(?:submission|entry|entries|application|reading)\s+(?:period|window)|마감|접수\s*기간|모집\s*기간|응모\s*기간|공모\s*기간|투고\s*기간|접수\s*일정|까지|기한)", re.I)
+DEADLINE_CUE = re.compile(r"(deadline|closes?|closing|due( date| by)?|submit by|submissions? (until|through|by)|no later than|apply by|until|through|(?:submission|entry|entries|application|reading)\s+(?:period|window)|마감|접수\s*기간|모집\s*기간|응모\s*기간|공모\s*기간|투고\s*기간|접수\s*일정|까지|기한|"
+                          r"(?:신청|지원|제출|응모|원서\s*접수)\s*(?:기간|기한|마감|일정)|(?:지원|원서|온라인|우편|방문)\s*접수|접수\s*(?:일시|마감|기한)|"
+                          r"(?:^|[|│])\s*(?:신청|접수|모집|응모|공모)\s*[:：|]?\s*(?=(?:19|20)\d{2}\s*(?:[-./]|년)))", re.I)
 OPEN_DATE_CUE = re.compile(r"(opens?|opening|starts?|begin(s)?|reading period (begins|starts)|접수\s*시작|시작일)", re.I)
 RANGE_CUE = re.compile(r"(기간|period|window|between|from)", re.I)
 NOT_DEADLINE_CUE = re.compile(r"(announce|winners?|results|notified|notification|published|posted on|publication date|발표|심사|발행|게시일|시상)", re.I)
