@@ -189,7 +189,16 @@ def call_index(fetcher, target: dict, now: str, year: int, max_pages: int = 3) -
             d = parse.parse_html(r.body, r.final_url)
             pages += [n for n in d.next_pages[:1]]
             own = urlparse(r.final_url).hostname or ""
-            for l in d.links:
+            links = list(d.links)
+            # directories that keep each call on an internal detail page (e.g. Korean contest portals): follow up to
+            # `max_details` internal detail links matching `detail_re` and take the organiser links found there (discovery only)
+            if ix.get("detail_re"):
+                det = [l.href for l in d.links if re.search(ix["detail_re"], l.href) and (urlparse(l.href).hostname or "").removeprefix("www.") == own.removeprefix("www.")]
+                for du in list(dict.fromkeys(det))[: int(ix.get("max_details", 12))]:
+                    rr = fetcher.fetch(du, now_iso=now)
+                    if rr.outcome == "ok" and rr.content_type.startswith("text/html"):
+                        links += parse.parse_html(rr.body, rr.final_url).links
+            for l in links:
                 h = (urlparse(l.href).hostname or "").lower()
                 if not h or h.endswith(own.replace("www.", "")) or not _acceptable(l.href):
                     continue

@@ -36,3 +36,9 @@ the old value is superseded (history kept) and the status becomes `extended`. A 
 ## Social media
 Instagram/Facebook/X/Threads/TikTok: no official-API access, never fetched. Links found on official pages are stored as `manual_lead` candidates; a human clips
 the notice, and that clip enters as `source_claim`/`unverified` with its own source record.
+
+## Manual clips (Instagram and other social)
+No automatic fetching of social sites. A human drops `$ROOT/inbox/manual_clips/*.json` with `url, clipped_by ("human:<name>"), text, outlet_id|outlet_name, clipped_at, posted_at`. The daemon stores them as `source_claim` only; clips that do not name a known outlet go to `unresolved/`.
+
+## public_document renewal
+`scripts/renew_public_document.py [--dry-run] [--horizon 48]` renews 7-day public approvals only if robots allows our UA and an anonymous GET returns 200 without a login wall; it backs up the crawler DB first and never touches blocked hosts. Report: `exports/renewal_YYYYMMDD.json`.
