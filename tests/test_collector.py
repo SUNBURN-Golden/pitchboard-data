@@ -31,6 +31,24 @@ class PriorityTests(unittest.TestCase):
         self.assertGreater(u("2026-10-30", "2026-10-27"), u("2027-06-01", "2026-10-27"))
 
 
+class CycleTests(unittest.TestCase):
+    def test_cycle_score_prefers_current_and_drops_past(self):
+        from pbdata.profiles import pitchboard as prof
+        today = dt.date(2026, 10, 28)
+        self.assertGreater(prof.cycle_score("/contest/2027-prize", today), 0)
+        self.assertGreater(prof.cycle_score("2026 open call", today), 0)
+        self.assertLess(prof.cycle_score("/news/2024/winners", today), 0)
+        self.assertEqual(prof.cycle_score("/submissions", today), 0)
+
+    def test_past_deadline_never_eligible(self):
+        from pbdata.profiles import pitchboard as prof
+        d = parse.parse_html(b"<html><head><title>Open call for submissions</title></head><body><h1>Open call</h1><p>Submit your story. Deadline: March 31, 2026.</p></body></html>", "https://x.example/call")
+        labs = prof.label_doc(d, prof.extract(d), dt.date(2026, 10, 28))
+        rec = [l for l in labs if l.label == "recruitment"][0]
+        self.assertFalse(rec.open_call_eligible)
+        self.assertEqual(rec.status, "past_deadline")
+
+
 class ParserTests(unittest.TestCase):
     def test_pdf_text_and_rows(self):
         d = parse.parse_pdf(fx.make_pdf(["Deadline: January 31, 2027.", "Entry fee: $15 per entry."]))

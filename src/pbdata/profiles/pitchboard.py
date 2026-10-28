@@ -347,8 +347,27 @@ def relevance(texts: List[str], lang: str, target: dict) -> float:
     return round(min(1.0, score), 3)
 
 
-def link_priority(link: Link) -> float:
-    s = 0.0
+NEWS_PATH = re.compile(r"(news|notice|announce|board|bbs|competitions?|contests?|prizes?|awards?|opportunit|공지|소식|알림|공고|사업안내)", re.I)
+NEWEST_CUE = re.compile(r"(\bnew\b|latest|now open|open now|20\d\d[- ]?20\d\d|신규|최신|접수\s*중|모집\s*중)", re.I)
+
+
+def cycle_score(text: str, today: Optional[dt.date] = None) -> float:
+    """Current-cycle preference: +0.5 for the current/next year in URL or anchor, -0.8 if only past years appear."""
+    y = (today or dt.date.today()).year
+    years = {int(v) for v in YEAR_RE.findall(text or "")}
+    if not years:
+        return 0.0
+    if max(years) >= y:
+        return 0.5 if max(years) <= y + 1 else 0.0
+    return -0.8
+
+
+def link_priority(link: Link, today: Optional[dt.date] = None) -> float:
+    s = cycle_score((link.href or "") + " " + (link.text or ""), today)
+    if NEWS_PATH.search(link.href) or NEWS_PATH.search(link.text or ""):
+        s += 0.2
+    if NEWEST_CUE.search(link.text or ""):
+        s += 0.2
     if HIGH_VALUE_PATH.search(link.href):
         s += 0.6
     if CALL_LINK.search(link.text or ""):

@@ -145,9 +145,11 @@ def add_candidates(svc: sqlite3.Connection, cands: Iterable[Cand], target_id: st
     """Insert new candidates (dedupe by host+target). Skips blocked hosts. Returns new cand_ids."""
     new_ids = []
     ms = int(timeutil.parse_iso(now).timestamp() * 1000)
-    count = svc.execute("SELECT count(*) FROM pb_discovery_candidate WHERE target_id=?", (target_id,)).fetchone()[0]
+    per = {}
     for c in cands:
-        if count + len(new_ids) >= budget.max_candidates or c.prior < budget.min_prior or depth > budget.max_depth:
+        if c.strategy not in per:
+            per[c.strategy] = svc.execute("SELECT count(*) FROM pb_discovery_candidate WHERE target_id=? AND strategy=?", (target_id, c.strategy)).fetchone()[0]
+        if per[c.strategy] >= budget.max_candidates or c.prior < budget.min_prior or depth > budget.max_depth:
             break
         host = urlparse(c.url).netloc.lower()
         if not host or store.is_blocked(host):
@@ -158,4 +160,40 @@ def add_candidates(svc: sqlite3.Connection, cands: Iterable[Cand], target_id: st
                               " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (cid, c.url, host, c.label[:120], target_id, c.strategy, c.origin_ref, parent, depth, c.prior, "new", now))
         if cur.rowcount:
             new_ids.append(cid)
+            per[c.strategy] += 1
     return new_ids
+
+
+def call_index(fetcher, target: dict, now: str, year: int, max_pages: int = 3) -> List[Cand]:
+    """Current-cycle discovery from official call indexes / organiser news boards and open-call directories (config `call_indexes`).
+    The index page itself becomes a candidate (strategy call_index); outbound organiser links on directory pages become
+    candidates (strategy directory_hub). Directory pages are discovery only: no facts are taken from them."""
+    from . import parse
+    from ..profiles import pitchboard as prof
+    out: List[Cand] = []
+    for ix in target.get("call_indexes", []):
+        url, kind = ix["url"], ix.get("kind", "official")
+        if kind == "official" and _acceptable(url):
+            out.append(Cand(url, ix.get("label", ""), "call_index", "%s:%s" % (target["id"], url), 0.8))
+        if kind != "directory":
+            continue
+        pages, seen = [url], set()
+        while pages and len(seen) < max_pages:
+            u = pages.pop(0)
+            if u in seen:
+                continue
+            seen.add(u)
+            r = fetcher.fetch(u, now_iso=now)
+            if r.outcome != "ok" or not r.content_type.startswith("text/html"):
+                continue
+            d = parse.parse_html(r.body, r.final_url)
+            pages += [n for n in d.next_pages[:1]]
+            own = urlparse(r.final_url).hostname or ""
+            for l in d.links:
+                h = (urlparse(l.href).hostname or "").lower()
+                if not h or h.endswith(own.replace("www.", "")) or not _acceptable(l.href):
+                    continue
+                if prof.cycle_score((l.text or "") + " " + l.href, None) < 0:
+                    continue
+                out.append(Cand(l.href, (l.text or "")[:120], "directory_hub", "%s:%s" % (target["id"], u), 0.6))
+    return out

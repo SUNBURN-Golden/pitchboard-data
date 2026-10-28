@@ -27,7 +27,7 @@ class Ctx:
                  caps: Optional[dict] = None):
         self.svc, self.infra, self.fetcher, self.api = svc, infra, fetcher, api
         self.targets = {t["id"]: t for t in targets["targets"]}
-        self.year = targets.get("year", int(clock()[:4]))
+        self.year = targets.get("year") or int(clock()[:4])
         self.run_id, self.run_tag, self.clock = run_id, run_tag, clock
         self.caps = caps or DEFAULT_CAPS
         self.trial_cache: Dict[str, FetchResult] = {}
@@ -48,7 +48,9 @@ def _day(now: str) -> str:
 def seed_discovery(ctx: Ctx) -> int:
     now, n = ctx.clock(), 0
     for tid, t in ctx.targets.items():
-        for strat in ("wikidata_class", "wiki_category", "query_combo"):
+        for strat in ("call_index", "wikidata_class", "wiki_category", "query_combo"):
+            if strat == "call_index" and not t.get("call_indexes"):
+                continue
             if scheduler.enqueue(ctx.infra, "discover", "discovery", {"target_id": tid, "strategy": strat}, "discover|%s|%s|%s" % (tid, strat, ctx.run_tag),
                                  scheduler.priority(novelty=1.0, quality=0.6, cost=0.2), now):
                 n += 1
@@ -65,6 +67,8 @@ def h_discover(ctx: Ctx, p: dict, job) -> dict:
         cands = discover.wiki_category(ctx.api, t)
     elif strat == "query_combo":
         cands = discover.query_search(ctx.api, t, ctx.year)
+    elif strat == "call_index":
+        cands = discover.call_index(ctx.fetcher, t, now, ctx.year)
     elif strat == "entity_followup":
         cands = discover.entity_followup(ctx.api, p["name"], t.get("language", "en"), p.get("parent", ""))
     else:
@@ -173,8 +177,8 @@ def _follow(ctx: Ctx, r, site, site_id: str, url: str, depth: int, now: str, hop
         if _same_site(nxt, url) and hop < 5:
             scheduler.enqueue(ctx.infra, "fetch_page", "backfill", {"url": nxt, "site_source_id": site_id, "depth": depth, "via": "pagination", "hop": hop + 1},
                               "fetch|%s|%s" % (normalize_url(nxt), ctx.run_tag), scheduler.priority(novelty=0.6, quality=0.5, cost=0.3), now, depth=depth)
-    for l in doc.links:
-        if not l.href.startswith("http") or n >= 8:
+    for l in sorted(doc.links, key=lambda x: -prof.link_priority(x)):
+        if not l.href.startswith("http") or n >= 8 or prof.cycle_score(l.href + " " + (l.text or "")) < 0:
             continue
         host = urlparse(l.href).netloc.lower()
         if store.is_blocked(host):
@@ -253,10 +257,11 @@ def h_expand_site(ctx: Ctx, p: dict, job) -> dict:
             urls += [it["link"] for it in parse.parse_feed(res.body)[:40] if it["link"]]
     picked = []
     for u in dict.fromkeys(urls):
-        if not prof.HIGH_VALUE_PATH.search(u) or re.search(r"/(19|20(0\d|1\d))/|/tag/|/category/|/author/|\.(jpg|png|gif|css|js)$", u):
+        if not (prof.HIGH_VALUE_PATH.search(u) or (prof.NEWS_PATH.search(u) and prof.cycle_score(u) > 0)) or prof.cycle_score(u) < 0 \
+                or re.search(r"/tag/|/category/|/author/|\.(jpg|png|gif|css|js)$", u):
             continue
         picked.append(u)
-    picked = picked[:6]
+    picked = sorted(picked, key=lambda u: -prof.cycle_score(u))[:8]
     for u in picked:
         scheduler.enqueue(ctx.infra, "fetch_page", "backfill", {"url": u, "site_source_id": p["site_source_id"], "depth": 2, "via": "sitemap"},
                           "fetch|%s|%s" % (normalize_url(u), ctx.run_tag), scheduler.priority(novelty=0.8, quality=0.6, urgency=0.4, cost=0.3), now, depth=2)
