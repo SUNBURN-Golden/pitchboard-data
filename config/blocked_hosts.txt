@@ -1,0 +1,14 @@
+# access_review domains: not_collectable (decision: never fetch, never bypass)
+bookforum.com
+bostonreview.net
+electricliterature.com
+liberreview.com
+lux-magazine.com
+thedriftmag.com
+thepointmag.com
+instagram.com
+facebook.com
+x.com
+twitter.com
+threads.net
+tiktok.com

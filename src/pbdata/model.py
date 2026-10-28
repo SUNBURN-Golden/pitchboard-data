@@ -43,8 +43,8 @@ FRESH_DAYS = {"status.": 7, "deadline.": 7, "fee.": 90, "compensation.": 90, "ri
 # Statements that justify value_state='explicitly_none' (V-03), per predicate.
 EXPLICIT_NONE_PATTERNS = {
     "fee.submission": re.compile(r"\b(no (submission|reading|entry) fees?|(submissions?|submitting) (is|are) free|free to submit|"
-                                 r"does not charge|do not charge)\b", re.I),
-    "compensation.rate": re.compile(r"\b(we do not pay|unpaid|no payment|does not pay|do not pay)\b", re.I),
+                                 r"does not charge|do not charge)\b|(응모료|참가비|접수비|참가료|심사비|응모비)\s*(은|는)?\s*(없|무료|면제)|(응모|참가|접수)\s*무료", re.I),
+    "compensation.rate": re.compile(r"\b(we do not pay|unpaid|no payment|does not pay|do not pay)\b|원고료\s*(은|는)?\s*(없|지급하지)", re.I),
     "eligibility.region": re.compile(r"\b(open to (writers|submissions|everyone) (from )?(everywhere|worldwide|around the world|"
                                      r"internationally)|international submissions are welcome|writers worldwide)\b", re.I),
 }

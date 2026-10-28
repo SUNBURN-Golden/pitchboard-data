@@ -1,0 +1,75 @@
+{
+ "run_a_counts": {
+  "pb_fact": 23,
+  "pb_call_edition": 3,
+  "pb_source_site": 1,
+  "pb_outlet": 1,
+  "pb_conflict_group": 2
+ },
+ "kinds_collected": [
+  "html",
+  "image",
+  "pdf"
+ ],
+ "list_page_2_followed": true,
+ "image_ocr_deadline": [
+  {
+   "field": "deadline.closes_on",
+   "v": "{\"date\": \"2026-12-15\", \"tz_source\": \"unknown\"}",
+   "confidence": 0.8
+  }
+ ],
+ "gaps_filled_with_evidence": 5,
+ "gap_states": {
+  "filled": 5,
+  "open": 4
+ },
+ "rerun_counts_equal": true,
+ "rerun_unchanged_raw": 8,
+ "changed_urls_v2": [
+  "/calls/2026-fall"
+ ],
+ "deadline_history": [
+  {
+   "v": null,
+   "s": null
+  },
+  {
+   "v": "{\"date\":\"2027-01-31\",\"tz_source\":\"unknown\"}",
+   "s": null
+  },
+  {
+   "v": "{\"date\":\"2026-11-30\",\"tz_source\":\"unknown\"}",
+   "s": "2026-10-27T07:00:00Z"
+  },
+  {
+   "v": "{\"date\":\"2026-12-15\",\"tz_source\":\"unknown\"}",
+   "s": null
+  },
+  {
+   "v": "{\"date\":\"2026-12-20\",\"tz_source\":\"unknown\"}",
+   "s": null
+  }
+ ],
+ "status_events": [
+  {
+   "from_status": "candidate",
+   "to_status": "announced"
+  },
+  {
+   "from_status": "candidate",
+   "to_status": "open"
+  },
+  {
+   "from_status": "candidate",
+   "to_status": "announced"
+  },
+  {
+   "from_status": "open",
+   "to_status": "extended"
+  }
+ ],
+ "alerts_v3": [
+  "field_lost"
+ ]
+}

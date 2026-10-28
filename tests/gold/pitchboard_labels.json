@@ -1,0 +1,696 @@
+{
+ "today": "2026-10-27",
+ "note": "hand-labelled by the author before running the extractor; synthetic snippets",
+ "items": [
+  {
+   "id": "r01",
+   "title": "Call for submissions: Winter Issue",
+   "text": "Submissions are open until December 1, 2026. Send fiction up to 4,000 words.",
+   "lang": "en",
+   "expect": {
+    "label": "recruitment",
+    "eligible": true,
+    "deadline": "2026-12-01"
+   }
+  },
+  {
+   "id": "r02",
+   "title": "Open call: essays",
+   "text": "Deadline: 15 January 2027. Submit your essay through our form.",
+   "lang": "en",
+   "expect": {
+    "label": "recruitment",
+    "eligible": true,
+    "deadline": "2027-01-15"
+   }
+  },
+  {
+   "id": "r03",
+   "title": "Submit your work",
+   "text": "We read year-round. Submissions are open on a rolling basis.",
+   "lang": "en",
+   "expect": {
+    "label": "recruitment",
+    "eligible": true,
+    "deadline": null
+   }
+  },
+  {
+   "id": "r04",
+   "title": "Annual Prize call for entries",
+   "text": "Entries close on November 20, 2026. Entry fee $20 per entry.",
+   "lang": "en",
+   "expect": {
+    "label": "recruitment",
+    "eligible": true,
+    "deadline": "2026-11-20",
+    "fee": 20
+   }
+  },
+  {
+   "id": "r05",
+   "title": "Call for pitches",
+   "text": "Pitches due by Nov 5, 2026 11:59 PM ET. We pay $0.25 per word.",
+   "lang": "en",
+   "expect": {
+    "label": "recruitment",
+    "eligible": true,
+    "deadline": "2026-11-05",
+    "pay": 0.25
+   }
+  },
+  {
+   "id": "r06",
+   "title": "Poetry contest call for entries",
+   "text": "There is no entry fee. Deadline: December 31, 2026.",
+   "lang": "en",
+   "expect": {
+    "label": "recruitment",
+    "eligible": true,
+    "deadline": "2026-12-31",
+    "fee": "none"
+   }
+  },
+  {
+   "id": "r07",
+   "title": "Fiction call for submissions",
+   "text": "Simultaneous submissions are accepted. Deadline January 5, 2027.",
+   "lang": "en",
+   "expect": {
+    "label": "recruitment",
+    "eligible": true,
+    "deadline": "2027-01-05",
+    "simul": "allowed"
+   }
+  },
+  {
+   "id": "r08",
+   "title": "Fiction call for submissions",
+   "text": "No simultaneous submissions. Deadline: February 1, 2027.",
+   "lang": "en",
+   "expect": {
+    "label": "recruitment",
+    "eligible": true,
+    "deadline": "2027-02-01",
+    "simul": "not_allowed"
+   }
+  },
+  {
+   "id": "s01",
+   "title": "Call for submissions: Spring 2025",
+   "text": "Submissions closed March 1, 2025. Thank you.",
+   "lang": "en",
+   "expect": {
+    "label": "recruitment",
+    "eligible": false,
+    "status": "stale_prior_year"
+   }
+  },
+  {
+   "id": "s02",
+   "title": "Open call 2024",
+   "text": "Call for submissions. Deadline: June 30, 2024.",
+   "lang": "en",
+   "expect": {
+    "label": "recruitment",
+    "eligible": false,
+    "status": "stale_prior_year",
+    "deadline": "2024-06-30"
+   }
+  },
+  {
+   "id": "s03",
+   "title": "Call for entries: 2025 Contest",
+   "text": "Deadline: September 15, 2025.",
+   "lang": "en",
+   "expect": {
+    "label": "recruitment",
+    "eligible": false,
+    "status": "stale_prior_year",
+    "deadline": "2025-09-15"
+   }
+  },
+  {
+   "id": "s04",
+   "title": "Call for submissions",
+   "text": "Deadline: October 1, 2026. Send your best work.",
+   "lang": "en",
+   "expect": {
+    "label": "recruitment",
+    "eligible": false,
+    "status": "past_deadline",
+    "deadline": "2026-10-01"
+   }
+  },
+  {
+   "id": "s05",
+   "title": "Calls archive 2023",
+   "text": "Call for submissions 2023: deadline May 5, 2023.",
+   "lang": "en",
+   "expect": {
+    "label": "recruitment",
+    "eligible": false,
+    "status": "stale_prior_year"
+   }
+  },
+  {
+   "id": "s06",
+   "title": "Call for submissions",
+   "text": "Submissions are closed. The deadline was November 1, 2025.",
+   "lang": "en",
+   "expect": {
+    "label": "recruitment",
+    "eligible": false
+   }
+  },
+  {
+   "id": "x01",
+   "title": "2026 Poetry Prize Winners Announced",
+   "text": "We are pleased to announce the winners of the 2026 Poetry Prize. Congratulations to all.",
+   "lang": "en",
+   "expect": {
+    "label": "results",
+    "eligible": false
+   }
+  },
+  {
+   "id": "x02",
+   "title": "Shortlist announced for the Fiction Award",
+   "text": "The shortlist for this year's award has been announced.",
+   "lang": "en",
+   "expect": {
+    "label": "results",
+    "eligible": false
+   }
+  },
+  {
+   "id": "x03",
+   "title": "2025 수상작 발표",
+   "text": "제10회 문학상 수상작을 발표합니다.",
+   "lang": "ko",
+   "expect": {
+    "label": "results",
+    "eligible": false
+   }
+  },
+  {
+   "id": "x04",
+   "title": "제12회 신인문학상 당선작 발표",
+   "text": "당선작과 심사평을 공개합니다.",
+   "lang": "ko",
+   "expect": {
+    "label": "results",
+    "eligible": false
+   }
+  },
+  {
+   "id": "x05",
+   "title": "Winners of the 2026 contest",
+   "text": "Congratulations to the winning entries. Thank you to everyone who submitted.",
+   "lang": "en",
+   "expect": {
+    "label": "results",
+    "eligible": false
+   }
+  },
+  {
+   "id": "x06",
+   "title": "Announcing the winners of our 2026 Call for Submissions",
+   "text": "The winners are listed below.",
+   "lang": "en",
+   "expect": {
+    "label": "results",
+    "eligible": false
+   }
+  },
+  {
+   "id": "x07",
+   "title": "Our 2025 open call: results",
+   "text": "Thank you to everyone who submitted. Winners:",
+   "lang": "en",
+   "expect": {
+    "label": "results",
+    "eligible": false
+   }
+  },
+  {
+   "id": "u01",
+   "title": "Submission guidelines",
+   "text": "We accept fiction up to 5,000 words. Please send as .docx.",
+   "lang": "en",
+   "expect": {
+    "label": "rules"
+   }
+  },
+  {
+   "id": "u02",
+   "title": "Terms and conditions",
+   "text": "Eligibility: open to residents of the United States. Rights revert to authors after publication.",
+   "lang": "en",
+   "expect": {
+    "label": "rules",
+    "eligibility": "stated"
+   }
+  },
+  {
+   "id": "u03",
+   "title": "투고 규정",
+   "text": "원고 분량은 200자 원고지 80매 이내이며 한글 파일로 제출합니다.",
+   "lang": "ko",
+   "expect": {
+    "label": "rules"
+   }
+  },
+  {
+   "id": "u04",
+   "title": "Submission guidelines",
+   "text": "There is no reading fee. We pay $50 per poem.",
+   "lang": "en",
+   "expect": {
+    "label": "rules",
+    "fee": "none",
+    "pay": 50
+   }
+  },
+  {
+   "id": "u05",
+   "title": "Submission guidelines",
+   "text": "Reading fee: £3 per submission.",
+   "lang": "en",
+   "expect": {
+    "label": "rules",
+    "fee": 3
+   }
+  },
+  {
+   "id": "u06",
+   "title": "Submission guidelines",
+   "text": "We do not accept AI-generated submissions.",
+   "lang": "en",
+   "expect": {
+    "label": "rules",
+    "ai": "prohibited"
+   }
+  },
+  {
+   "id": "u07",
+   "title": "Submission guidelines",
+   "text": "Simultaneous submissions are not accepted.",
+   "lang": "en",
+   "expect": {
+    "label": "rules",
+    "simul": "not_allowed"
+   }
+  },
+  {
+   "id": "u08",
+   "title": "Submission guidelines",
+   "text": "Simultaneous submissions are welcome.",
+   "lang": "en",
+   "expect": {
+    "label": "rules",
+    "simul": "allowed"
+   }
+  },
+  {
+   "id": "u09",
+   "title": "Submission guidelines",
+   "text": "Open to writers worldwide.",
+   "lang": "en",
+   "expect": {
+    "label": "rules",
+    "region": "worldwide"
+   }
+  },
+  {
+   "id": "u10",
+   "title": "Submission guidelines",
+   "text": "Open to residents of Canada only.",
+   "lang": "en",
+   "expect": {
+    "label": "rules",
+    "eligibility": "stated"
+   }
+  },
+  {
+   "id": "u11",
+   "title": "응모 규정",
+   "text": "응모료 없음. 동시 투고 불가.",
+   "lang": "ko",
+   "expect": {
+    "label": "rules",
+    "fee": "none",
+    "simul": "not_allowed"
+   }
+  },
+  {
+   "id": "k01",
+   "title": "제15회 신인문학상 공모",
+   "text": "접수기간: 2026년 11월 1일 ~ 2026년 12월 15일. 응모료 없음.",
+   "lang": "ko",
+   "expect": {
+    "label": "recruitment",
+    "eligible": true,
+    "deadline": "2026-12-15",
+    "fee": "none"
+   }
+  },
+  {
+   "id": "k02",
+   "title": "원고 모집 안내",
+   "text": "마감: 2026. 11. 30. 원고료 30만원 지급.",
+   "lang": "ko",
+   "expect": {
+    "label": "recruitment",
+    "eligible": true,
+    "deadline": "2026-11-30",
+    "pay": 300000
+   }
+  },
+  {
+   "id": "k03",
+   "title": "공모 안내",
+   "text": "접수 마감 2026년 12월 5일 18시.",
+   "lang": "ko",
+   "expect": {
+    "label": "recruitment",
+    "eligible": true,
+    "deadline": "2026-12-05"
+   }
+  },
+  {
+   "id": "k04",
+   "title": "2025 신춘문예 공모",
+   "text": "접수 마감 2025년 12월 1일.",
+   "lang": "ko",
+   "expect": {
+    "label": "recruitment",
+    "eligible": false,
+    "status": "stale_prior_year",
+    "deadline": "2025-12-01"
+   }
+  },
+  {
+   "id": "k05",
+   "title": "서평 투고 안내",
+   "text": "서평 상시 투고 가능합니다. 상시 모집.",
+   "lang": "ko",
+   "expect": {
+    "label": "recruitment",
+    "eligible": true
+   }
+  },
+  {
+   "id": "k06",
+   "title": "공모전 응모요강",
+   "text": "응모료 1만원. 마감 2027년 1월 10일.",
+   "lang": "ko",
+   "expect": {
+    "label": "recruitment",
+    "eligible": true,
+    "deadline": "2027-01-10",
+    "fee": 10000
+   }
+  },
+  {
+   "id": "e01",
+   "title": "Call for submissions",
+   "text": "The deadline has been extended to December 20, 2026.",
+   "lang": "en",
+   "expect": {
+    "label": "extension",
+    "deadline": "2026-12-20"
+   }
+  },
+  {
+   "id": "e02",
+   "title": "마감 연장 안내",
+   "text": "공모 마감일이 2026년 12월 20일로 연장되었습니다.",
+   "lang": "ko",
+   "expect": {
+    "label": "extension",
+    "deadline": "2026-12-20"
+   }
+  },
+  {
+   "id": "c01",
+   "title": "Contest cancelled",
+   "text": "The 2026 contest has been cancelled. We are no longer accepting submissions.",
+   "lang": "en",
+   "expect": {
+    "label": "cancellation",
+    "eligible": false
+   }
+  },
+  {
+   "id": "c02",
+   "title": "공모 취소 안내",
+   "text": "올해 공모가 취소되었습니다.",
+   "lang": "ko",
+   "expect": {
+    "label": "cancellation",
+    "eligible": false
+   }
+  },
+  {
+   "id": "f01",
+   "title": "Correction: Call for submissions",
+   "text": "Update: the correct deadline is November 28, 2026.",
+   "lang": "en",
+   "expect": {
+    "label": "correction",
+    "deadline": "2026-11-28"
+   }
+  },
+  {
+   "id": "f02",
+   "title": "정정 공지",
+   "text": "공모 마감일 정정: 2026년 11월 28일.",
+   "lang": "ko",
+   "expect": {
+    "label": "correction",
+    "deadline": "2026-11-28"
+   }
+  },
+  {
+   "id": "o01",
+   "title": "About us",
+   "text": "The Fixture Review is a literary magazine founded in 1999 in Seoul.",
+   "lang": "en",
+   "expect": {
+    "label": "other",
+    "eligible": false,
+    "deadline": null
+   }
+  },
+  {
+   "id": "o02",
+   "title": "Privacy policy",
+   "text": "We use cookies to improve your experience.",
+   "lang": "en",
+   "expect": {
+    "label": "other",
+    "eligible": false,
+    "deadline": null
+   }
+  },
+  {
+   "id": "o03",
+   "title": "Shop",
+   "text": "Buy back issues. Subscribe to our print edition for $40 a year.",
+   "lang": "en",
+   "expect": {
+    "label": "other",
+    "eligible": false,
+    "deadline": null
+   }
+  },
+  {
+   "id": "o04",
+   "title": "Events",
+   "text": "Join our reading on November 12, 2026 at the library.",
+   "lang": "en",
+   "expect": {
+    "label": "other",
+    "eligible": false,
+    "deadline": null
+   }
+  },
+  {
+   "id": "o05",
+   "title": "Blog: our favorite books of 2025",
+   "text": "We loved these novels and story collections.",
+   "lang": "en",
+   "expect": {
+    "label": "other",
+    "eligible": false,
+    "deadline": null
+   }
+  },
+  {
+   "id": "o06",
+   "title": "Staff",
+   "text": "Editor in chief: A. Writer. Poetry editor: B. Poet.",
+   "lang": "en",
+   "expect": {
+    "label": "other",
+    "eligible": false,
+    "deadline": null
+   }
+  },
+  {
+   "id": "o07",
+   "title": "사무실 휴무 안내",
+   "text": "12월 25일은 사무실 휴무입니다.",
+   "lang": "ko",
+   "expect": {
+    "label": "other",
+    "eligible": false,
+    "deadline": null
+   }
+  },
+  {
+   "id": "a01",
+   "title": "Call for submissions",
+   "text": "Deadline 04/05/2026.",
+   "lang": "en",
+   "expect": {
+    "label": "recruitment",
+    "eligible": false,
+    "deadline": null,
+    "status": "unknown_period"
+   }
+  },
+  {
+   "id": "a02",
+   "title": "Call for submissions",
+   "text": "Deadline: December 1. Fiction only.",
+   "lang": "en",
+   "expect": {
+    "label": "recruitment",
+    "eligible": false,
+    "deadline": null,
+    "status": "unknown_period"
+   }
+  },
+  {
+   "id": "a03",
+   "title": "Open call",
+   "text": "Submit before the end of the month.",
+   "lang": "en",
+   "expect": {
+    "label": "recruitment",
+    "eligible": false,
+    "deadline": null,
+    "status": "unknown_period"
+   }
+  },
+  {
+   "id": "a04",
+   "title": "Reading period",
+   "text": "We are closed to submissions until January 2027.",
+   "lang": "en",
+   "expect": {
+    "label": "other",
+    "eligible": false,
+    "deadline": null
+   }
+  },
+  {
+   "id": "a05",
+   "title": "Call for submissions - Fall 2026",
+   "text": "Last year's deadline was November 30, 2025. This year: deadline December 1, 2026.",
+   "lang": "en",
+   "expect": {
+    "label": "recruitment",
+    "eligible": true,
+    "deadline": "2026-12-01"
+   }
+  },
+  {
+   "id": "g01",
+   "title": "Translation grant",
+   "text": "Foundation grant for translators: call for applications, apply by February 15, 2027.",
+   "lang": "en",
+   "expect": {
+    "label": "recruitment",
+    "eligible": true,
+    "deadline": "2027-02-15"
+   }
+  },
+  {
+   "id": "g02",
+   "title": "Writing residency call",
+   "text": "Call for applications. Applications due: March 1, 2027.",
+   "lang": "en",
+   "expect": {
+    "label": "recruitment",
+    "eligible": true,
+    "deadline": "2027-03-01"
+   }
+  },
+  {
+   "id": "g03",
+   "title": "Anthology call for submissions",
+   "text": "Call for submissions for our anthology. Deadline Nov 15 2026.",
+   "lang": "en",
+   "expect": {
+    "label": "recruitment",
+    "eligible": true,
+    "deadline": "2026-11-15"
+   }
+  },
+  {
+   "id": "g04",
+   "title": "Contest call for entries",
+   "text": "Submission period: Nov. 3 - Dec. 1, 2026.",
+   "lang": "en",
+   "expect": {
+    "label": "recruitment",
+    "eligible": true,
+    "deadline": "2026-12-01"
+   }
+  },
+  {
+   "id": "g05",
+   "title": "Call for manuscripts",
+   "text": "Deadline: 2026-11-18. Manuscripts up to 80 pages.",
+   "lang": "en",
+   "expect": {
+    "label": "recruitment",
+    "eligible": true,
+    "deadline": "2026-11-18"
+   }
+  },
+  {
+   "id": "g06",
+   "title": "Open call for reviewers",
+   "text": "We are always looking for book reviewers. Pitches accepted on a rolling basis.",
+   "lang": "en",
+   "expect": {
+    "label": "recruitment",
+    "eligible": true
+   }
+  },
+  {
+   "id": "g07",
+   "title": "공모 안내 (연장)",
+   "text": "제3회 공모 접수가 2026년 12월 31일까지 연장되었습니다.",
+   "lang": "ko",
+   "expect": {
+    "label": "extension",
+    "deadline": "2026-12-31"
+   }
+  },
+  {
+   "id": "g08",
+   "title": "Winners of last year's contest",
+   "text": "2025 contest winners were announced in December. See below.",
+   "lang": "en",
+   "expect": {
+    "label": "results",
+    "eligible": false
+   }
+  }
+ ]
+}

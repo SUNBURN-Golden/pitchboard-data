@@ -1,0 +1,29 @@
+{
+  "profile": "pitchboard",
+  "year": 2026,
+  "note": "Target lists scope every metric. Hub categories are directory/org lists, not source seeds.",
+  "budget": {"api_calls": 90, "max_candidates": 60, "max_depth": 2},
+  "targets": [
+    {"id": "kr-ko-lit", "country": "KR", "country_qid": "Q884", "language": "ko", "language_qid": "Q9176",
+     "genres": ["문학", "소설", "시", "평론"],
+     "organizer_types": ["literary magazine", "book publisher", "literary award"],
+     "event_keywords": ["공모", "투고", "신인문학상", "원고 모집", "문학상 공모"],
+     "directory_categories": [{"lang": "ko", "category": "분류:대한민국의 문학상"}, {"lang": "ko", "category": "분류:대한민국의 출판사"},
+                              {"lang": "en", "category": "Category:South Korean literary awards"}]},
+    {"id": "us-en-lit", "country": "US", "country_qid": "Q30", "language": "en", "language_qid": "Q1860",
+     "genres": ["fiction", "poetry", "book reviews", "criticism"],
+     "organizer_types": ["literary magazine", "literary award"],
+     "event_keywords": ["call for submissions", "submission guidelines", "open call"],
+     "directory_categories": [{"lang": "en", "category": "Category:Poetry literary magazines"}]},
+    {"id": "gb-en-lit", "country": "GB", "country_qid": "Q145", "language": "en", "language_qid": "Q1860",
+     "genres": ["fiction", "poetry", "book reviews", "criticism"],
+     "organizer_types": ["literary magazine", "literary award"],
+     "event_keywords": ["call for submissions", "submission guidelines", "open call"],
+     "directory_categories": [{"lang": "en", "category": "Category:Literary magazines published in Ireland"}]},
+    {"id": "ca-au-en-lit", "country": "CA", "country_qid": "Q16", "language": "en", "language_qid": "Q1860",
+     "genres": ["fiction", "poetry", "book reviews", "criticism"],
+     "organizer_types": ["literary magazine"],
+     "event_keywords": ["call for submissions", "submission guidelines"],
+     "directory_categories": [{"lang": "en", "category": "Category:Literary magazines published in Canada"}, {"lang": "en", "category": "Category:Literary magazines published in Australia"}]}
+  ]
+}
