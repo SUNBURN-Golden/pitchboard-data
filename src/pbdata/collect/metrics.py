@@ -37,6 +37,14 @@ def compute(svc: sqlite3.Connection, infra: sqlite3.Connection, targets: dict, g
     # 2. new targets (outlets + call editions) from non-seed sites
     out["new_outlets"] = svc.execute("SELECT count(*) FROM pb_source_site WHERE in_seed_list=0 AND target_id IN (%s)" % q).fetchone()[0]
     out["new_call_editions"] = svc.execute("SELECT count(*) FROM pb_call_edition c JOIN pb_source_site ss ON ss.outlet_id=c.outlet_id WHERE ss.in_seed_list=0 AND ss.target_id IN (%s)" % q).fetchone()[0]
+    # open calls now: live deadline fact >= today (UTC date of the run) and status not closed/cancelled; never by clock-free guess
+    import datetime as _dt
+    today = _dt.date.today().isoformat()
+    rows = svc.execute("SELECT c.call_id, c.status, c.title_raw, json_extract(f.value_json,'$.date') d, s.canonical_url u, f.epistemic e FROM pb_call_edition c "
+                       "JOIN pb_fact f ON f.subject_id=c.call_id AND f.predicate='deadline.closes_on' AND f.superseded_at IS NULL AND f.value_state='stated' "
+                       "JOIN pb_source s ON s.source_id=f.source_id WHERE c.status NOT IN ('closed','cancelled') AND json_extract(f.value_json,'$.date') >= ?", (today,)).fetchall()
+    out["open_calls_current"] = len({r["call_id"] for r in rows})
+    out["open_calls_list"] = [{"deadline": r["d"], "status": r["status"], "epistemic": r["e"], "source": r["u"]} for r in rows][:50]
     # 3. required-field coverage (per outlet or call subject x predicate), live facts only
     cov = {"stated": 0, "explicitly_none": 0, "not_stated_in_inspected_scope": 0, "empty": 0}
     per_pred: Dict[str, Dict[str, int]] = {}
