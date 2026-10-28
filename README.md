@@ -14,6 +14,6 @@ Scope: schema, fact model, collectors, validation rules, migrations, stage runne
 
 ## Tests
 ```sh
-PYTHONPATH=src python -m unittest discover -s tests -v
+PYTHONPATH=src:tests python -m unittest discover -s tests -v
 ```
 Python 3.9+, standard library only.
