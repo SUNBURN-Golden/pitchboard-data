@@ -24,7 +24,7 @@ def compute(svc: sqlite3.Connection, infra: sqlite3.Connection, targets: dict, g
         valid = svc.execute(
             "SELECT count(DISTINCT ss.source_id) FROM pb_source_site ss JOIN pb_source s ON s.owner_outlet_id=ss.outlet_id "
             "JOIN pb_raw_ref r ON r.source_id=s.source_id AND r.outcome='ok' JOIN pb_label l ON l.raw_id=r.raw_id "
-            "AND ((l.label='rules') OR (l.label='recruitment' AND l.status NOT IN ('stale_prior_year','results_not_call','past_deadline'))) "
+            "AND ((l.label='rules') OR (l.label='recruitment' AND l.status NOT IN ('stale_prior_year','results_not_call','past_deadline','not_writing_call'))) "
             "WHERE ss.target_id=? AND ss.in_seed_list=0 AND EXISTS (SELECT 1 FROM pb_extraction e WHERE e.raw_id=r.raw_id AND e.field IN (%s))" %
             ",".join("'%s'" % k for k in prof.REQUIRED), (t,)).fetchone()[0]
         cand = dict(svc.execute("SELECT state, count(*) FROM pb_discovery_candidate WHERE target_id=? GROUP BY state", (t,)).fetchall())

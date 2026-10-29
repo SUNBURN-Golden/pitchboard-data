@@ -15,7 +15,7 @@ from . import store
 from ..collect.parse import Doc, Segment
 
 CALL_PREDICATES = {"deadline.closes_on", "deadline.opens_on", "status.declared"}
-SKIP_LABEL_STATUS = {"stale_prior_year", "results_not_call", "past_deadline"}
+SKIP_LABEL_STATUS = {"stale_prior_year", "results_not_call", "past_deadline", "not_writing_call"}
 
 
 @dataclasses.dataclass

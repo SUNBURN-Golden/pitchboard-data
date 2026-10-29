@@ -102,7 +102,7 @@ def trial_crawl(svc: sqlite3.Connection, fetcher: Fetcher, cand: sqlite3.Row, ta
         ex = prof.extract(d)
         core |= {e.field for e in ex if e.field in prof.REQUIRED}
         labs = prof.label_doc(d, ex, __import__("datetime").date.fromisoformat(now[:10]))
-        call_seen |= any(l.label in ("recruitment", "rules") and l.status not in ("stale_prior_year", "results_not_call") for l in labs)
+        call_seen |= any(l.label in ("recruitment", "rules") and l.status not in ("stale_prior_year", "results_not_call", "not_writing_call") for l in labs)
         if d.canonical and not _same_site(d.canonical, u):
             repost = True
         if prof.REPOST_RE.search(" ".join(s.text for s in d.segments[:120])):
