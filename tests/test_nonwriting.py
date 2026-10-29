@@ -24,6 +24,12 @@ class NonWritingGateTests(unittest.TestCase):
                "2026. 10. 21 2026.10.21 ~ 2026.12.04 상세보기")
         self.assertEqual(closes(row), [])
 
+    def test_impulstanz_row_has_no_call_deadline(self):
+        row = ("진행중 NEW [해외레지던시참가지원] 2027년 오스트리아 임펄스탄츠 아틀라스 레지던시 참가 신청안내 · 임펄스탄츠 아틀라스 "
+               "홈페이지를 통해 직접 신청(영문) - 지원신청기간 : 2026. 10... 2026.10.21 ~ 2026.12.04 상세보기")
+        self.assertEqual(closes(row), [])
+        self.assertEqual(closes("ImPulsTanz atlas residency, application period 2026.10.21 ~ 2026.12.04"), [])
+
     def test_literary_board_row_keeps_deadline(self):
         self.assertEqual(closes("진행중 [문학] 2027 문학 레지던시 참가 신청안내 · 신청기간 : 2026.10.21 ~ 2026.12.04"), ["2026-12-04"])
 
@@ -56,6 +62,27 @@ class NonWritingGateTests(unittest.TestCase):
         self.assertTrue(prof.non_writing("Theatre venue hire applications close 4 December 2026"))
         self.assertFalse(prof.non_writing("Call for theatre reviews: submissions close 4 December 2026"))
         self.assertFalse(prof.non_writing("A tender poem about rental flats"))   # 'tender'/'rental' alone are not notice types
+
+
+class HeadingGateTests(unittest.TestCase):
+    """Board detail pages put the notice title in a heading and a bare '마감일' (posting end) in a list item."""
+    def _closes(self, heading, text):
+        return [e.value["date"] for e in prof.extract(Doc("html", segments=[Segment(0, "li", text, heading)])) if e.field == "deadline.closes_on"]
+
+    def test_event_notice(self):
+        self.assertEqual(self._closes("2026년 <예술로 소풍-가을> 대학로 행사 안내 (10.31.(토))", "마감일 2026.10.31"), [])
+
+    def test_forum_notice(self):
+        self.assertEqual(self._closes("제4회 문화체육관광 디지털혁신 포럼(11.17(화))", "마감일 2026.11.17"), [])
+
+    def test_hiring_interview_notice(self):
+        self.assertEqual(self._closes("1) 서류전형 합격자 필수 제출자료", "제출기한 | 2026. 11. 4(수) 16:00까지"), [])
+
+    def test_writing_call_heading_kept(self):
+        self.assertEqual(self._closes("2027 문장웹진 원고 모집 공고", "마감일 2026.11.17"), ["2026-11-17"])
+
+    def test_criticism_forum_call_kept(self):
+        self.assertEqual(self._closes("2026 비평 포럼 발표 원고 공모", "마감일 2026.11.17"), ["2026-11-17"])
 
 
 class PromoteSkipsNonWritingTests(unittest.TestCase):

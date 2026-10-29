@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 from ..collect.dates import find_dates
 from ..collect.parse import Doc, Link, Segment
 
-EXTRACTOR_VERSION = "pb-rules-3"   # 2: Korean application-period cues, range start with 24h time, HH:MM times; 3: non-writing deadline gate
+EXTRACTOR_VERSION = "pb-rules-3"   # 2: Korean application-period cues, range start with 24h time, HH:MM times; 3: non-writing deadline gate (segment text + its heading)
 LABELER_VERSION = "pb-labels-2"    # 2: non-writing notices (venue rental, hiring, admissions, dance/theatre...) -> not_writing_call
 OCR_EXTRACTOR = "ocr:tesseract+rules"
 
@@ -93,9 +93,9 @@ YEAR_RE = re.compile(r"(?<!\d)(20\d{2})(?!\d)")
 # Pitchboard tracks writing/criticism calls only. Arts-council boards mix them with other notices, e.g. a venue rental
 # ("대관 공고"), a dance residency, staff hiring or a school admission guide. These are not writing calls:
 #  - NONWRITING_TYPE: notice types that are never a writing call, even when a literary word appears;
-#  - NONWRITING_DISC: other disciplines, which are overridden by any writing cue (희곡/극본 = playwriting, 미술 비평 = criticism).
-NONWRITING_TYPE = re.compile(r"(대관|채용|입찰|용역|입학|신입생|특별전형|일반전형|venue (hire|rental)|job (opening|vacanc)|we(?:'re| are) hiring)", re.I)
-NONWRITING_DISC = re.compile(r"(무용|댄스|발레|연극|뮤지컬|오페라|공연장|미술|시각\s*예술|공예|음악|국악|전시|영화|\bdance\b|\bballet\b|\btheat(?:re|er)\b|\bvisual arts?\b|\bmusic(?:al)?\b|\bexhibition\b|\bfilm\b)", re.I)
+#  - NONWRITING_DISC: other disciplines and events (forum, screening), which are overridden by any writing cue (희곡/극본 = playwriting, 미술 비평 = criticism).
+NONWRITING_TYPE = re.compile(r"(대관|채용|입찰|용역|입학|신입생|(?:특별|일반|서류|면접|실기)\s*전형|공모\s*직위|임용|venue (hire|rental)|job (opening|vacanc)|we(?:'re| are) hiring)", re.I)
+NONWRITING_DISC = re.compile(r"(행사\s*(?:안내|소개)|포럼|세미나|심포지엄|설명회|공연\s*실황|상영|무용|댄스|발레|연극|뮤지컬|오페라|공연장|미술|시각\s*예술|공예|음악|국악|전시|영화|\bdance\b|tanz|탄츠|\bballet\b|\btheat(?:re|er)\b|\bvisual arts?\b|\bmusic(?:al)?\b|\bexhibition\b|\bfilm\b)", re.I)
 WRITING_CUE = re.compile(r"(문학|문예|소설|시인|시집|시조|동시|수필|에세이|평론|비평|서평|리뷰|희곡|극본|대본|시나리오|동화|원고|번역|글쓰기|웹진|"
                          r"\bliter(?:ary|ature)|\bfiction|\bpoe(?:m|ms|try|t|ts)\b|\bessays?\b|\bwrit(?:ing|ers?)\b|\bmanuscripts?\b|\btranslat|\bcriticism|\bplaywrit|\bscripts?\b|\bscreenplays?\b|\breviews?\b)", re.I)
 
@@ -142,7 +142,7 @@ def extract(doc: Doc, ocr: bool = False) -> List[Ext]:
         # --- dates
         hits = find_dates(t)
         if hits and DEADLINE_CUE.search(t) and not (NOT_DEADLINE_CUE.search(t) and not re.search(r"deadline|마감|접수|submit|due", t, re.I)) \
-                and not non_writing(t):   # e.g. a board-list row for a dance residency or venue rental: not a writing-call deadline
+                and not non_writing(t + " " + seg.heading):   # e.g. a dance-residency board row, or '마감일' under an event/hiring notice heading
             cue = DEADLINE_CUE.search(t)
             first, last = hits[0], hits[-1]
             if len(hits) >= 2 and (RANGE_CUE.search(t) or re.search(r"[~∼–]", t)) and last.iso >= first.iso:
