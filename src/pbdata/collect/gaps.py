@@ -33,7 +33,7 @@ def compute_gaps(svc: sqlite3.Connection, outlet_id: str, target_id: str, now: s
     relevant_ok = []
     for p in ok_pages:
         labs = {l["label"]: l for l in svc.execute("SELECT * FROM pb_label WHERE raw_id=?", (p["raw_id"],))}
-        if ("rules" in labs) or ("recruitment" in labs and labs["recruitment"]["status"] not in ("stale_prior_year", "results_not_call", "past_deadline")):
+        if ("rules" in labs) or ("recruitment" in labs and labs["recruitment"]["status"] not in ("stale_prior_year", "results_not_call", "past_deadline", "not_writing_call")):
             relevant_ok.append(p)
     calls = svc.execute("SELECT call_id FROM pb_call_edition WHERE outlet_id=? AND status IN ('announced','open','extended','standing')", (outlet_id,)).fetchall()
     for pred, (stype, importance) in prof.REQUIRED.items():
