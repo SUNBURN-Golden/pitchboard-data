@@ -23,6 +23,7 @@ ALLOWED = {
     ("standing", "superseded"): {REV},
     ("closed", "open"): {EV}, ("closed", "extended"): {EV}, ("closed", "archived"): {CLK}, ("closed", "superseded"): {REV},
     ("cancelled", "archived"): {CLK}, ("cancelled", "superseded"): {REV},
+    ("cancelled", "open"): {REV},  # review-only correction of a wrongly extracted cancellation (PR #11)
     ("status_unknown", "announced"): {EV}, ("status_unknown", "open"): {EV}, ("status_unknown", "extended"): {EV},
     ("status_unknown", "standing"): {EV}, ("status_unknown", "closed"): {EV}, ("status_unknown", "cancelled"): {EV},
     ("superseded", "archived"): {CLK},
