@@ -57,7 +57,30 @@ EXT_RE = re.compile(r"(deadline (has been |is |was )?extended|extended (the )?de
 CANC_RE = re.compile(r"(\bcancel(l)?ed\b|\bcancell?ation\b|no longer (accepting|open|being offered)|discontinued|has been (withdrawn|closed permanently)|취소|폐지|중단\s*(되었|합니다))", re.I)
 STANDING_RE = re.compile(r"(rolling (basis|submissions?|deadline)|year[- ]round|always open|ongoing submissions?|submit (at )?any ?time|상시\s*(접수|모집|투고))", re.I)
 OPEN_RE = re.compile(r"(submissions? (are |is )?(now |currently )?open|(now|currently) (accepting|open)|open for submissions|접수\s*중|모집\s*중|현재\s*접수)", re.I)
-CLOSED_RE = re.compile(r"(submissions? (are |is )?(now |currently )?closed|closed to submissions|not (currently )?(accepting|open to) (new )?(submissions?|pitches)|접수\s*마감|모집\s*마감|마감되었|접수\s*종료)", re.I)
+# Korean: a bare "접수 마감" / "모집 마감" is usually a schedule label ("접수 마감 : 11월 5일", "접수 마감일", "모집마감시까지"),
+# not a declaration that the call is closed; only count it when no date/label/time word follows (pb-status-1)
+_KO_CLOSE_LABEL_AFTER = r"(?!\s*(?:일|시|기한|기간|일정|일시|예정|전|후|까지|이전|이후|[:：|~\-]|\(|\d)|\s*$)"
+CLOSED_RE = re.compile(r"(submissions? (are |is )?(now |currently )?closed|closed to submissions|not (currently )?(accepting|open to) (new )?(submissions?|pitches)|"
+                       r"(?:접수|모집)\s*(?:이\s*)?마감(?:되었|됐|되어|됨|했|하였|합니다|입니다)|(?:접수|모집)\s*마감" + _KO_CLOSE_LABEL_AFTER + r"|"
+                       r"마감되었|접수\s*(?:이\s*)?종료(?:되었|됐|됨|했|하였|합니다|입니다)|접수\s*종료" + _KO_CLOSE_LABEL_AFTER + r")", re.I)
+# status.declared "cancelled": the CALL itself must be the thing cancelled. Korean pages are full of other 취소 (수상 취소,
+# 선정 취소, 참가 취소, 예매/뉴스레터 취소, 저장 취소 buttons, conditional "취소될 수 있음") that are never a call cancellation.
+STATUS_CANC_EN = re.compile(r"((?:contest|competition|call|prize|award|issue|reading period|submissions?)\s+(?:has been |have been |was |were |is )?(?:cancell?ed|discontinued)|"
+                            r"no longer (accepting|open|being offered)|has been (withdrawn|closed permanently))", re.I)
+STATUS_CANC_KO = re.compile(r"(?<![가-힣])(?:공모전?|모집|접수|대회|사업|행사|선발|공고)\s*(?:이|가|은|는|을|를)?\s*(?:전면\s*)?(?:취소|폐지|중단)"
+                            r"(?:\s*(?:되었|됐|되어|됨|합니다|하였|했|함|공고|안내|공지|알림))")
+STATUS_CANC_COND = re.compile(r"(경우|시에는|시\s|(?<!전)면\s|때|수\s*있|될\s*수|예정)")
+
+
+def status_cancel_match(text: str):
+    """A cancellation declaration for the call itself, or None (conditional/penalty clauses are not declarations)."""
+    for rx in (STATUS_CANC_EN, STATUS_CANC_KO):
+        for m in rx.finditer(text):
+            ctx = text[max(0, m.start() - 20):m.end() + 12]
+            if rx is STATUS_CANC_KO and STATUS_CANC_COND.search(ctx):
+                continue
+            return m
+    return None
 
 DEADLINE_CUE = re.compile(r"(deadline|closes?|closing|due( date| by)?|submit by|submissions? (until|through|by)|no later than|apply by|until|through|(?:submission|entry|entries|application|reading)\s+(?:period|window)|마감|접수\s*기간|모집\s*기간|응모\s*기간|공모\s*기간|투고\s*기간|접수\s*일정|까지|기한|"
                           r"(?:신청|지원|제출|응모|원서\s*접수)\s*(?:기간|기한|마감|일정)|(?:지원|원서|온라인|우편|방문)\s*접수|접수\s*(?:일시|마감|기한)|"
@@ -216,8 +239,8 @@ def extract(doc: Doc, ocr: bool = False) -> List[Ext]:
             if m:
                 add("eligibility.statement", "stated", {"text": window(t, m.start(), m.end(), 200)}, seg, m, 0.7)
         # --- status
-        for rx, st in ((CLOSED_RE, "closed"), (OPEN_RE, "open"), (STANDING_RE, "standing"), (CANC_RE, "cancelled")):
-            m = rx.search(t)
+        for rx, st in ((CLOSED_RE, "closed"), (OPEN_RE, "open"), (STANDING_RE, "standing"), (None, "cancelled")):
+            m = rx.search(t) if rx is not None else status_cancel_match(t)
             if m:
                 add("status.declared", "stated", {"declared": st}, seg, m, 0.9 if st != "cancelled" else 0.6)
                 break
