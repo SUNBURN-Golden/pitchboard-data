@@ -44,8 +44,15 @@ def answer_all(svc) -> Dict[str, object]:
     q3 = [brief(p, {"no_fee": fee_answer(p)}) for p in rows if p["applicable_now"] in ("yes", "maybe")]
     def region(p):
         c = _cell(p, "eligibility.region")
-        if c["answer"] == "stated" and (c["facts"][0]["value"] or {}).get("worldwide"):
+        if c["answer"] == "explicitly_none" and (c["facts"][0]["value"] or {}).get("scope") == "worldwide":
             return "yes"
+        if c["answer"] == "stated":
+            v = c["facts"][0]["value"] or {}
+            k = v.get("korea_resident_eligible", True if v.get("worldwide") else None)
+            if k is True:
+                return "yes"
+            if k is False:
+                return "no"
         return "unknown" if c["answer"] in ("unknown",) else ("conflict" if c["answer"] == "conflict" else "unknown_needs_reading")
     q5 = [brief(p, {"korea_resident_eligible": region(p)}) for p in rows if p["applicable_now"] in ("yes", "maybe")]
     q6 = [brief(p, {"history": p["status_history"]}) for p in rows if any(h["to_status"] in ("extended", "cancelled") or h["kind"] != "transition" for h in p["status_history"])]
