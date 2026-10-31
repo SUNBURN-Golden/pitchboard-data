@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 from ..collect.dates import find_dates
 from ..collect.parse import Doc, Link, Segment
 
-EXTRACTOR_VERSION = "pb-rules-3"   # 2: Korean application-period cues, range start with 24h time, HH:MM times; 3: non-writing deadline gate (segment text + its heading)
+EXTRACTOR_VERSION = "pb-rules-4"   # 2: Korean application-period cues, range start with 24h time, HH:MM times; 3: non-writing deadline gate (segment text + its heading); 4: eligibility.region stated values (pb-region-1)
 LABELER_VERSION = "pb-labels-2"    # 2: non-writing notices (venue rental, hiring, admissions, dance/theatre...) -> not_writing_call
 OCR_EXTRACTOR = "ocr:tesseract+rules"
 
@@ -100,6 +100,91 @@ AI_NO = re.compile(r"((do not|don't|will not|cannot|can't|not) (accept|consider|
 AI_MENTION = re.compile(r"\b(generative AI|AI[- ]generated|artificial intelligence|ChatGPT|LLM)\b|생성형\s*AI|인공지능", re.I)
 WORLD_RE = re.compile(r"(open to (writers|submissions|everyone) (from )?(everywhere|worldwide|around the world|internationally)|international submissions are welcome|writers worldwide)", re.I)
 ELIG_RE = re.compile(r"((open|restricted|limited) to [^.\n]{0,60}(residents|citizens|nationals|resident|members|students|writers|authors)[^.\n]{0,60}|(residents|citizens) of [^.\n]{0,50}|must be (a )?(resident|citizen|currently|enrolled|over|at least)[^.\n]{0,60}|(국내|대한민국)\s*(거주|국민|국적)[^.\n]{0,40}|응모\s*자격[^.\n]{0,60}|지원\s*자격[^.\n]{0,60}|만\s*\d+세\s*이상[^.\n]{0,30})", re.I)
+# eligibility.region as a stated value (pb-region-1). Before this, the extractor only ever wrote the narrow worldwide
+# explicitly_none phrase, so eligibility.region 'stated' was 0 on every page. Values stay literal: a place is only
+# recorded when it resolves to a known country; anything else stays an eligibility.statement for human reading.
+PLACES = [  # (regex, code)
+    (r"the united states(?: of america)?|united states(?: of america)?|u\.\s?s\.(?:\s?a\.)?|usa|america", "US"),
+    (r"the united kingdom|united kingdom|\buk\b|u\.k\.|great britain|britain|england|scotland|wales|northern ireland", "GB"),
+    (r"(?:the republic of )?ireland", "IE"), (r"canada", "CA"), (r"australia", "AU"), (r"new zealand|aotearoa", "NZ"),
+    (r"(?:south |the republic of )?korea", "KR"), (r"india", "IN"), (r"south africa", "ZA"), (r"nigeria", "NG"),
+    (r"singapore", "SG"), (r"the philippines|philippines", "PH"), (r"namibia", "NA"), (r"kenya", "KE"), (r"ghana", "GH"),
+    (r"jamaica", "JM"), (r"syria", "SY"), (r"iran", "IR"), (r"cuba", "CU"), (r"north korea", "KP"), (r"russia", "RU"),
+    (r"crimea", "UA-43"), (r"belarus", "BY"), (r"venezuela", "VE"), (r"sudan", "SD"),
+]
+DEMONYMS = {"american": "US", "u.s.": "US", "us": "US", "british": "GB", "uk": "GB", "u.k.": "GB", "irish": "IE", "canadian": "CA",
+            "australian": "AU", "new zealand": "NZ", "korean": "KR"}
+_PLACE_ALT = "|".join(r for r, _ in PLACES)
+_DEMO_ALT = r"american|(?-i:U\.S\.|US)|british|(?-i:UK|U\.K\.)|irish|canadian|australian|new zealand|korean"
+REGION_WORLD_EN = re.compile(r"(open to (?:both )?(?:u\.?s\.?|american) and non-(?:u\.?s\.?|american) (?:residents|citizens|writers|entrants|authors)|"
+                             r"(?:writers|authors|poets|submissions|entries|applicants) (?:of|from) (?:every|any|all) (?:nationalit(?:y|ies)|countr(?:y|ies))|"
+                             r"regardless of (?:your |their )?(?:nationality|citizenship|country of residence|location|where (?:you|they) live)|"
+                             r"open to (?:writers|authors|poets|entrants|applicants|anyone|everyone) (?:from |in )?(?:anywhere(?: in the world)?|any country|all countries|around the world|across the (?:world|globe))|"
+                             r"(?:accept|welcome)s? (?:submissions|entries|work|writers) from (?:anywhere|around the world|all over the world|all countries|any country))", re.I)
+REGION_EXCL_EN = re.compile(r"(?:unable to|cannot|can't|can ?not|do not|don't|does not|will not) accept (?:entries|submissions|work|applications) from (?P<list>[^.;]{3,200})", re.I)
+REGION_ONLY_EN = re.compile(r"((?:open|restricted|limited|available)\s+(?:only\s+)?to\s+(?:writers\s+|authors\s+|poets\s+|applicants\s+|entrants\s+|creators\s+)?(?:who\s+are\s+)?"
+                            r"(?:legal\s+|permanent\s+|current\s+)?(?:residents?|citizens?|nationals?)\s+of\s+(?P<p1>" + _PLACE_ALT + r")|"
+                            r"must\s+(?:be|have\s+been)\s+(?:a\s+|an\s+)?(?:legal\s+|permanent\s+|current\s+)?(?:residents?|citizens?|nationals?)\s+of\s+(?P<p2>" + _PLACE_ALT + r")|"
+                            r"open\s+(?:only\s+)?to\s+(?:writers|authors|poets|applicants|creators|entrants)\s+(?:living|based|residing|resident)\s+in\s+(?P<p3>" + _PLACE_ALT + r")|"
+                            r"(?P<d1>" + _DEMO_ALT + r")\s+(?:residents|citizens|writers|authors)\s+only|"
+                            r"open\s+(?:only\s+)?to\s+(?P<d2>" + _DEMO_ALT + r")\s+(?:residents|citizens|nationals|writers|authors|poets))", re.I)
+REGION_WORLD_KO = re.compile(r"(국적\s*(?:및\s*거주지\s*)?(?:불문|무관|제한\s*(?:없|이\s*없))|거주\s*(?:지역|지|국가)\s*(?:불문|무관|제한\s*(?:없|이\s*없))|전\s*세계\s*누구나)")
+REGION_KR_KO = re.compile(r"((?:대한민국|한국)\s*(?:국적(?:을\s*(?:가진|소지한|보유한))?(?:자|인)?|국민|시민권자)|(?:국내|대한민국|한국)\s*(?:에\s*)?(?:거주(?:하는|자|중인)?|체류(?:하는|자)?))")
+REGION_OVERSEAS_KO = re.compile(r"(재외\s*(?:동포|국민|한인)|해외\s*(?:거주(?:자|하는)?\s*(?:한국인|한인|동포|교민)?|교포|동포|교민))[^.\n]{0,20}(포함|가능|도\s*(?:응모|지원|참가))")
+REGION_FOREIGN_KO = re.compile(r"(외국인|외국\s*국적(?:자|을\s*가진)?)")
+ELIG_CUE_KO = re.compile(r"(자격|대상|응모|지원|참가|신청|공모)")
+
+
+def _places(text: str) -> List[str]:
+    found = []
+    t = " " + text.lower() + " "
+    for rx, code in sorted(PLACES, key=lambda x: -len(x[0])):
+        if re.search(r"(?<![a-z])(?:" + rx + r")(?![a-z])", t, re.I):
+            # 'north korea' must not also count as KR
+            if code == "KR" and re.search(r"north korea", t):
+                t2 = re.sub(r"north korea", " ", t)
+                if not re.search(r"(?<![a-z])(?:" + rx + r")(?![a-z])", t2, re.I):
+                    continue
+            if code not in found:
+                found.append(code)
+    return found
+
+
+def region_value(text: str) -> Optional[Tuple[str, dict, "re.Match"]]:
+    """eligibility.region read literally from one segment: ('stated', value, match) or None.
+    value: {scope: worldwide|restricted, regions?, excluded?, basis?, korea_resident_eligible: True|False|None}."""
+    m = REGION_WORLD_EN.search(text) or REGION_WORLD_KO.search(text)
+    ex = REGION_EXCL_EN.search(text)
+    if m or (ex and _places(ex.group("list"))):
+        excluded = _places(ex.group("list")) if ex else []
+        return "stated", {"scope": "worldwide", "worldwide": True, "excluded": excluded,
+                          "korea_resident_eligible": "KR" not in excluded}, (m or ex)
+    m = REGION_ONLY_EN.search(text)
+    if m:
+        p = next((g for g in (m.group("p1"), m.group("p2"), m.group("p3")) if g), None)
+        regions = _places(p) if p else []
+        d = next((g for g in (m.group("d1"), m.group("d2")) if g), None)
+        if d:
+            regions = [DEMONYMS.get(d.lower().strip(), "")] if DEMONYMS.get(d.lower().strip()) else []
+        if regions:
+            basis = "citizenship" if re.search(r"citizen|national", m.group(0), re.I) else "residence"
+            return "stated", {"scope": "restricted", "regions": regions, "basis": basis,
+                              "korea_resident_eligible": "KR" in regions}, m
+        return None
+    if ELIG_CUE_KO.search(text):
+        m = REGION_KR_KO.search(text)
+        if m:
+            regions = ["KR"]
+            if REGION_OVERSEAS_KO.search(text):
+                regions.append("overseas_korean")
+            basis = "residence" if re.search(r"거주|체류", m.group(0)) else "citizenship"
+            return "stated", {"scope": "restricted", "regions": regions, "basis": basis, "korea_resident_eligible": True}, m
+        m = re.search(r"(?:자격|대상)\s*[:：|]?\s*[^.\n]{0,40}" + REGION_FOREIGN_KO.pattern, text)
+        if m and not re.search(r"내국인|한국인|대한민국\s*국민", text):
+            return "stated", {"scope": "restricted", "regions": ["non-KR"], "basis": "citizenship", "korea_resident_eligible": None}, m
+    return None
+
+
 ENTITY_EN = re.compile(r"(?i:presented|hosted|published|sponsored|organized|organised|funded|administered) (?i:by) (?P<n>[A-Z][\w&'’. -]{2,50}?)(?=[.,;|]|\s+(?:and|with|in|for|at)\b|$)")
 ENTITY_KO = re.compile(r"(?:주최|주관|후원|발행처|출판사)\s*[:：]\s*(?P<n>[^,;|/\n·()]{2,30})")
 APPLY_ANCHOR = re.compile(r"(submit|apply|application|enter now|submission manager|submittable|제출|응모|접수|신청|지원하기)", re.I)
@@ -232,8 +317,11 @@ def extract(doc: Doc, ocr: bool = False) -> List[Ext]:
             add("policy.ai", "stated", {"dimension": "generated_content", "state": "mentioned_unclassified"}, seg, m, 0.5)
         # --- eligibility
         m = WORLD_RE.search(t)
+        rv = None if m else region_value(t + (" " + seg.heading if seg.heading and not ELIG_CUE_KO.search(t) else ""))
         if m:
             add("eligibility.region", "explicitly_none", {"scope": "worldwide"}, seg, m)
+        elif rv and rv[2].start() < len(t):
+            add("eligibility.region", rv[0], rv[1], seg, rv[2], 0.9)
         else:
             m = ELIG_RE.search(t)
             if m:
