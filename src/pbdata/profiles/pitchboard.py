@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 from ..collect.dates import find_dates
 from ..collect.parse import Doc, Link, Segment
 
-EXTRACTOR_VERSION = "pb-rules-4"   # 2: Korean application-period cues, range start with 24h time, HH:MM times; 3: non-writing deadline gate (segment text + its heading); 4: eligibility.region stated values (pb-region-1)
+EXTRACTOR_VERSION = "pb-rules-5"   # 2: Korean application-period cues, range start with 24h time, HH:MM times; 3: non-writing deadline gate (segment text + its heading); 4: eligibility.region stated values (pb-region-1); 5: non-writing gate also reads the board-row title above the deadline line, membership drives / event sign-ups (pb-row-1)
 LABELER_VERSION = "pb-labels-2"    # 2: non-writing notices (venue rental, hiring, admissions, dance/theatre...) -> not_writing_call
 OCR_EXTRACTOR = "ocr:tesseract+rules"
 
@@ -202,8 +202,8 @@ YEAR_RE = re.compile(r"(?<!\d)(20\d{2})(?!\d)")
 # ("대관 공고"), a dance residency, staff hiring or a school admission guide. These are not writing calls:
 #  - NONWRITING_TYPE: notice types that are never a writing call, even when a literary word appears;
 #  - NONWRITING_DISC: other disciplines and events (forum, screening), which are overridden by any writing cue (희곡/극본 = playwriting, 미술 비평 = criticism).
-NONWRITING_TYPE = re.compile(r"(대관|채용|입찰|용역|입학|신입생|(?:특별|일반|서류|면접|실기)\s*전형|공모\s*직위|임용|venue (hire|rental)|job (opening|vacanc)|we(?:'re| are) hiring)", re.I)
-NONWRITING_DISC = re.compile(r"(행사\s*(?:안내|소개)|포럼|세미나|심포지엄|설명회|공연\s*실황|상영|무용|댄스|발레|연극|뮤지컬|오페라|공연장|미술|시각\s*예술|공예|음악|국악|전시|영화|\bdance\b|tanz|탄츠|\bballet\b|\btheat(?:re|er)\b|\bvisual arts?\b|\bmusic(?:al)?\b|\bexhibition\b|\bfilm\b)", re.I)
+NONWRITING_TYPE = re.compile(r"(대관|채용|입찰|용역|입학|신입생|신입\s*회원|회원\s*모집|(?:특별|일반|서류|면접|실기)\s*전형|공모\s*직위|임용|venue (hire|rental)|job (opening|vacanc)|we(?:'re| are) hiring)", re.I)
+NONWRITING_DISC = re.compile(r"(행사\s*(?:안내|소개)|포럼|세미나|심포지엄|토론회|설명회|공연\s*실황|상영|무용|댄스|발레|연극|뮤지컬|오페라|공연장|미술|시각\s*예술|공예|음악|국악|전시|영화|\bdance\b|tanz|탄츠|\bballet\b|\btheat(?:re|er)\b|\bvisual arts?\b|\bmusic(?:al)?\b|\bexhibition\b|\bfilm\b)", re.I)
 WRITING_CUE = re.compile(r"(문학|문예|소설|시인|시집|시조|동시|수필|에세이|평론|비평|서평|리뷰|희곡|극본|대본|시나리오|동화|원고|번역|글쓰기|웹진|"
                          r"\bliter(?:ary|ature)|\bfiction|\bpoe(?:m|ms|try|t|ts)\b|\bessays?\b|\bwrit(?:ing|ers?)\b|\bmanuscripts?\b|\btranslat|\bcriticism|\bplaywrit|\bscripts?\b|\bscreenplays?\b|\breviews?\b)", re.I)
 
@@ -211,6 +211,27 @@ WRITING_CUE = re.compile(r"(문학|문예|소설|시인|시집|시조|동시|수
 def non_writing(text: str) -> bool:
     """True when a notice/deadline text is about something other than a writing call (rules only)."""
     return bool(NONWRITING_TYPE.search(text) or (NONWRITING_DISC.search(text) and not WRITING_CUE.search(text)))
+
+
+# Board/card lists put the notice title on its own line and the "접수 : 2026-10-27~2026-11-26" line a few lines below,
+# with no heading in between (e.g. "토론회 목록위원회 책토론회" / "신청 : 2/25" / "주관 ... 일시 ... 장소" / "접수 : ...").
+# The row title is the only place that says what the deadline is for, so the non-writing gate reads it too.
+ROW_STATUS = re.compile(r"^\s*(접수\s*(?:중|예정|마감|종료)|모집\s*(?:중|예정|마감|종료)|진행\s*중|마감|종료|open|closed)\s*$", re.I)
+ROW_CONTEXT_SEGS = 3
+ROW_LINE_MAX = 100
+
+
+def row_context(segments, i: int) -> str:
+    """Short lines directly above segment i in the same board row: walk back at most ROW_CONTEXT_SEGS lines, stopping at
+    the previous row's status word or deadline line, a heading, or any long (prose) line."""
+    out = []
+    for j in range(i - 1, max(-1, i - 1 - ROW_CONTEXT_SEGS), -1):
+        s = segments[j]
+        t = s.text.strip()
+        if s.kind == "h" or len(t) > ROW_LINE_MAX or ROW_STATUS.match(t) or DEADLINE_CUE.search(t):
+            break
+        out.append(t)
+    return " ".join(reversed(out))
 
 
 @dataclasses.dataclass
@@ -245,12 +266,15 @@ def extract(doc: Doc, ocr: bool = False) -> List[Ext]:
     def add(field, state, value, seg, m, conf=1.0):
         out.append(Ext(field, state, value, window(seg.text, m.start(), m.end()), dict(seg.locator, seg=seg.idx, kind=seg.kind, heading=seg.heading[:80]), conf * src_conf))
 
-    for seg in doc.segments:
+    for si, seg in enumerate(doc.segments):
         t = seg.text
         # --- dates
         hits = find_dates(t)
         if hits and DEADLINE_CUE.search(t) and not (NOT_DEADLINE_CUE.search(t) and not re.search(r"deadline|마감|접수|submit|due", t, re.I)) \
-                and not non_writing(t + " " + seg.heading):   # e.g. a dance-residency board row, or '마감일' under an event/hiring notice heading
+                and not non_writing(t + " " + seg.heading) \
+                and not (len(t) <= ROW_LINE_MAX and non_writing(row_context(doc.segments, si) + " " + t)):
+            # e.g. a dance-residency board row, '마감일' under an event/hiring notice heading, or a short '접수 :' line under a
+            # membership-drive / book-discussion sign-up row title
             cue = DEADLINE_CUE.search(t)
             first, last = hits[0], hits[-1]
             if len(hits) >= 2 and (RANGE_CUE.search(t) or re.search(r"[~∼–]", t)) and last.iso >= first.iso:
