@@ -193,5 +193,20 @@ class RunnerTest(unittest.TestCase):
             e.close()
 
 
+class WindowSincePrevRun(unittest.TestCase):
+    def test_window_starts_at_previous_ok_daemon_run(self):
+        e = Env()
+        e.infra.execute("INSERT INTO runs(run_id,started_at,finished_at,outcome) VALUES('dmn_old','2026-10-19T21:00:00Z','2026-10-19T21:01:00Z','ok')")
+        e.infra.execute("INSERT INTO runs(run_id,started_at,outcome) VALUES('dmn_bad','2026-10-19T22:00:00Z','failed')")
+        e.infra.execute("INSERT INTO runs(run_id,started_at) VALUES('dmn_now','2026-10-20T00:00:00Z')")
+        e.infra.commit()
+        c = e.ctx(run_id="dmn_now")
+        self.assertEqual(S.s_discovery(c)["window_start"], "2026-10-19T21:00:00Z")
+
+    def test_window_defaults_to_clock_without_history(self):
+        e = Env()
+        self.assertEqual(S.s_discovery(e.ctx(run_id="dmn_first"))["window_start"], T0)
+
+
 if __name__ == "__main__":
     unittest.main()

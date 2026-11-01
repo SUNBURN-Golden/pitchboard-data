@@ -23,6 +23,16 @@ def _since(c: RunContext) -> str:
     return c.state.get("discovery", {}).get("window_start") or c.opts.get("window_start") or c.clock()
 
 
+def _prev_run_start(c: RunContext):
+    """Start of the previous successful daemon run. The 04:20 collector fetches (and uses the day's request budget)
+    before the daemon runs, so a window that starts at this run's own clock never sees those revisions and every run
+    looks empty. Starting the window at the previous daemon run covers everything fetched since then (stages 3-4 are
+    idempotent, so overlap is harmless)."""
+    r = c.infra.execute("SELECT started_at FROM runs WHERE run_id LIKE 'dmn_%' AND run_id<>? AND outcome='ok' "
+                        "ORDER BY started_at DESC LIMIT 1", (c.run_id,)).fetchone()
+    return r[0] if r else None
+
+
 def _collector_ctx(c: RunContext):
     if "_cctx" not in c.opts:
         from ..collect.net import Fetcher
@@ -36,7 +46,7 @@ def _collector_ctx(c: RunContext):
 
 # 1 ---------------------------------------------------------------- discovery
 def s_discovery(c: RunContext) -> dict:
-    out = {"window_start": c.opts.get("window_start") or c.clock(), "discover_jobs": 0}
+    out = {"window_start": c.opts.get("window_start") or _prev_run_start(c) or c.clock(), "discover_jobs": 0}
     if c.opts.get("offline"):
         return out
     out["discover_jobs"] = collector.seed_discovery(_collector_ctx(c))
