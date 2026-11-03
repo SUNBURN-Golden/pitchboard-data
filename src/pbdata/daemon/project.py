@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 from ..ids import sha256_hex
 from .. import timeutil
@@ -31,11 +31,14 @@ def _fact_view(svc, f) -> dict:
                                                  "paragraph": ev["paragraph_index"], "chars": [ev["char_start"], ev["char_end"]]}}
 
 
-def _condition(svc, subject_ids: List[str], predicate: str) -> dict:
+def _condition(svc, subject_ids: List[str], predicate: str, inherited_sources: Set[str]) -> dict:
     """Return the condition cell. Call-level facts win over outlet-level ones. Conflicts are surfaced, not resolved."""
     for sid in subject_ids:
         rows = svc.execute("SELECT * FROM pb_fact WHERE subject_id=? AND predicate=? AND superseded_at IS NULL ORDER BY recorded_at DESC",
                            (sid, predicate)).fetchall()
+        if sid != subject_ids[0]:
+            # Site ownership and source_type do not establish applicability to a call.
+            rows = [r for r in rows if r["source_id"] in inherited_sources]
         if not rows:
             continue
         views = [_fact_view(svc, r) for r in rows]
@@ -84,7 +87,15 @@ def build_payload(svc, call_id: str, now: Optional[dt.datetime] = None) -> dict:
     col = "outlet_id" if c["outlet_id"] else "organizer_id"
     owner = svc.execute("SELECT canonical_name FROM %s WHERE %s=?" % (tbl, col), (owner_id,)).fetchone()
     aliases = [r[0] for r in svc.execute("SELECT alias_raw FROM pb_alias WHERE subject_id IN (?,?) ORDER BY alias_raw", (owner_id, call_id))]
-    conds = {p: _condition(svc, [call_id, owner_id], p) for p in CONDITIONS}
+    # An evidence-backed call fact establishes that this exact source concerns the
+    # call (including a separate guidelines source explicitly attached to it).
+    # Domain/path similarity and AI-inferred relations cannot establish this link.
+    inherited_sources = {r[0] for r in svc.execute(
+        "SELECT DISTINCT f.source_id FROM pb_fact f JOIN pb_evidence e ON e.evidence_id=f.evidence_id "
+        "WHERE f.subject_id=? AND f.subject_type='call' AND f.superseded_at IS NULL "
+        "AND f.value_state IN ('stated','explicitly_none') AND f.epistemic IN ('source_claim','verified_fact') "
+        "AND e.source_id=f.source_id", (call_id,))}
+    conds = {p: _condition(svc, [call_id, owner_id], p, inherited_sources) for p in CONDITIONS}
     closes = None
     cl = conds["deadline.closes_on"]
     if cl["answer"] == "stated" and (cl["facts"][0]["value"] or {}).get("date"):
@@ -97,8 +108,10 @@ def build_payload(svc, call_id: str, now: Optional[dt.datetime] = None) -> dict:
         if any(conds[p]["facts"] for p in ("deadline.closes_on", "status.declared")) else None
     history = [dict(r) for r in svc.execute("SELECT kind, from_status, to_status, basis, evidence_id, occurred_at, reason FROM pb_status_event "
                                            "WHERE call_id=? ORDER BY recorded_at", (call_id,))]
-    revs = sorted({r[0] for r in svc.execute("SELECT DISTINCT e.revision_id FROM pb_fact f JOIN pb_evidence e ON e.evidence_id=f.evidence_id "
-                                              "WHERE f.subject_id IN (?,?) AND f.superseded_at IS NULL", (call_id, owner_id))})
+    selected_facts = {f["fact_id"] for cell in conds.values() for f in cell["facts"]}
+    revs = sorted({r["revision_id"] for r in svc.execute(
+        "SELECT f.fact_id, e.revision_id FROM pb_fact f JOIN pb_evidence e ON e.evidence_id=f.evidence_id "
+        "WHERE f.subject_id IN (?,?) AND f.superseded_at IS NULL", (call_id, owner_id)) if r["fact_id"] in selected_facts})
     return {"call_id": call_id, "owner": {"id": owner_id, "type": col[:-3], "name": owner["canonical_name"] if owner else None, "aliases": aliases},
             "edition_key": c["edition_key"], "title": c["title_raw"], "scope_ref": c["scope_ref"],
             "status": c["status"], "status_since": c["status_since"], "status_basis": c["status_basis"],

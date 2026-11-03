@@ -9,6 +9,8 @@ Safeguards: `locks/daemon.lock` + `locks/collector.lock` (flock), `locks/KILL_SW
 
 Rules: newer `status.declared` evidence moves a call to cancelled/closed/reopened (with history in `pb_status_event`); the clock may only close a call after the latest possible deadline instant and may never cancel. Missing conditions are `unknown`, never "no restriction". Call-level facts override outlet-level ones; conflicting values are kept and shown as `conflict`.
 
+Projection inheritance is source-bound: an outlet/organizer fact applies to a call only when that exact source also has a live, evidence-backed `source_claim` or `verified_fact` on the call. Shared site ownership, the `official_guidelines` source type, and AI-inferred relations do not establish applicability. Separate guidelines pages need an explicit evidence-backed call fact before their outlet facts can be inherited; otherwise the condition stays unknown. Projection revision IDs include only evidence used by the selected facts. Stored facts and conflicts are preserved.
+
 Scheduling: cron `30 5 * * * scripts/daemon_daily.sh` (renewal of public approvals due in 48h, then one run), after the 04:20 collector `daily.sh`.
 
 ## Dev pipeline lanes (준태님 2026-11-03 12:55 KST)
