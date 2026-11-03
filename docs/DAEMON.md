@@ -10,3 +10,11 @@ Safeguards: `locks/daemon.lock` + `locks/collector.lock` (flock), `locks/KILL_SW
 Rules: newer `status.declared` evidence moves a call to cancelled/closed/reopened (with history in `pb_status_event`); the clock may only close a call after the latest possible deadline instant and may never cancel. Missing conditions are `unknown`, never "no restriction". Call-level facts override outlet-level ones; conflicting values are kept and shown as `conflict`.
 
 Scheduling: cron `30 5 * * * scripts/daemon_daily.sh` (renewal of public approvals due in 48h, then one run), after the 04:20 collector `daily.sh`.
+
+## Dev pipeline lanes (준태님 2026-11-03 12:55 KST)
+Stage model order lives in `config/dev_lanes.json` (primary first, then backups); `scripts/devpipe/run_stage.sh <stage> <log> <prompt>` tries them in order.
+design: Codex astra 6 high → DeepSeek flash → GLM → swe-2 · design review: DeepSeek flash → Codex sol 6.1 high → GLM → swe-2 ·
+build: Codex sol 6.1 high → DeepSeek flash → GLM → swe-2 · build review: GLM → DeepSeek flash → Codex sol 6.1 high → swe-2 ·
+review fix: DeepSeek flash → Codex sol 6.1 high → GLM → swe-2 · re-review: Devin automatic (adaptive) → DeepSeek flash → Codex sol 6.1 high → swe-2 ·
+audit every 10 PRs vs the original blueprint: Codex astra 6 high → GLM → swe-2.
+DeepSeek runs via Claude CLI on `https://api.deepseek.com/anthropic` (model `deepseek-flash`). Cron reads `DEEPSEEK_API_KEY` from `~/.config/pitchboard/env` (600, not in git).
