@@ -63,6 +63,11 @@ python -m pbdata.collect status  --root $PB_DATA_ROOT
 ```
 Resume after a crash: run the same command again with the same `--run-tag` and `--run-id` and `--no-seed` (leases expire after 300 s and are re-queued).
 
+`open_calls_list` contains at most 50 distinct `call_id` values, matching the identity used by
+`open_calls_current`. Each entry retains all eligible `deadline_evidence` (deadline, epistemic, source).
+The legacy summary fields show the earliest eligible deadline, then strongest evidence and URL order;
+alternative deadlines remain evidence and are not resolved by the metric.
+
 ## Known limits (honest)
 * Browser render = headless chromium `--dump-dom` over the already-fetched HTML with the network disabled (inline JS only). JS apps that need XHR stay `needs_render` failures.
 * No general web SERP provider (interface only; scraping a search engine is not done). Discovery uses Wikidata/Wikipedia APIs and links found on registered sites.
