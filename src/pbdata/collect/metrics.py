@@ -42,9 +42,21 @@ def compute(svc: sqlite3.Connection, infra: sqlite3.Connection, targets: dict, g
     today = _dt.date.today().isoformat()
     rows = svc.execute("SELECT c.call_id, c.status, c.title_raw, json_extract(f.value_json,'$.date') d, s.canonical_url u, f.epistemic e FROM pb_call_edition c "
                        "JOIN pb_fact f ON f.subject_id=c.call_id AND f.predicate='deadline.closes_on' AND f.superseded_at IS NULL AND f.value_state='stated' "
-                       "JOIN pb_source s ON s.source_id=f.source_id WHERE c.status NOT IN ('closed','cancelled','superseded') AND json_extract(f.value_json,'$.date') >= ?", (today,)).fetchall()
-    out["open_calls_current"] = len({r["call_id"] for r in rows})
-    out["open_calls_list"] = [{"deadline": r["d"], "status": r["status"], "epistemic": r["e"], "source": r["u"]} for r in rows][:50]
+                       "JOIN pb_source s ON s.source_id=f.source_id WHERE c.status NOT IN ('closed','cancelled','superseded') AND json_extract(f.value_json,'$.date') >= ? "
+                       "ORDER BY c.call_id, d, CASE f.epistemic WHEN 'verified_fact' THEN 0 WHEN 'source_claim' THEN 1 ELSE 2 END, s.canonical_url, f.fact_id", (today,)).fetchall()
+    # Several sources can corroborate one edition. Group by its identity, never URL/date:
+    # different editions may share both. Apply the display cap after grouping.
+    calls: Dict[str, Dict] = {}
+    for r in rows:
+        evidence = {"deadline": r["d"], "epistemic": r["e"], "source": r["u"]}
+        if r["call_id"] not in calls:
+            # Keep the legacy summary fields deterministic: earliest eligible deadline,
+            # strongest evidence, then URL. Alternatives remain visible, not resolved.
+            calls[r["call_id"]] = dict(evidence, call_id=r["call_id"], status=r["status"], deadline_evidence=[])
+        if evidence not in calls[r["call_id"]]["deadline_evidence"]:
+            calls[r["call_id"]]["deadline_evidence"].append(evidence)
+    out["open_calls_current"] = len(calls)
+    out["open_calls_list"] = list(calls.values())[:50]
     # 3. required-field coverage (per outlet or call subject x predicate), live facts only
     cov = {"stated": 0, "explicitly_none": 0, "not_stated_in_inspected_scope": 0, "empty": 0}
     per_pred: Dict[str, Dict[str, int]] = {}
