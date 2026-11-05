@@ -85,6 +85,61 @@ class HeadingGateTests(unittest.TestCase):
         self.assertEqual(self._closes("2026 비평 포럼 발표 원고 공모", "마감일 2026.11.17"), ["2026-11-17"])
 
 
+class ScholarshipGateTests(unittest.TestCase):
+    def test_entrance_awards_title_gates_separate_application_timeline(self):
+        labs, exts = labels("Entrance awards and scholarships | Douglas College",
+                            "Eligibility guidelines. Application period: October 1, 2026 through March 31, 2027. "
+                            "Award winners will be notified later.")
+        self.assertFalse(any(e.field.startswith("deadline.") for e in exts))
+        self.assertIn("rules", labs)
+        self.assertIn("results", labs)
+        self.assertEqual(labs["recruitment"].status, "not_writing_call")
+        self.assertFalse(labs["recruitment"].open_call_eligible)
+
+    def test_finance_deadline_segments_are_gated_without_a_title(self):
+        for topic in ("Scholarships", "Student bursaries", "Entrance awards", "Financial aid", "Tuition", "Fees-and-finances"):
+            with self.subTest(topic=topic):
+                self.assertEqual(closes(topic + " application deadline: March 31, 2027."), [])
+
+    def test_writing_scholarships_and_awards_keep_deadlines(self):
+        for title in ("Poetry scholarship", "Writers scholarship", "Fiction award", "Essay contest"):
+            with self.subTest(title=title):
+                labs, exts = labels(title, "Submit your original poems or fiction manuscript. "
+                                    "Scholarship application deadline: December 4, 2026.")
+                self.assertEqual([e.value["date"] for e in exts if e.field == "deadline.closes_on"], ["2026-12-04"])
+                self.assertTrue(labs["recruitment"].open_call_eligible)
+
+    def test_writing_cues_in_another_paragraph_override_finance_title_and_deadline(self):
+        doc = Doc("html", title="Scholarship award guidelines", segments=[
+            Segment(0, "p", "Call for submissions: send an original poetry manuscript."),
+            Segment(1, "p", "Scholarship application deadline: December 4, 2026.")])
+        exts = prof.extract(doc)
+        self.assertEqual([e.value["date"] for e in exts if e.field == "deadline.closes_on"], ["2026-12-04"])
+        self.assertTrue(any(l.open_call_eligible for l in prof.label_doc(doc, exts, TODAY)))
+
+    def test_literary_title_overrides_finance_in_a_bare_deadline_segment(self):
+        labs, exts = labels("Poetry scholarship guidelines", "Scholarship application deadline: December 4, 2026.")
+        self.assertEqual([e.value["date"] for e in exts if e.field == "deadline.closes_on"], ["2026-12-04"])
+        self.assertTrue(labs["recruitment"].open_call_eligible)
+
+    def test_og_title_gates_bare_deadline(self):
+        doc = Doc("html", meta={"og:title": "Student bursary guidelines"},
+                  segments=[Segment(0, "p", "Eligibility rules. Deadline: December 4, 2026.")])
+        self.assertFalse(any(e.field == "deadline.closes_on" for e in prof.extract(doc)))
+        self.assertEqual(next(l for l in prof.label_doc(doc, [], TODAY) if l.label == "recruitment").status,
+                         "not_writing_call")
+
+    def test_unrelated_writing_navigation_does_not_override_finance_title(self):
+        doc = Doc("html", title="Entrance awards and scholarships", segments=[
+            Segment(0, "p", "Creative Writing courses | Program Reviews | Child and Youth Care essay form"),
+            Segment(1, "p", "Eligibility guidelines. Application period: October 1, 2026 through March 31, 2027."),
+            Segment(2, "p", "Award winners will be notified later.")])
+        exts = prof.extract(doc)
+        self.assertFalse(any(e.field == "deadline.closes_on" for e in exts))
+        self.assertEqual(next(l for l in prof.label_doc(doc, exts, TODAY) if l.label == "recruitment").status,
+                         "not_writing_call")
+
+
 class BoardRowTitleGateTests(unittest.TestCase):
     """Card/board lists (childbook.org 교육 프로그램): the row title sits a few lines above a bare '접수 : a~b' line."""
     def _closes(self, lines):
@@ -133,6 +188,38 @@ class PromoteSkipsNonWritingTests(unittest.TestCase):
     def test_status_in_skip_set(self):
         from pbdata.collect import promote
         self.assertIn("not_writing_call", promote.SKIP_LABEL_STATUS)
+
+    def test_rules_only_nonwriting_title_cannot_promote_even_with_a_future_deadline(self):
+        from helpers import service, add_source, add_outlet, add_revision
+        from pbdata.collect import promote, store
+
+        # Retain a future extraction to exercise the promotion gate independently of deadline filtering.
+        # Results in the body suppress the old deadline-based recruitment fallback: the rules label alone
+        # previously admitted this page to promotion.
+        body = "Eligibility rules. Application deadline: March 31, 2027. Award winners will be notified later."
+        for title, writing in (("Entrance awards and scholarships", False), ("회원모집", False),
+                               ("Venue rental guidelines", False), ("Poetry scholarship guidelines", True)):
+            with self.subTest(title=title), service() as svc:
+                self.addCleanup(svc.close)
+                now = "2026-11-06T00:00:00Z"
+                doc = Doc("html", title=title, segments=[Segment(0, "p", body)])
+                exts = prof.extract(Doc("html", segments=doc.segments))
+                self.assertTrue(any(e.field == "deadline.closes_on" for e in exts))
+                labs = prof.label_doc(doc, exts, dt.date(2026, 11, 6))
+                self.assertTrue(any(l.label == "rules" for l in labs))
+                if writing:
+                    self.assertFalse(any(l.label == "recruitment" for l in labs))
+                else:
+                    self.assertEqual(next(l for l in labs if l.label == "recruitment").status, "not_writing_call")
+                sid = add_source(svc, outlet=add_outlet(svc))
+                add_revision(svc, sid, fetched_at=now)
+                rid = store.insert_raw(svc, now, source_id=sid, url="https://example.org/x", kind="html",
+                                       fetch_method="html", outcome="ok", change_state="new", text_hash="h1", fetched_at=now)
+                store.put_extractions(svc, rid, exts, "rules", prof.EXTRACTOR_VERSION, now)
+                store.put_labels(svc, rid, labs, prof.LABELER_VERSION, now)
+                stats = promote.promote_raw(svc, rid, now)
+                self.assertEqual(stats.calls_created, int(writing))
+                self.assertEqual(svc.execute("SELECT count(*) FROM pb_call_edition").fetchone()[0], int(writing))
 
 
 if __name__ == "__main__":
