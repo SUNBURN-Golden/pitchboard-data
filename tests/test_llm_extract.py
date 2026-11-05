@@ -1,0 +1,565 @@
+"""Shadow safety regressions: temporary state and fake transports only."""
+import contextlib
+from concurrent.futures import ThreadPoolExecutor
+import datetime as dt
+from decimal import Decimal
+import io
+import json
+import os
+from pathlib import Path
+import socket
+import tempfile
+import unittest
+from unittest.mock import patch
+import urllib.error
+
+from pbdata.collect.shadow import common, policy, runner, schema, state
+from pbdata.collect.shadow.common import Stop, UTC, digest, dumps
+from pbdata.collect.parse import Doc, Segment, parse_html
+
+NOW = dt.datetime(2026, 11, 5, 12, tzinfo=UTC)
+URL = "https://example.org/call"
+KEY = "sk-SENTINEL-NEVER-LOG-123"
+HTML = ("<html><title>Writing submissions 2026</title><h1>Writing submissions</h1>"
+        "<p>Submissions are open until December 1, 2026.</p>"
+        "<p>We pay USD 100 per story.</p><p>All writers worldwide may apply.</p></html>").encode()
+QUOTE = "Submissions are open until December 1, 2026."
+
+
+def page(url=URL, body=HTML):
+    return policy.Page(url, url, body, (url,), "offline_cached")
+
+
+def proposal():
+    return {
+        "open_call": {"value": {"is_real_call": True, "status": "open"}, "quote": QUOTE},
+        "deadline": {"value": {"text": "December 1, 2026", "date": "2026-12-01", "timezone": None}, "quote": QUOTE},
+        "pay": {"value": {"text": "USD 100 per story", "state": "paid", "amount_min": "100", "amount_max": "100",
+                          "currency": "USD", "unit": "per_story"}, "quote": "We pay USD 100 per story."},
+        "eligibility": {"value": {"text": "All writers worldwide", "constraints": [{"type": "region", "text": "worldwide"}]},
+                        "quote": "All writers worldwide may apply."}}
+
+
+def completion(fields=None):
+    return {"model": "deepseek-flash", "choices": [{"finish_reason": "stop", "message": {
+        "content": dumps(proposal() if fields is None else fields)}}],
+        "usage": {"prompt_tokens": 123, "completion_tokens": 100, "total_tokens": 223}}
+
+
+class Harness(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+        self.config_path = self.base / "config.json"
+        self.config = json.loads(common.CONFIG.read_text())
+        self.config.update(enabled=True, window_start_utc="2026-11-05T00:00:00Z", window_end_utc="2026-11-12T00:00:00Z")
+        self.write_config()
+        self.root = self.base / "shadow"
+        self.calls = []
+        self.clock = NOW
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write_config(self):
+        self.config_path.write_text(dumps(self.config))
+
+    def transport(self, body, key, timeout):
+        self.assertEqual(key, KEY)
+        self.assertNotIn(KEY, dumps(body))
+        self.assertEqual(body["model"], "deepseek-flash")
+        self.assertEqual(body["thinking"], {"type": "disabled"})
+        self.assertNotIn("tools", body)
+        self.calls.append(body)
+        return completion()
+
+    def run_page(self, url=URL, **kwargs):
+        opts = {"shadow_root": self.root, "url": url, "page": page(url), "transport": self.transport, "key_loader": lambda: KEY}
+        opts.update(kwargs)
+        return runner.ShadowRunner(self.config_path, clock=lambda: self.clock).run(**opts)
+
+    def artifacts(self):
+        return b"".join(p.read_bytes() for p in self.root.rglob("*") if p.is_file())
+
+
+class ConfigTests(Harness):
+    def test_checked_in_flag_is_false_and_no_side_effects(self):
+        self.assertIs(json.loads(common.CONFIG.read_text())["enabled"], False)
+        with patch.object(runner, "load_key", side_effect=AssertionError("credentials touched")), patch.object(policy.PolicyFetcher, "fetch", side_effect=AssertionError("network")):
+            result = runner.ShadowRunner().run(shadow_root=self.root, url=URL)
+        self.assertEqual(result["reason"], "disabled")
+        self.assertFalse(self.root.exists())
+
+    def test_missing_invalid_false_config_all_skip_without_secrets_or_network(self):
+        cases = [None, {}, {"enabled": False}, {"enabled": "true"}, {**self.config, "extra": 1},
+                 {**self.config, "daily_call_cap": True}, {**self.config, "daily_call_cap": 0},
+                 {**self.config, "daily_cost_cap_usd": "0"}, {**self.config, "daily_cost_cap_usd": "NaN"},
+                 {**self.config, "daily_cost_cap_usd": "-1"}, {**self.config, "mode": "live"},
+                 {**self.config, "window_end_utc": "2026-11-14T00:00:00Z"},
+                 {**self.config, "window_end_utc": "2026-11-06"},
+                 {**self.config, "window_start_utc": "2026-11-06T00:00:00Z"},
+                 {**self.config, "window_end_utc": "2026-11-05T01:00:00Z"},
+                 {**self.config, "pricing": {**self.config["pricing"], "valid_until_utc": "2026-11-11T00:00:00Z"}}]
+        for c in cases:
+            with self.subTest(config=c):
+                if c is None:
+                    self.config_path.unlink(missing_ok=True)
+                else:
+                    self.config_path.write_text(dumps(c))
+                result = self.run_page(key_loader=lambda: self.fail("credential lookup"))
+                self.assertEqual(result["outcome"], "skipped")
+                self.assertFalse(self.root.exists())
+        self.assertFalse(self.calls)
+
+    def test_invalid_duplicate_config_and_stale_rates(self):
+        self.config_path.write_text('{"enabled":true,"enabled":true}')
+        self.assertEqual(self.run_page()["reason"], "duplicate_json_key")
+        self.config["pricing"]["input_usd_per_million_ceiling"] = "0.01"
+        self.write_config()
+        self.assertEqual(self.run_page()["reason"], "invalid_config")
+
+
+class BudgetTests(Harness):
+    def test_call_cap_restart_failed_attempts_and_utc_rollover(self):
+        self.config.update(daily_call_cap=2, daily_cost_cap_usd="100")
+        self.write_config()
+        def fail(*_):
+            self.calls.append(1)
+            raise TimeoutError(KEY)
+        self.assertEqual(self.run_page(URL + "1", transport=fail)["outcome"], "provider_error")
+        self.assertEqual(self.run_page(URL + "2")["outcome"], "ok")
+        self.assertEqual(self.run_page(URL + "3")["reason"], "budget_exhausted")
+        self.clock += dt.timedelta(days=1)
+        self.assertEqual(self.run_page(URL + "4")["outcome"], "ok")
+        self.assertEqual(len(self.calls), 3)
+        self.assertNotIn(KEY.encode(), self.artifacts())
+
+    def test_cost_cap_exact_boundary_and_conservative_default(self):
+        unit = state.reservation(self.config)
+        self.assertEqual(unit, Decimal("0.3024576"))
+        self.config["daily_cost_cap_usd"] = str(unit * 2)
+        self.write_config()
+        for i in range(2):
+            self.assertEqual(self.run_page(URL + str(i))["outcome"], "ok")
+        self.assertEqual(self.run_page(URL + "last")["reason"], "budget_exhausted")
+        self.assertEqual(len(self.calls), 2)
+
+    def test_insufficient_cost_zero_provider_calls(self):
+        self.config["daily_cost_cap_usd"] = "0.3024575"
+        self.write_config()
+        self.assertEqual(self.run_page()["reason"], "budget_exhausted")
+        self.assertFalse(self.calls)
+
+    def test_default_five_dollars_allows_sixteen_calls(self):
+        for i in range(16):
+            self.assertEqual(self.run_page(URL + str(i))["outcome"], "ok")
+        self.assertEqual(self.run_page(URL + "17")["reason"], "budget_exhausted")
+        self.assertEqual(len(self.calls), 16)
+
+    def test_concurrent_call_and_cost_caps(self):
+        for binding in ("call", "cost"):
+            with self.subTest(binding=binding):
+                self.root = self.base / binding
+                self.calls.clear()
+                self.config.update(daily_call_cap=3 if binding == "call" else 50,
+                                   daily_cost_cap_usd="100" if binding == "call" else str(state.reservation(self.config) * 3))
+                self.write_config()
+                # Initialize once, then independent State connections and locks compete.
+                with state.State(self.root).locked():
+                    pass
+                with ThreadPoolExecutor(max_workers=8) as pool:
+                    results = list(pool.map(lambda i: self.run_page(URL + str(i)), range(12)))
+                self.assertEqual(sum(r["outcome"] == "ok" for r in results), 3)
+                self.assertEqual(len(self.calls), 3)
+
+    def test_crashed_reservation_counts_and_is_deduplicated(self):
+        self.config["daily_call_cap"] = 1
+        self.write_config()
+        with patch.object(state.State, "finish", side_effect=OSError(KEY)):
+            self.assertEqual(self.run_page()["outcome"], "skipped")
+        self.assertEqual(self.run_page()["reason"], "duplicate_page")
+        self.assertEqual(self.run_page(URL + "next")["reason"], "budget_exhausted")
+        self.assertEqual(len(self.calls), 1)
+
+    def test_publish_recovery_no_new_provider_call(self):
+        with patch.object(state.State, "publish", side_effect=OSError(KEY)):
+            self.assertEqual(self.run_page()["outcome"], "skipped")
+        self.assertEqual(self.run_page()["reason"], "duplicate_page")
+        files = list(self.root.glob("data/shadow/*.jsonl"))
+        self.assertEqual(len(files), 1)
+        self.assertEqual(len(files[0].read_text().splitlines()), 1)
+        self.assertEqual(len(self.calls), 1)
+
+    def test_missing_corrupt_ledger_and_partial_output_fail_closed(self):
+        self.assertEqual(self.run_page()["outcome"], "ok")
+        output = next(self.root.glob("data/shadow/*.jsonl"))
+        with output.open("a") as f:
+            f.write('{"partial":')
+        self.assertEqual(self.run_page(URL + "next")["reason"], "partial_shadow_output")
+        output.write_text("")
+        ledger = self.root / "budget.sqlite3"
+        ledger.unlink()
+        self.assertEqual(self.run_page(URL + "next")["reason"], "missing_budget_state")
+        ledger.write_bytes(b"broken sqlite")
+        ledger.chmod(0o600)
+        self.assertEqual(self.run_page(URL + "next")["reason"], "shadow_state_error")
+        self.assertEqual(len(self.calls), 1)
+
+    def test_backwards_clock_and_expiry(self):
+        self.assertEqual(self.run_page()["outcome"], "ok")
+        self.clock -= dt.timedelta(seconds=1)
+        self.assertEqual(self.run_page(URL + "next")["reason"], "clock_backwards")
+        self.clock = dt.datetime(2026, 11, 12, tzinfo=UTC)
+        self.assertEqual(self.run_page(URL + "expired")["reason"], "inactive_window")
+        self.assertEqual(len(self.calls), 1)
+
+    def test_midnight_dispatch_never_sends_against_wrong_day(self):
+        moments = iter([NOW, NOW, NOW, NOW + dt.timedelta(days=1)])
+        r = runner.ShadowRunner(self.config_path, clock=lambda: next(moments)).run(
+            shadow_root=self.root, page=page(), as_of="2026-11-05", transport=self.transport, key_loader=lambda: KEY)
+        self.assertEqual(r["outcome"], "dispatch_clock_changed")
+        self.assertFalse(self.calls)
+
+    def test_disabling_during_run_prevents_dispatch(self):
+        def clock():
+            self.config["enabled"] = False
+            self.write_config()
+            return NOW
+        # First load must see enabled=true; disable at the next clock read.
+        calls = iter([NOW, clock])
+        def tick():
+            value = next(calls)
+            return value() if callable(value) else value
+        r = runner.ShadowRunner(self.config_path, tick).run(shadow_root=self.root, page=page(),
+            as_of="2026-11-05", transport=self.transport, key_loader=lambda: KEY)
+        self.assertEqual(r["reason"], "disabled")
+        self.assertFalse(self.calls)
+
+
+    def test_config_changes_after_reservation_stop_dispatch(self):
+        original = state.State.reserve
+        def reserve(*args):
+            result = original(*args)
+            self.config["daily_call_cap"] = 1
+            self.write_config()
+            return result
+        with patch.object(state.State, "reserve", side_effect=reserve, autospec=True):
+            self.assertEqual(self.run_page()["outcome"], "config_changed")
+        self.assertFalse(self.calls)
+
+    def test_output_failure_prevents_reservation_and_provider(self):
+        original = state.secure_open
+        def protected(path, *args, **kwargs):
+            if str(path).endswith(".jsonl"):
+                raise OSError(KEY)
+            return original(path, *args, **kwargs)
+        with patch.object(state, "secure_open", side_effect=protected):
+            self.assertEqual(self.run_page()["reason"], "shadow_state_error")
+        self.assertFalse(self.calls)
+        with state.State(self.root).locked() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0], 0)
+
+
+class SecretAndIsolationTests(Harness):
+    def test_env_precedence_and_empty_env_rejected(self):
+        self.assertEqual(common.load_key({"DEEPSEEK_API_KEY": KEY}, self.base / "missing"), KEY)
+        with self.assertRaises(Stop):
+            common.load_key({"DEEPSEEK_API_KEY": ""}, self.base / "missing")
+
+    def test_env_file_is_parsed_never_executed_and_permissions_checked(self):
+        p = self.base / "env"
+        for text in ("export DEEPSEEK_API_KEY=" + KEY, "DEEPSEEK_API_KEY='" + KEY + "'", 'DEEPSEEK_API_KEY="' + KEY + '"'):
+            p.write_text(text + "\nUNRELATED=$(must-never-run)\n")
+            p.chmod(0o600)
+            self.assertEqual(common.load_key({}, p), KEY)
+        for text in ("DEEPSEEK_API_KEY=$(touch " + str(self.base / "executed") + ")", "DEEPSEEK_API_KEY=`id`",
+                     "DEEPSEEK_API_KEY=$OTHER", "export DEEPSEEK_API_KEY='safe' 'suffix'",
+                     "DEEPSEEK_API_KEY=a\nDEEPSEEK_API_KEY=b"):
+            p.write_text(text)
+            with self.assertRaises(Stop):
+                common.load_key({}, p)
+        self.assertFalse((self.base / "executed").exists())
+        p.write_text("DEEPSEEK_API_KEY=" + KEY)
+        p.chmod(0o644)
+        with self.assertRaises(Stop):
+            common.load_key({}, p)
+        p.chmod(0o600)
+        link = self.base / "symlink"
+        link.symlink_to(p)
+        with self.assertRaises(Stop):
+            common.load_key({}, link)
+
+    def test_key_only_in_auth_header_fixed_https_endpoint_no_proxy_redirect_retry(self):
+        class Response:
+            status = 200
+            headers = type("Headers", (), {"get_content_type": lambda _: "application/json"})()
+            def __enter__(self): return self
+            def __exit__(self, *_): pass
+            def read(self, limit): return dumps(completion()).encode()
+        with patch.dict(os.environ, {"HTTPS_PROXY": "http://bad", "ALL_PROXY": "http://bad"}), patch.object(runner.urllib.request, "build_opener") as build:
+            build.return_value.open.return_value = Response()
+            raw = runner.provider({"model": "deepseek-flash"}, KEY, 30)
+            self.assertEqual(raw["model"], "deepseek-flash")
+            args = build.call_args.args
+            self.assertEqual(args[0].proxies, {})
+            self.assertIs(args[1], runner.NoRedirect)
+            request = build.return_value.open.call_args.args[0]
+            self.assertEqual(request.full_url, runner.ENDPOINT)
+            self.assertEqual(request.get_header("Authorization"), "Bearer " + KEY)
+            self.assertNotIn(KEY.encode(), request.data)
+            self.assertIsNone(runner.NoRedirect().redirect_request(None, None, 302, "", {}, "https://evil.org"))
+            build.return_value.open.side_effect = urllib.error.HTTPError(runner.ENDPOINT, 302, KEY, {}, None)
+            with self.assertRaisesRegex(Stop, "^provider_error$"):
+                runner.provider({}, KEY, 30)
+            self.assertEqual(build.return_value.open.call_count, 2)
+
+    def test_no_secret_in_outputs_errors_logs_or_request_prompt(self):
+        log = io.StringIO()
+        def bad(*args):
+            raise RuntimeError(KEY)
+        with contextlib.redirect_stdout(log), contextlib.redirect_stderr(log):
+            result = self.run_page(transport=bad)
+        self.assertNotIn(KEY, dumps(result) + log.getvalue())
+        self.assertNotIn(KEY.encode(), self.artifacts())
+        self.assertEqual(result["outcome"], "provider_error")
+
+    def test_key_echo_in_response_is_rejected(self):
+        response = completion()
+        response["key"] = KEY
+        r = self.run_page(transport=lambda *_: response)
+        self.assertEqual(r["outcome"], "credential_in_response")
+        self.assertNotIn(KEY.encode(), self.artifacts())
+
+    def test_no_live_db_store_promotion_scheduler_or_runtime_environment(self):
+        with patch("pbdata.db.connect", side_effect=AssertionError("live DB")), \
+             patch("pbdata.collect.store.insert_raw", side_effect=AssertionError("store")), \
+             patch("pbdata.collect.promote.promote_raw", side_effect=AssertionError("promotion")), \
+             patch("pbdata.collect.scheduler.enqueue", side_effect=AssertionError("scheduler")), \
+             patch.dict(os.environ, {"PB_DATA_ROOT": str(self.base / "live"), "PB_REPO": "/workspace/pitchboard-data"}):
+            result = self.run_page()
+        self.assertEqual(result["outcome"], "ok")
+        self.assertFalse((self.base / "live").exists())
+        self.assertEqual(runner.baseline(page().doc(), "2026-11-05"), result["baseline"])
+        for p in self.root.rglob("*"):
+            self.assertEqual(p.stat().st_mode & 0o077, 0)
+
+    def test_protected_roots_symlink_hardlink_and_unrecognized_root(self):
+        for path in common.PROTECTED:
+            for p in (path, path / "new-shadow", path.parent):
+                with self.subTest(path=p), self.assertRaises(Stop):
+                    common.shadow_root(p)
+        link = self.base / "link"
+        link.symlink_to(self.base, target_is_directory=True)
+        with self.assertRaises(Stop):
+            common.shadow_root(link / "shadow")
+        self.root.mkdir(mode=0o700)
+        (self.root / "other").write_text("untouched")
+        self.assertEqual(self.run_page()["reason"], "unrecognized_shadow_root")
+        (self.root / "other").unlink()
+        self.assertEqual(self.run_page()["outcome"], "ok")
+        output = next(self.root.glob("data/shadow/*.jsonl"))
+        output.unlink()
+        external = self.base / "external"
+        external.write_text("safe")
+        external.chmod(0o600)
+        os.link(external, output)
+        self.assertEqual(self.run_page(URL + "next")["reason"], "unsafe_file")
+        self.assertEqual(external.read_text(), "safe")
+
+
+class EvidenceTests(unittest.TestCase):
+    def test_valid_evidence_offsets_korean_title_repetition(self):
+        p = page()
+        result, reasons = schema.validate(proposal(), p.doc(), "2026-11-05")
+        self.assertFalse(reasons)
+        for field in result.values():
+            segment = p.doc().segments[field["segment_idx"]]
+            self.assertEqual(segment.text[field["start"]:field["end"]], field["quote"])
+        text = "한국어 작가 누구나 지원할 수 있습니다."
+        doc = Doc("html", segments=[Segment(0, "h", text), Segment(1, "p", text)])
+        raw = dict.fromkeys(schema.FIELDS)
+        raw["eligibility"] = {"value": {"text": text, "constraints": []}, "quote": text}
+        result, _ = schema.validate(raw, doc, "2026-11-05")
+        self.assertEqual(result["eligibility"]["occurrence_count"], 2)
+        self.assertEqual(result["eligibility"]["segment_idx"], 0)
+        doc = parse_html(b"<title>Title evidence</title><p>Body</p>", URL)
+        self.assertEqual(doc.segments[0].text, "Title evidence")
+        self.assertEqual(doc.text().count("Title evidence"), 1)
+
+    def test_bad_quotes_null_entire_field_leave_others(self):
+        for quote in (None, "", "   ", "fabricated", QUOTE.lower(), QUOTE.replace(" ", "  "), "x" * 281,
+                      "Writing submissions\n" + QUOTE):
+            with self.subTest(quote=quote):
+                raw = proposal()
+                raw["deadline"]["quote"] = quote
+                fields, reasons = schema.validate(raw, page().doc(), "2026-11-05")
+                self.assertIsNone(fields["deadline"])
+                self.assertIn("deadline", reasons)
+                self.assertIsNotNone(fields["pay"])
+
+    def test_contact_details_unsupported_year_invalid_types_and_schema(self):
+        raw = proposal()
+        raw["deadline"]["value"]["date"] = "2027-12-01"
+        result, reasons = schema.validate(raw, page().doc(), "2026-11-05")
+        self.assertIsNone(result["deadline"])
+        self.assertEqual(reasons["deadline"], "unsupported_year")
+        doc = Doc("html", segments=[Segment(0, "p", "Contact editor@example.org for eligibility.")])
+        raw = dict.fromkeys(schema.FIELDS)
+        raw["eligibility"] = {"value": {"text": "Eligibility", "constraints": []}, "quote": doc.text()}
+        self.assertEqual(schema.validate(raw, doc, "2026-11-05")[1]["eligibility"], "evidence_contact_details")
+        raw = proposal()
+        raw["pay"]["value"]["amount_min"] = 100
+        self.assertIsNone(schema.validate(raw, page().doc(), "2026-11-05")[0]["pay"])
+        raw = proposal()
+        raw["pay"]["value"]["amount_min"] = "200"
+        self.assertIsNone(schema.validate(raw, page().doc(), "2026-11-05")[0]["pay"])
+        with self.assertRaises(Stop):
+            schema.validate({"open_call": None}, page().doc(), "2026-11-05")
+        with self.assertRaises(Stop):
+            common.loads('{"deadline":null,"deadline":null}')
+
+    def test_not_call_truth_table_closed_and_deadline_conflict(self):
+        for status in ("open", "closed", "cancelled", "upcoming", "unknown", "not_call"):
+            for real in (True, False):
+                self.assertEqual(schema.valid_value("open_call", {"is_real_call": real, "status": status}), real == (status != "not_call"))
+        raw = proposal()
+        raw["open_call"]["value"] = {"is_real_call": False, "status": "not_call"}
+        result, _ = schema.validate(raw, page().doc(), "2026-11-05")
+        self.assertTrue(all(result[f] is None for f in schema.FIELDS[1:]))
+        raw = proposal()
+        result, reasons = schema.validate(raw, page().doc(), "2026-12-02")
+        self.assertIsNone(result["open_call"])
+        self.assertEqual(reasons["open_call"], "past_deadline_conflict")
+
+
+class ProviderFailures(Harness):
+    def test_invalid_provider_responses_count_and_keep_cost(self):
+        cases = []
+        for key, value in (("model", "other-model"), ("usage", None), ("choices", [])):
+            r = completion(); r[key] = value; cases.append(r)
+        for content in ("", "not json", '{"a":null,"a":null}', '{"extra":1}', '[]'):
+            r = completion(); r["choices"][0]["message"]["content"] = content; cases.append(r)
+        for finish in ("length", "tool_calls", "content_filter"):
+            r = completion(); r["choices"][0]["finish_reason"] = finish; cases.append(r)
+        for k, v in (("refusal", "no"), ("tool_calls", [{}]), ("reasoning_content", "thinking")):
+            r = completion(); r["choices"][0]["message"][k] = v; cases.append(r)
+        r = completion(); r["usage"]["completion_tokens"] = True; cases.append(r)
+        r = completion(); r["usage"]["completion_tokens_details"] = {"reasoning_tokens": 50}; cases.append(r)
+        for i, raw in enumerate(cases):
+            with self.subTest(i=i):
+                self.root = self.base / ("failure" + str(i))
+                result = self.run_page(transport=lambda *_: raw)
+                self.assertNotEqual(result["outcome"], "ok")
+                self.assertEqual(result["charged_ceiling_usd"], "0.3024576")
+                self.assertIsNone(result["fields"])
+                self.assertEqual(self.run_page()["reason"], "experiment_halted" if result["outcome"] in ("model_mismatch", "usage_invariant") else "duplicate_page")
+
+
+class PolicyTests(Harness):
+    def fake_fetcher(self, responses):
+        f = policy.PolicyFetcher(clock=lambda: 100, sleep=lambda _: None)
+        self.requests = []
+        def get(url, accept, limit, delay=2):
+            canonical = policy.canonical_url(url)
+            self.requests.append(canonical)
+            response = responses[canonical]
+            if isinstance(response, Exception):
+                raise response
+            return response
+        f._get = get
+        return f
+
+    def test_instagram_and_blocked_domains_never_dns_fetch_or_llm(self):
+        hosts = ["instagram.com", "WWW.INSTAGRAM.COM", "api.instagram.com.", "instagram.com:443", "instagram.com:8443",
+                 "user@instagram.com", "instagram%2ecom", "instagram.com\\@example.org", "instagram.com\n", "facebook.com", "bostonreview.net"]
+        for host in hosts:
+            url = "https://" + host + "/call"
+            with self.subTest(host=host), patch.object(socket, "getaddrinfo", side_effect=AssertionError("DNS")), patch.object(policy.PolicyFetcher, "_get", side_effect=AssertionError("HTTP")):
+                r = self.run_page(page=None, url=url)
+                self.assertEqual(r["outcome"], "skipped")
+                r = self.run_page(page=page(url))
+                self.assertEqual(r["outcome"], "skipped")
+        self.assertFalse(self.calls)
+        self.assertEqual(policy.canonical_url("https://notinstagram.com/", blocked=set()), "https://notinstagram.com/")
+        with self.assertRaisesRegex(Stop, "blocked_host"):
+            policy.canonical_url("https://instagram.com/", blocked=set())
+
+    def test_robots_status_table_and_denial_before_page_or_model(self):
+        robots = "https://example.org/robots.txt"
+        cases = [(200, {"Content-Type": "text/plain"}, b"User-agent: *\nDisallow: /call")]
+        cases += [(s, {}, b"") for s in (301, 302, 307, 308, 401, 403, 429, 500, 503, 204)]
+        cases += [(200, {"Content-Type": c}, b"User-agent: *\nAllow: /") for c in ("text/html", "application/json")]
+        cases += [(200, {"Content-Type": "text/plain"}, text) for text in (b"", b"<html>bad</html>", b"User-agent: *\xff", b"nonsense")]
+        for response in cases + [Stop("fetch_error")]:
+            with self.subTest(response=response):
+                f = self.fake_fetcher({robots: response})
+                result = self.run_page(page=None, url=URL, fetcher=f)
+                self.assertEqual(result["outcome"], "skipped")
+                self.assertEqual(self.requests, [robots])
+        self.assertFalse(self.calls)
+
+    def test_robots_allow_404_410_cache_and_live_result(self):
+        for status in (200, 404, 410):
+            f = self.fake_fetcher({"https://example.org/robots.txt": (status, {"Content-Type": "text/plain"}, b"User-agent: *\nAllow: /"),
+                                   URL: (200, {"Content-Type": "text/html"}, HTML)})
+            fetched = f.fetch(URL)
+            self.assertEqual(fetched.provenance, "live_verified")
+            f.fetch(URL)
+            self.assertEqual(self.requests.count("https://example.org/robots.txt"), 1)
+        self.assertEqual(self.run_page(page=None, url=URL, fetcher=f)["outcome"], "ok")
+
+    def test_redirect_blocks_instagram_before_request_and_checks_new_origin_robots(self):
+        f = self.fake_fetcher({"https://example.org/robots.txt": (404, {}, b""),
+                               URL: (302, {"Location": "https://instagram.com/hidden"}, b"")})
+        self.assertEqual(self.run_page(page=None, url=URL, fetcher=f)["reason"], "blocked_host")
+        self.assertEqual(len(self.requests), 2)
+        f = self.fake_fetcher({"https://example.org/robots.txt": (404, {}, b""),
+                               URL: (302, {"Location": "https://other.org/call"}, b""),
+                               "https://other.org/robots.txt": (403, {}, b"")})
+        self.assertEqual(self.run_page(page=None, url=URL, fetcher=f)["reason"], "denied_robots")
+        self.assertEqual(self.requests[-1], "https://other.org/robots.txt")
+        self.assertFalse(self.calls)
+
+    def test_page_denials_challenges_login_compression_oversize_no_bypass(self):
+        for status in (301, 401, 402, 403, 429, 451, 500):
+            f = self.fake_fetcher({"https://example.org/robots.txt": (404, {}, b""), URL: (status, {}, b"")})
+            self.assertEqual(self.run_page(page=None, url=URL, fetcher=f)["outcome"], "skipped")
+        for data in (b"<title>Sign in</title>", b"<h1>verify you are human</h1>", b'<input type="password">', b"<p>Please log in to continue reading.</p>", b"<p>Members only</p>"):
+            self.assertEqual(self.run_page(page=page(body=data))["reason"], "access_wall")
+        self.assertEqual(self.run_page(page=page(body=b"<p>" + b"x" * 25000 + b"</p>"))["reason"], "page_too_large")
+        self.assertFalse(self.calls)
+
+    def test_public_dns_pinned_and_gateway_exception_ignored(self):
+        infos = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.0.1", 443))]
+        with patch.dict(os.environ, {"PITCHBOARD_EGRESS_GATEWAY_CIDRS": "198.18.0.0/15"}), patch.object(socket, "getaddrinfo", return_value=infos), patch.object(socket, "create_connection") as connect:
+            with self.assertRaisesRegex(Stop, "blocked_network"):
+                policy.public_socket("example.org", 443, 15)
+            connect.assert_not_called()
+        infos[0] = (*infos[0][:4], ("1.1.1.1", 443))
+        with patch.object(socket, "getaddrinfo", return_value=infos) as resolve, patch.object(socket, "create_connection") as connect:
+            policy.public_socket("example.org", 443, 15)
+            self.assertEqual(resolve.call_count, 1)
+            self.assertEqual(connect.call_args.args[0], ("1.1.1.1", 443))
+
+    def test_transport_caps_and_nontext_compressed_robots(self):
+        class Response:
+            code = 200
+            headers = {"Content-Type": "text/plain"}
+            def __enter__(self): return self
+            def __exit__(self, *_): pass
+            def read(self, n): return b"x" * n
+        f = policy.PolicyFetcher(sleep=lambda _: None)
+        with patch.object(f.opener, "open", return_value=Response()):
+            with self.assertRaisesRegex(Stop, "invalid_transport_body"):
+                f._get("https://example.org/robots.txt", "text/plain", 500000)
+        Response.read = lambda self, n: b"User-agent: *\nAllow: /"
+        Response.headers = {"Content-Type": "text/plain", "Content-Encoding": "gzip"}
+        with patch.object(f.opener, "open", return_value=Response()):
+            with self.assertRaisesRegex(Stop, "invalid_transport_body"):
+                f._get("https://example.org/robots.txt", "text/plain", 500000)
+
+    def test_cached_policy_envelope_rechecked(self):
+        invalid = policy.Page(URL, URL, HTML, ("https://instagram.com/x", URL), "offline_cached")
+        self.assertEqual(self.run_page(page=invalid)["reason"], "blocked_host")
+        invalid = policy.Page(URL, URL, HTML, (URL,), "live_verified")
+        self.assertEqual(self.run_page(page=invalid)["reason"], "invalid_policy_envelope")

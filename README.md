@@ -21,3 +21,11 @@ Python 3.9+, standard library only.
 ## Active collector (PR #2)
 `src/pbdata/collect/` + `src/pbdata/profiles/pitchboard.py`; docs: `docs/COLLECTOR.md`, `docs/OPS.md`, `docs/PROOFS.md`.
 Run: `PYTHONPATH=src python -m pbdata.collect run --root $PB_DATA_ROOT --run-tag T`. AI extraction is off (cost cap 0). Data roots live outside this repo.
+
+## Optional LLM shadow experiment
+
+The standalone DeepSeek Flash extraction lane is disabled in
+`config/llm_extract.json`. It writes only to a private external shadow root and
+never updates the live DB or active crawler. See
+[the BUILD design and commands](docs/LLM_EXTRACT_DESIGN.md) for the seven-day
+comparison, daily caps, evidence validation, and offline held-out scoring.
