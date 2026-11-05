@@ -19,6 +19,16 @@ def reservation(config):
             Decimal(1000000)).quantize(Decimal("0.0000001"), rounding=ROUND_CEILING)
 
 
+def comparison_output(root, extra_protected=()):
+    """Validate the shadow root and return the report path.
+
+    Score-only runs use this instead of ``State`` so they never create an
+    experiment identity, lock, or budget ledger. The output itself is still
+    confined to the validated shadow root.
+    """
+    return shadow_root(root, extra_protected) / "comparison.json"
+
+
 class State:
     def __init__(self, root, extra_protected=()):
         self.root = shadow_root(root, extra_protected)

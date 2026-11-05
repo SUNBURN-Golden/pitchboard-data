@@ -89,6 +89,7 @@ class CompareTests(Harness):
         self.assertEqual(b3["current_open_gold"], {"accuracy": None, "labeled": 0, "reason": "missing_gold"})
         self.assertEqual(report["summaries"]["root"]["real_call_gold"]["rules"]["reason"], "missing_gold")
         self.assertEqual(report["summaries"]["deduplicated"]["eligible_pages"], 24)
+        self.assertTrue(any("low-power" in note for note in report["notes"]))
 
     def test_hand_computed_scores_and_abstentions(self):
         result = compare.boolean_metrics([(True, True), (True, False), (True, None), (False, True), (False, False), (False, None)])
@@ -100,6 +101,10 @@ class CompareTests(Harness):
         self.assertEqual(result["precision"], .5)
         self.assertAlmostEqual(result["recall"], 1 / 3)
         self.assertAlmostEqual(result["f1"], .4)
+        # Abstentions are wrong end-to-end (2/6) but excluded from covered (2/4).
+        self.assertAlmostEqual(result["accuracy_end_to_end"], 1 / 3)
+        self.assertEqual(result["accuracy_covered"], .5)
+        self.assertNotIn("accuracy", result)
 
     def test_prediction_evidence_revalidated_and_fields_compared_as_sets(self):
         items, _, _ = compare.load_cohorts(self.eval)
@@ -180,6 +185,76 @@ class CompareTests(Harness):
         report = json.loads((self.root / "comparison.json").read_text())
         self.assertEqual(report["summaries"]["b3"]["eligible_pages"], 22)
         self.assertNotIn(KEY.encode(), self.artifacts())
+
+    def test_score_only_has_no_experiment_identity_and_missing_parent_is_stop(self):
+        script = Path(__file__).resolve().parents[1] / "scripts/compare_llm_extract.py"
+        spec = importlib.util.spec_from_file_location("compare_entry_score", script)
+        entry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(entry)
+        argv = [str(script), "--eval-root", str(self.eval), "--shadow-root", str(self.root)]
+        with patch.object(sys, "argv", argv), patch("socket.socket", side_effect=AssertionError("network")):
+            entry.main()
+        self.assertTrue((self.root / "comparison.json").is_file())
+        for name in ("experiment.json", "experiment.lock", "budget.sqlite3"):
+            self.assertFalse((self.root / name).exists(), name)
+        missing = self.base / "missing-parent" / "shadow"
+        result = subprocess.run([sys.executable, "-B", str(script), "--eval-root", str(self.eval),
+                                 "--shadow-root", str(missing)], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(json.loads(result.stdout)["reason"], "unsafe_root")
+        self.assertFalse(missing.exists())
+
+    def test_malformed_prediction_rows_raise_fixed_stop_not_keyerror(self):
+        path = self.base / "bad.jsonl"
+        for line in ('[]',
+                     '{"outcome":"ok"}',
+                     '{"outcome":"ok","requested_url":1,"body_sha256":"a","as_of":"2026-10-29"}'):
+            path.write_text(line + "\n")
+            with self.subTest(line=line), self.assertRaisesRegex(common.Stop, "^invalid_prediction$"):
+                compare.predictions(path)
+        items, _, _ = compare.load_cohorts(self.eval)
+        item = items[0]
+        fields, _ = schema.validate(proposal(), item.page.doc(), item.as_of)
+        row = {"fields": dict(fields), "text_sha256": item.text_hash}
+        row["fields"]["pay"] = []
+        with self.assertRaisesRegex(common.Stop, "^invalid_prediction_fields$"):
+            compare.score(items, {item.key: row})
+        with self.assertRaisesRegex(common.Stop, "^invalid_prediction$"):
+            compare.score(items, {item.key: "not-a-row"})
+
+    def test_generate_loop_treats_experiment_states_as_terminal(self):
+        script = Path(__file__).resolve().parents[1] / "scripts/compare_llm_extract.py"
+        spec = importlib.util.spec_from_file_location("compare_entry_terminal", script)
+        entry = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(entry)
+        for reason in ("experiment_halted", "disabled", "expired_pricing", "budget_exhausted",
+                       "unrecognized_shadow_root", "config_changed", "clock_backwards"):
+            with self.subTest(reason=reason):
+                self.assertTrue(entry.terminal({"outcome": "skipped", "reason": reason}))
+        for reason in ("blocked_host", "access_wall", "page_too_large", "duplicate_page",
+                       "denied_robots", "fetch_error", "invalid_policy_envelope"):
+            with self.subTest(reason=reason):
+                self.assertFalse(entry.terminal({"outcome": "skipped", "reason": reason}))
+        self.assertTrue(entry.terminal({"outcome": "model_mismatch"}))
+        self.assertTrue(entry.terminal({"outcome": "usage_invariant"}))
+        self.assertFalse(entry.terminal({"outcome": "ok"}))
+        self.assertFalse(entry.terminal({"outcome": "provider_error"}))
+        self.assertTrue(entry.terminal(None))
+
+    def test_cohort_threshold_shares_config_and_rejects_invalid(self):
+        self.assertEqual(common.page_limit(self.config_path), 24000)
+        self.config["max_page_utf8_bytes"] = 100
+        self.write_config()
+        self.assertEqual(common.page_limit(self.config_path), 100)
+        items, integrity, _ = compare.load_cohorts(self.eval, common.page_limit(self.config_path))
+        self.assertEqual(items, [])
+        self.assertTrue(integrity["exclusions"])
+        reasons = {e["reason"] for e in integrity["exclusions"]}
+        self.assertIn("page_too_large", reasons)
+        self.assertLessEqual(reasons, {"page_too_large", "tune_overlap"})
+        for bad in (0, 24001, True, "24000"):
+            with self.subTest(bad=bad), self.assertRaisesRegex(common.Stop, "^invalid_config$"):
+                compare.load_cohorts(self.eval, bad)
 
     def test_generate_disabled_exits_before_eval_or_key_reads(self):
         script = Path(__file__).resolve().parents[1] / "scripts/compare_llm_extract.py"

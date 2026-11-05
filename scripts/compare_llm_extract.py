@@ -2,15 +2,40 @@
 """Offline held-out scoring (default) or explicit bounded cached-page generation."""
 import argparse
 from collections import defaultdict
+import os
 from pathlib import Path
 import subprocess
 import sys
 sys.dont_write_bytecode = True
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "src"))
-from pbdata.collect.shadow.common import CONFIG, Stop, digest, dumps, load_config, secure_open
+from pbdata.collect.shadow.common import CONFIG, Stop, digest, dumps, load_config, page_limit, secure_open
 from pbdata.collect.shadow.compare import load_cohorts, predictions, score
-from pbdata.collect.shadow.state import State
+from pbdata.collect.shadow.state import State, comparison_output
+
+# Per-page/host skips that should not end a generation run. Anything else
+# (including experiment_halted, disabled, expired_pricing, bad state) is
+# terminal, so the loop must not walk the rest of the frozen sample for free.
+CONTINUE_REASONS = frozenset({
+    "bad_url", "blocked_host", "blocked_network", "denied_robots", "host_halted",
+    "fetch_error", "denied_http", "unsupported_content", "invalid_transport_body",
+    "invalid_robots", "redirect_limit", "access_wall", "empty_page", "page_too_large",
+    "duplicate_page", "invalid_policy_envelope"})
+
+
+def terminal(result):
+    if not isinstance(result, dict):
+        return True
+    if result.get("outcome") in ("model_mismatch", "usage_invariant"):
+        return True
+    return result.get("outcome") == "skipped" and result.get("reason") not in CONTINUE_REASONS
+
+
+def write_report(path, report):
+    with secure_open(path, "w") as f:
+        f.write(dumps(report) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
 
 
 def main():
@@ -25,8 +50,12 @@ def main():
     if args.operation == "generate":
         # Disabled generation exits before corpus reads, state, credentials or sockets.
         load_config(args.config)
-    state = State(args.shadow_root, (args.eval_root,))
-    items, integrity, inputs = load_cohorts(args.eval_root)
+        state = State(args.shadow_root, (args.eval_root,))
+        report_path = state.root / "comparison.json"
+    else:
+        # Score-only runs validate the root but create no experiment identity or ledger.
+        report_path = comparison_output(args.shadow_root, (args.eval_root,))
+    items, integrity, inputs = load_cohorts(args.eval_root, page_limit(args.config))
     rows = predictions(args.predictions)
     if args.operation == "generate":
         from pbdata.collect.shadow.runner import ShadowRunner
@@ -61,7 +90,7 @@ def main():
                                 extra_protected=(args.eval_root,))
             if result.get("outcome") == "ok":
                 rows[item.key] = result
-            elif result.get("reason") == "budget_exhausted":
+            if terminal(result):
                 break
         # Also recover prior completed attempts on resume, without repeat API calls.
         with state.locked() as conn:
@@ -71,13 +100,12 @@ def main():
     report["integrity"] = integrity
     report["baseline_commit"] = subprocess.check_output(["git", "-C", str(REPO), "rev-parse", "HEAD"], text=True).strip()
     inputs.verify()
-    with state.locked():
-        with secure_open(state.root / "comparison.json", "w") as f:
-            f.write(dumps(report) + "\n")
-            f.flush()
-            import os
-            os.fsync(f.fileno())
-    print(dumps({"report": str(state.root / "comparison.json"), "eligible_pages": len(items),
+    if args.operation == "generate":
+        with state.locked():
+            write_report(report_path, report)
+    else:
+        write_report(report_path, report)
+    print(dumps({"report": str(report_path), "eligible_pages": len(items),
                  "scored_predictions": sum(r["has_prediction"] for r in report["pages"])}))
 
 

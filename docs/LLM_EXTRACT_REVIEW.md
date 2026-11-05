@@ -62,3 +62,45 @@ committed state, and the isolation boundary held under independent verification
 hardening; 6–8 are operational guidance for the first enabled run. Any live
 generation remains gated on explicitly enabling the config with a fresh pricing
 verification, and must never be merged or pushed toward `main`.
+
+## REVIEW FIX pass (2026-11-05)
+
+All findings were addressed in the follow-up commit. No guard or enabled path
+was relaxed.
+
+1. **Score-only footprint / missing parent.** Score mode no longer constructs
+   `State`: it validates the root with `state.comparison_output` and writes only
+   `comparison.json`, creating no `experiment.json`, lock, or budget ledger.
+   `common.shadow_root` now converts a missing/unwritable parent into
+   `Stop("unsafe_root")`, so the script's fixed-reason JSON handler covers it
+   instead of leaking a traceback. Tests:
+   `test_score_only_has_no_experiment_identity_and_missing_parent_is_stop`.
+2. **Malformed prediction rows.** `compare.predictions` and `compare.score`
+   now shape-check rows and proposals and raise `Stop("invalid_prediction")` /
+   `Stop("invalid_prediction_fields")` rather than bare `KeyError`/`TypeError`.
+   Test: `test_malformed_prediction_rows_raise_fixed_stop_not_keyerror`.
+3. **Terminal generation states.** The loop breaks on any terminal result
+   (`experiment_halted`, `disabled`, `expired_pricing`, budget/config/state
+   failures, model/usage halt) and continues only for known page/host-local
+   skips. Test: `test_generate_loop_treats_experiment_states_as_terminal`.
+4. **Accuracy denominator.** `boolean_metrics["accuracy"]` was replaced by
+   explicit `accuracy_end_to_end` (abstentions wrong) and `accuracy_covered`
+   (covered subset only). Test: `test_hand_computed_scores_and_abstentions`.
+5. **Duplicated page threshold.** `common.page_limit` is the single reader of
+   `max_page_utf8_bytes`; `compare.load_cohorts` requires the limit and the
+   scorer passes the configured value. Test:
+   `test_cohort_threshold_shares_config_and_rejects_invalid`.
+6. **Low labeled power.** The scorer emits a permanent report note and the
+   design doc records the observed 3-positive/15-negative B3 state and the
+   human wall-adjudication decision. No code attempts to reclassify walls.
+7. **First enabled run.** The design doc now requires a fresh-root,
+   `--sample-size 1` smoke test before the sample loop, explaining the immutable
+   frozen sample, the model allowlist halt, and charged non-halting 4xx/5xx
+   failures.
+8. **Timeout nuance.** The design doc now states that `timeout_seconds` applies
+   only to the provider call; page/robots fetches use the fixed 15-second
+   transport timeout.
+
+Verification after the fix: focused suite
+`PYTHONPATH=src python3 -B -m pytest -q tests/test_llm_extract.py tests/test_llm_compare.py`
+passes, and the committed config remains `"enabled": false`.

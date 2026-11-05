@@ -110,6 +110,22 @@ def load_config(path=CONFIG, now=None):
         raise Stop("invalid_config") from None
 
 
+def page_limit(path=CONFIG):
+    """Read the runner's page-size threshold without enabling extraction or touching state."""
+    try:
+        c = loads(Path(path).read_bytes())
+        value = c.get("max_page_utf8_bytes") if isinstance(c, dict) else None
+        if type(value) is not int or not 1 <= value <= 24000:
+            raise Stop("invalid_config")
+        return value
+    except Stop:
+        raise
+    except FileNotFoundError:
+        raise Stop("disabled") from None
+    except Exception:
+        raise Stop("invalid_config") from None
+
+
 def load_key(env=None, path=None):
     env = os.environ if env is None else env
     if "DEEPSEEK_API_KEY" in env:
@@ -168,7 +184,11 @@ def shadow_root(path, extra_protected=()):
     if existed and (not path.is_dir() or path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077):
         raise Stop("unsafe_root")
     if not existed:
-        path.mkdir(mode=0o700, parents=False)
+        try:
+            path.mkdir(mode=0o700, parents=False)
+        except OSError:
+            # A missing/unwritable parent is a fixed policy failure, not a traceback.
+            raise Stop("unsafe_root") from None
     return path
 
 

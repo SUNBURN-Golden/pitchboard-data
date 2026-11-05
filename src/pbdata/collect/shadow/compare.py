@@ -8,7 +8,7 @@ from decimal import Decimal
 import re
 from urllib.parse import parse_qs, urlsplit
 
-from .common import Stop, digest, dumps, loads, no_symlinks
+from .common import Stop, digest, dumps, loads, no_symlinks, page_limit
 from .policy import Page, canonical_url
 from .runner import baseline
 from .schema import FIELDS, validate
@@ -119,7 +119,12 @@ def b3_gold(manifest, gold):
     return mapped
 
 
-def load_cohorts(root):
+def load_cohorts(root, max_page_utf8_bytes=None):
+    # One threshold shared with the runner: a lowered config must also screen
+    # cohort eligibility rather than silently diverging at a copied literal.
+    max_page_utf8_bytes = page_limit() if max_page_utf8_bytes is None else max_page_utf8_bytes
+    if type(max_page_utf8_bytes) is not int or not 1 <= max_page_utf8_bytes <= 24000:
+        raise Stop("invalid_config")
     inputs = Inputs(root)
     inputs.checksum("split_frozen.sha256", {"split.json", "manifest.json"})
     inputs.checksum("d1102/manifest_ho.sha256", {"manifest_ho.json"})
@@ -171,7 +176,7 @@ def load_cohorts(root):
                     raise Stop("tune_overlap")
                 page = Page(url, final, data, (canonical_url(url), final), "offline_cached")
                 doc = page.doc()
-                if len(doc.text().encode("utf-8")) > 24000:
+                if len(doc.text().encode("utf-8")) > max_page_utf8_bytes:
                     raise Stop("page_too_large")
                 primary = seen_urls.get(canonical_url(url)) or seen_bodies.get(body_hash)
                 if primary:
@@ -207,9 +212,17 @@ def predictions(path):
     with open(no_symlinks(path), encoding="utf-8") as f:
         for line in f:
             row = loads(line)
+            if not isinstance(row, dict):
+                raise Stop("invalid_prediction")
             if row.get("outcome") != "ok":
                 continue
-            key = (canonical_url(row["requested_url"]), row["body_sha256"], row["as_of"])
+            try:
+                requested, body_sha, as_of = row["requested_url"], row["body_sha256"], row["as_of"]
+            except KeyError:
+                raise Stop("invalid_prediction") from None
+            if not all(isinstance(value, str) for value in (requested, body_sha, as_of)):
+                raise Stop("invalid_prediction")
+            key = (canonical_url(requested), body_sha, as_of)
             if key in result and result[key] != row:
                 raise Stop("conflicting_predictions")
             result[key] = row
@@ -228,7 +241,10 @@ def boolean_metrics(pairs):
             "tp": tp, "fp": fp, "fn_including_abstentions": fn, "tn": tn,
             "precision": precision, "recall": recall,
             "f1": 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else None,
-            "accuracy": sum(g == p for g, p in pairs if p is not None) / len(pairs) if pairs else None,
+            # Abstentions count as wrong end-to-end; covered accuracy is separate
+            # so the two denominators cannot be confused.
+            "accuracy_end_to_end": sum(g == p for g, p in pairs if p is not None) / len(pairs) if pairs else None,
+            "accuracy_covered": sum(g == p for g, p in pairs if p is not None) / covered if covered else None,
             "reason": None if pairs else "missing_gold"}
 
 
@@ -275,12 +291,19 @@ def score(items, rows):
         row = rows.get(item.key)
         fields = {f: None for f in FIELDS}
         if row is not None:
+            if not isinstance(row, dict):
+                raise Stop("invalid_prediction")
             if row.get("text_sha256") != item.text_hash:
                 raise Stop("prediction_text_mismatch")
             proposals = row.get("fields")
             if not isinstance(proposals, dict) or set(proposals) != set(FIELDS):
                 raise Stop("invalid_prediction_fields")
-            raw = {f: ({"value": proposals[f]["value"], "quote": proposals[f]["quote"]} if proposals[f] is not None else None) for f in FIELDS}
+            try:
+                raw = {f: ({"value": proposals[f]["value"], "quote": proposals[f]["quote"]}
+                           if proposals[f] is not None else None) for f in FIELDS}
+            except (KeyError, TypeError):
+                # Foreign/hand-edited rows must become a fixed Stop, never KeyError.
+                raise Stop("invalid_prediction_fields") from None
             fields, reasons = validate(raw, item.page.doc(), item.as_of)
             if reasons:
                 raise Stop("prediction_evidence_invalid")
@@ -323,4 +346,5 @@ def score(items, rows):
             "notes": ["Agreement is not accuracy.", "B3 labels writing-call existence, not current-open status.",
                       "No independent deadline/pay/eligibility gold exists in these cohorts.",
                       "Eligibility region agreement projects the LLM quote through current region rules; it is not independent accuracy.",
-                      "Missing predictions remain in eligible denominators; exclusions are reported separately."]}
+                      "Missing predictions remain in eligible denominators; exclusions are reported separately.",
+                      "Access-wall screening can leave very few gold positives (the observed B3 set leaves 3 positives / 15 negatives); label metrics are low-power and a human must adjudicate borderline cached walls before enabling."]}
