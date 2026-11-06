@@ -257,7 +257,9 @@ def s_quality_check(c: RunContext) -> dict:
     q["conflicts_open"] = svc.execute("SELECT count(*) FROM pb_conflict_group WHERE resolved_at IS NULL").fetchone()[0]
     q["dead_letter_jobs"] = c.infra.execute("SELECT count(*) FROM job WHERE state='dead'").fetchone()[0]
     q["failure_queue_open"] = c.infra.execute("SELECT count(*) FROM failure_queue WHERE state='open'").fetchone()[0]
-    q["sources_never_succeeded"] = svc.execute("SELECT count(*) FROM pb_source WHERE permission IN ('allowed_public','allowed_conditional') AND last_success_at IS NULL").fetchone()[0]
+    # Raw history is authoritative: historical successful writers left last_success_at NULL.
+    q["sources_never_succeeded"] = svc.execute("SELECT count(*) FROM pb_source s WHERE s.permission IN ('allowed_public','allowed_conditional') "
+                                              "AND NOT EXISTS (SELECT 1 FROM pb_raw_ref r WHERE r.source_id=s.source_id AND r.outcome='ok')").fetchone()[0]
     fetch = c.state.get("incremental_fetch", {})
     chg = c.state.get("change_detection", {})
     prev_empty = c.infra.execute("SELECT count(*) FROM (SELECT metrics FROM metric_snapshot WHERE label='daemon_quality' ORDER BY taken_at DESC LIMIT 2) "
