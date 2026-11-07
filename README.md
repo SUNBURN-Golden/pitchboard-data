@@ -29,3 +29,5 @@ The standalone DeepSeek Flash extraction lane is disabled in
 never updates the live DB or active crawler. See
 [the BUILD design and commands](docs/LLM_EXTRACT_DESIGN.md) for the seven-day
 comparison, daily caps, evidence validation, and offline held-out scoring.
+Activation, the sandbox egress path, and the opt-in monetary cap are in
+[docs/LLM_EXTRACT_ACTIVATE.md](docs/LLM_EXTRACT_ACTIVATE.md). The checked-in flag stays false.

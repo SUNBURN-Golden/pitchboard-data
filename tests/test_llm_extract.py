@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import urllib.error
+import urllib.request
 
 from pbdata.collect.shadow import common, policy, runner, schema, state
 from pbdata.collect.shadow.common import Stop, UTC, digest, dumps
@@ -84,7 +85,12 @@ class Harness(unittest.TestCase):
 
 class ConfigTests(Harness):
     def test_checked_in_flag_is_false_and_no_side_effects(self):
-        self.assertIs(json.loads(common.CONFIG.read_text())["enabled"], False)
+        shipped = json.loads(common.CONFIG.read_text())
+        self.assertIs(shipped["enabled"], False)
+        self.assertEqual(shipped["monetary_cap"], "enforced")
+        self.assertEqual(shipped["egress"], "direct")
+        self.assertEqual(shipped["daily_cost_cap_usd"], "5.00")
+        self.assertEqual(shipped["daily_call_cap"], 50)
         with patch.object(runner, "load_key", side_effect=AssertionError("credentials touched")), patch.object(policy.PolicyFetcher, "fetch", side_effect=AssertionError("network")):
             result = runner.ShadowRunner().run(shadow_root=self.root, url=URL)
         self.assertEqual(result["reason"], "disabled")
@@ -94,7 +100,14 @@ class ConfigTests(Harness):
         cases = [None, {}, {"enabled": False}, {"enabled": "true"}, {**self.config, "extra": 1},
                  {**self.config, "daily_call_cap": True}, {**self.config, "daily_call_cap": 0},
                  {**self.config, "daily_cost_cap_usd": "0"}, {**self.config, "daily_cost_cap_usd": "NaN"},
-                 {**self.config, "daily_cost_cap_usd": "-1"}, {**self.config, "mode": "live"},
+                 {**self.config, "daily_cost_cap_usd": "-1"}, {**self.config, "daily_cost_cap_usd": None},
+                 {**self.config, "monetary_cap": "none"}, {**self.config, "monetary_cap": "unlimited"},
+                 {**self.config, "monetary_cap": "none", "daily_cost_cap_usd": "0"},
+                 {**self.config, "monetary_cap": "none", "daily_cost_cap_usd": "none"},
+                 {k: v for k, v in self.config.items() if k != "monetary_cap"},
+                 {**self.config, "egress": "open"}, {**self.config, "egress": "198.18.0.0/15"},
+                 {k: v for k, v in self.config.items() if k != "egress"},
+                 {**self.config, "mode": "live"},
                  {**self.config, "window_end_utc": "2026-11-14T00:00:00Z"},
                  {**self.config, "window_end_utc": "2026-11-06"},
                  {**self.config, "window_start_utc": "2026-11-06T00:00:00Z"},
@@ -155,6 +168,31 @@ class BudgetTests(Harness):
             self.assertEqual(self.run_page(URL + str(i))["outcome"], "ok")
         self.assertEqual(self.run_page(URL + "17")["reason"], "budget_exhausted")
         self.assertEqual(len(self.calls), 16)
+
+    def test_monetary_cap_none_keeps_call_cap_ceiling_and_pricing(self):
+        self.config.update(monetary_cap="none", daily_cost_cap_usd=None, daily_call_cap=17, egress="sandbox")
+        self.write_config()
+        for i in range(17):
+            result = self.run_page(URL + str(i))
+            self.assertEqual(result["outcome"], "ok")
+            self.assertEqual(result["charged_ceiling_usd"], "0.3024576")
+        self.assertEqual(self.run_page(URL + "stop")["reason"], "budget_exhausted")
+        self.assertEqual(len(self.calls), 17)
+        self.config["pricing"]["valid_until_utc"] = "2026-11-11T00:00:00Z"
+        self.write_config()
+        self.root = self.base / "expired-none"
+        self.assertEqual(self.run_page(URL + "later")["reason"], "expired_pricing")
+        self.assertEqual(len(self.calls), 17)
+
+    def test_monetary_cap_none_concurrency_stops_at_call_cap(self):
+        self.config.update(monetary_cap="none", daily_cost_cap_usd=None, daily_call_cap=2)
+        self.write_config()
+        with state.State(self.root).locked():
+            pass
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            results = list(pool.map(lambda i: self.run_page(URL + str(i)), range(8)))
+        self.assertEqual(sum(r["outcome"] == "ok" for r in results), 2)
+        self.assertEqual(len(self.calls), 2)
 
     def test_concurrent_call_and_cost_caps(self):
         for binding in ("call", "cost"):
@@ -529,17 +567,139 @@ class PolicyTests(Harness):
         self.assertEqual(self.run_page(page=page(body=b"<p>" + b"x" * 25000 + b"</p>"))["reason"], "page_too_large")
         self.assertFalse(self.calls)
 
-    def test_public_dns_pinned_and_gateway_exception_ignored(self):
-        infos = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.0.1", 443))]
-        with patch.dict(os.environ, {"PITCHBOARD_EGRESS_GATEWAY_CIDRS": "198.18.0.0/15"}), patch.object(socket, "getaddrinfo", return_value=infos), patch.object(socket, "create_connection") as connect:
+    def _answers(self, *ips):
+        infos = []
+        for ip in ips:
+            family = socket.AF_INET6 if ":" in ip else socket.AF_INET
+            sockaddr = (ip, 443, 0, 0) if family == socket.AF_INET6 else (ip, 443)
+            infos.append((family, socket.SOCK_STREAM, 6, "", sockaddr))
+        return infos
+
+    def test_direct_and_documented_gateway_paths_pin_one_route(self):
+        env = {"PITCHBOARD_EGRESS_GATEWAY_CIDRS": "10.0.0.0/8,198.18.0.0/15,169.254.0.0/16",
+               "HTTP_PROXY": "http://127.0.0.1:9", "HTTPS_PROXY": "http://127.0.0.1:9", "ALL_PROXY": "http://127.0.0.1:9"}
+        for ip in ("1.1.1.1", "198.17.255.255"):
+            with self.subTest(route="direct", ip=ip), patch.dict(os.environ, env), patch.object(socket, "getaddrinfo", return_value=self._answers(ip)) as resolve, patch.object(socket, "create_connection") as connect:
+                policy.public_socket("example.org", 443, 15, egress="direct")
+                policy.public_socket("example.org", 443, 15, egress="sandbox")
+                self.assertEqual(resolve.call_count, 2)
+                self.assertEqual(connect.call_args_list[0].args[0], (ip, 443))
+                self.assertEqual(connect.call_args_list[1].args[0], (ip, 443))
+        for ip in ("198.18.0.1", "198.19.255.255", "::ffff:198.18.0.1"):
+            with self.subTest(route="gateway", ip=ip), patch.dict(os.environ, env), patch.object(socket, "getaddrinfo", return_value=self._answers(ip)), patch.object(socket, "create_connection") as connect:
+                with self.assertRaisesRegex(Stop, "blocked_network"):
+                    policy.public_socket("example.org", 443, 15)
+                connect.assert_not_called()
+                policy.public_socket("example.org", 443, 15, egress="sandbox")
+                self.assertEqual(connect.call_args.args[0], (ip, 443))
+        with patch.dict(os.environ, env), patch.object(socket, "getaddrinfo", return_value=self._answers("198.18.0.1", "198.19.0.8")), patch.object(socket, "create_connection") as connect:
+            with self.assertRaisesRegex(Stop, "blocked_network"):
+                policy.public_socket("example.org", 443, 15, egress="direct")
+            policy.public_socket("example.org", 443, 15, egress="sandbox")
+            self.assertEqual(connect.call_args.args[0], ("198.18.0.1", 443))
+        with patch.dict(os.environ, env):
+            fetcher = policy.PolicyFetcher(sleep=lambda *_: None, egress="sandbox")
+            # An empty ProxyHandler suppresses the env-proxy default and adds no proxy method.
+            self.assertEqual(fetcher.egress, "sandbox")
+            self.assertFalse(any(isinstance(h, urllib.request.ProxyHandler) for h in fetcher.opener.handlers))
+            self.assertFalse(any(getattr(h, "proxies", None) for h in fetcher.opener.handlers))
+            self.assertIn(policy.PublicHTTPSHandler, [type(h) for h in fetcher.opener.handle_open["https"]])
+            self.assertNotIn(urllib.request.ProxyHandler, [type(h) for h in fetcher.opener.handle_open["https"]])
+            https = next(h for h in fetcher.opener.handlers if isinstance(h, policy.PublicHTTPSHandler))
+            self.assertEqual(https._connection("example.org", 443).egress, "sandbox")
+            direct = policy.PolicyFetcher(sleep=lambda *_: None)
+            direct_https = next(h for h in direct.opener.handlers if isinstance(h, policy.PublicHTTPSHandler))
+            self.assertEqual(direct_https._connection("example.org", 443).egress, "direct")
+        with self.assertRaisesRegex(Stop, "invalid_config"):
+            policy.PolicyFetcher(egress="10.0.0.0/8")
+
+    def test_runner_passes_sandbox_egress_to_default_fetcher(self):
+        self.config["egress"] = "sandbox"
+        self.write_config()
+        seen = {}
+        class Recorder(policy.PolicyFetcher):
+            def __init__(self, *args, **kwargs):
+                seen["egress"] = kwargs.get("egress", "direct")
+                super().__init__(*args, **kwargs)
+            def fetch(self, url):
+                return page(url)
+        with patch.object(runner, "PolicyFetcher", Recorder):
+            self.assertEqual(self.run_page(page=None)["outcome"], "ok")
+        self.assertEqual(seen["egress"], "sandbox")
+
+    def test_private_metadata_mixed_and_literal_gateway_do_not_connect(self):
+        denied = (
+            ("10.0.0.1",), ("192.168.0.1",), ("172.16.0.1",), ("127.0.0.1",), ("169.254.169.254",),
+            ("::1",), ("::ffff:169.254.169.254",), ("100.64.0.1",), ("0.0.0.0",), ("192.0.2.1",),
+            ("198.18.0.1", "10.0.0.1"), ("198.18.0.1", "169.254.169.254"), ("198.18.0.1", "1.1.1.1"),
+        )
+        env = {"PITCHBOARD_EGRESS_GATEWAY_CIDRS": "10.0.0.0/8,198.18.0.0/15,169.254.0.0/16"}
+        for ips in denied:
+            with self.subTest(ips=ips), patch.dict(os.environ, env), patch.object(socket, "getaddrinfo", return_value=self._answers(*ips)), patch.object(socket, "create_connection") as connect:
+                with self.assertRaisesRegex(Stop, "blocked_network"):
+                    policy.public_socket("example.org", 443, 15)
+                connect.assert_not_called()
+        for ips in (("10.0.0.1",), ("169.254.169.254",), ("198.18.0.1", "10.0.0.1"), ("198.18.0.1", "1.1.1.1")):
+            with self.subTest(sandbox=ips), patch.dict(os.environ, env), patch.object(socket, "getaddrinfo", return_value=self._answers(*ips)), patch.object(socket, "create_connection") as connect:
+                with self.assertRaisesRegex(Stop, "blocked_network"):
+                    policy.public_socket("example.org", 443, 15, egress="sandbox")
+                connect.assert_not_called()
+        with patch.object(socket, "getaddrinfo", return_value=[]), patch.object(socket, "create_connection") as connect:
             with self.assertRaisesRegex(Stop, "blocked_network"):
                 policy.public_socket("example.org", 443, 15)
             connect.assert_not_called()
-        infos[0] = (*infos[0][:4], ("1.1.1.1", 443))
-        with patch.object(socket, "getaddrinfo", return_value=infos) as resolve, patch.object(socket, "create_connection") as connect:
-            policy.public_socket("example.org", 443, 15)
-            self.assertEqual(resolve.call_count, 1)
+        for host in ("198.18.0.1", "10.0.0.1", "169.254.169.254", "127.0.0.1"):
+            with self.subTest(literal=host), patch.object(socket, "getaddrinfo", side_effect=AssertionError("DNS")), patch.object(socket, "create_connection", side_effect=AssertionError("connect")):
+                with self.assertRaisesRegex(Stop, "blocked_network"):
+                    policy.public_socket(host, 443, 15)
+        with patch.object(socket, "getaddrinfo", return_value=self._answers("198.18.0.1")), patch.object(socket, "create_connection") as connect:
+            with self.assertRaisesRegex(Stop, "blocked_network"):
+                policy.public_socket("1.1.1.1", 443, 15)
+            connect.assert_not_called()
+        with patch.object(socket, "getaddrinfo", return_value=self._answers("1.1.1.1")), patch.object(socket, "create_connection") as connect:
+            policy.public_socket("1.1.1.1", 443, 15)
             self.assertEqual(connect.call_args.args[0], ("1.1.1.1", 443))
+
+    def test_malicious_hosts_and_redirects_never_resolve(self):
+        urls = (
+            "https://169.254.169.254/latest/meta-data", "https://198.18.0.1/", "https://10.0.0.1/",
+            "https://127.0.0.1/", "https://localhost/admin", "https://metadata.google.internal/computeMetadata/v1/",
+            "https://metadata.goog/", "https://printer.local/", "https://intranet.internal/",
+            "https://files.localdomain/", "https://0177.0.0.1/", "https://0x7f000001/",
+            "https://user:pass@example.org/secret", "http://198.18.0.1:443/",
+        )
+        for url in urls:
+            with self.subTest(url=url), patch.object(socket, "getaddrinfo", side_effect=AssertionError("DNS")), patch.object(socket, "create_connection", side_effect=AssertionError("connect")):
+                result = self.run_page(page=None, url=url)
+                self.assertEqual(result["outcome"], "skipped")
+                self.assertIn(result["reason"], {"blocked_network", "bad_url"})
+                with self.assertRaises(Stop):
+                    policy.canonical_url(url)
+        for loc in ("https://169.254.169.254/", "https://198.18.0.1/x", "https://10.1.1.1/",
+                    "https://metadata.google.internal/", "https://user:pass@example.org/a", "https://intranet.internal/a"):
+            with self.subTest(redirect=loc), patch.object(socket, "getaddrinfo", side_effect=AssertionError("DNS")):
+                f = self.fake_fetcher({"https://example.org/robots.txt": (404, {}, b""),
+                                       URL: (302, {"Location": loc}, b"")})
+                result = self.run_page(page=None, url=URL, fetcher=f)
+                self.assertEqual(result["outcome"], "skipped")
+                self.assertFalse(any(piece in " ".join(self.requests) for piece in ("169.254.169.254", "198.18.0.1", "10.1.1.1", "internal", "user:pass")))
+        def resolve(host, port, *args, **kwargs):
+            if host == "evil.example":
+                return self._answers("10.0.0.1")
+            if host == "example.org":
+                return self._answers("198.18.0.1")
+            raise AssertionError(host)
+        with patch.object(socket, "getaddrinfo", side_effect=resolve), patch.object(socket, "create_connection") as connect:
+            with self.assertRaisesRegex(Stop, "blocked_network"):
+                policy.public_socket("example.org", 443, 15, egress="direct")
+            connect.assert_not_called()
+            policy.public_socket("example.org", 443, 15, egress="sandbox")
+            self.assertEqual(connect.call_args.args[0], ("198.18.0.1", 443))
+            connect.reset_mock()
+            with self.assertRaisesRegex(Stop, "blocked_network"):
+                policy.public_socket("evil.example", 443, 15, egress="sandbox")
+            connect.assert_not_called()
+        self.assertFalse(self.calls)
 
     def test_transport_caps_and_nontext_compressed_robots(self):
         class Response:

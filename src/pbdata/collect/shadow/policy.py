@@ -20,6 +20,9 @@ from ..parse import parse_html
 BLOCKLIST = Path(__file__).resolve().parents[4] / "config/blocked_hosts.txt"
 MAX_BODY = 4_000_000
 USER_AGENT = "PitchboardBot/0.1 (+https://pitchboard.soulbound.co.kr; research collector; honors robots.txt)"
+# Fixed sandbox fake-IP range documented by collect/net.py. Not read from
+# PITCHBOARD_EGRESS_GATEWAY_CIDRS, which can name arbitrary networks.
+EGRESS_GATEWAY = ipaddress.ip_network("198.18.0.0/15")
 
 
 def canonical_url(url, blocked=None):
@@ -39,11 +42,7 @@ def canonical_url(url, blocked=None):
             blocked = {s.strip().lower() for s in BLOCKLIST.read_text().splitlines() if s.strip() and not s.startswith("#")}
         if any(host == b or host.endswith("." + b) for b in {"instagram.com", *blocked}):
             raise Stop("blocked_host")
-        try:
-            addr = ipaddress.ip_address(host)
-        except ValueError:
-            addr = None
-        if host == "localhost" or host.endswith(".localhost") or (addr is not None and not addr.is_global):
+        if _blocked_network_host(host):
             raise Stop("blocked_network")
         return urlunsplit((p.scheme, host, p.path or "/", p.query, ""))
     except Stop:
@@ -52,23 +51,91 @@ def canonical_url(url, blocked=None):
         raise Stop("bad_url") from None
 
 
-def public_socket(host, port, timeout, source_address=None):
-    """Resolve once, check every answer, then connect to a vetted numeric address."""
-    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
-    if not infos or any(not ipaddress.ip_address(i[4][0]).is_global for i in infos):
+def _normalized_ip(value):
+    ip = ipaddress.ip_address(value)
+    mapped = getattr(ip, "ipv4_mapped", None)
+    return mapped if mapped is not None else ip
+
+
+def _route(value):
+    """direct is a global address. gateway is only the documented fake-IP range."""
+    ip = _normalized_ip(value)
+    if ip in EGRESS_GATEWAY:
+        return "gateway"
+    if ip.is_global:
+        return "direct"
+    return "denied"
+
+
+def _blocked_network_host(host):
+    """Reject private, metadata, and literal gateway hosts before any DNS lookup."""
+    if host == "localhost" or host == "metadata.goog" or host.endswith((".localhost", ".local", ".internal", ".localdomain")):
+        return True
+    labels = host.split(".")
+    obfuscated_ip = all(re.fullmatch(r"(?:0x[0-9a-f]+|\d+)", label) for label in labels)
+    try:
+        route = _route(host)
+    except ValueError:
+        return obfuscated_ip
+    # A name that is the gateway address is not a public target. DNS may still
+    # return an address in that range for a hostname that passed this check.
+    return route != "direct"
+
+
+def public_socket(host, port, timeout, source_address=None, egress="direct"):
+    """Resolve once, require one safe route, and pin that numeric address.
+
+    egress direct: every answer must be global. egress sandbox: every answer
+    must be global, or every answer must be inside the documented
+    198.18.0.0/15 fake-IP range. The range is not configurable. Mixed answers
+    and every other non-global address are denied. The pinned address is not
+    resolved again.
+    """
+    if egress not in ("direct", "sandbox"):
         raise Stop("blocked_network")
-    # No gateway-CIDR exception; pin the address to prevent DNS rebinds.
+    try:
+        literal = _route(host)
+    except ValueError:
+        literal = None
+    if literal not in (None, "direct"):
+        raise Stop("blocked_network")
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    if not infos:
+        raise Stop("blocked_network")
+    routes = []
+    for info in infos:
+        try:
+            route = _route(info[4][0])
+        except ValueError:
+            raise Stop("blocked_network") from None
+        if route == "denied" or (route == "gateway" and egress != "sandbox"):
+            raise Stop("blocked_network")
+        routes.append(route)
+    if len(set(routes)) != 1 or (literal == "direct" and routes[0] != "direct"):
+        raise Stop("blocked_network")
     return socket.create_connection((infos[0][4][0], port), timeout, source_address)
 
 
+def _bind_connection(base, egress):
+    class Bound(base):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.egress = egress
+    return Bound
+
+
 class PublicHTTP(http.client.HTTPConnection):
+    egress = "direct"
+
     def connect(self):
-        self.sock = public_socket(self.host, self.port, self.timeout, self.source_address)
+        self.sock = public_socket(self.host, self.port, self.timeout, self.source_address, self.egress)
 
 
 class PublicHTTPS(http.client.HTTPSConnection):
+    egress = "direct"
+
     def connect(self):
-        sock = public_socket(self.host, self.port, self.timeout, self.source_address)
+        sock = public_socket(self.host, self.port, self.timeout, self.source_address, self.egress)
         try:
             self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
         except Exception:
@@ -77,13 +144,21 @@ class PublicHTTPS(http.client.HTTPSConnection):
 
 
 class PublicHTTPHandler(urllib.request.HTTPHandler):
+    def __init__(self, egress="direct"):
+        super().__init__()
+        self._connection = _bind_connection(PublicHTTP, egress)
+
     def http_open(self, req):
-        return self.do_open(PublicHTTP, req)
+        return self.do_open(self._connection, req)
 
 
 class PublicHTTPSHandler(urllib.request.HTTPSHandler):
+    def __init__(self, egress="direct"):
+        super().__init__()
+        self._connection = _bind_connection(PublicHTTPS, egress)
+
     def https_open(self, req):
-        return self.do_open(PublicHTTPS, req, context=self._context)
+        return self.do_open(self._connection, req, context=self._context)
 
 
 def access_check(body):
@@ -126,10 +201,13 @@ class Page:
 
 
 class PolicyFetcher:
-    def __init__(self, clock=time.monotonic, sleep=time.sleep):
-        self.clock, self.sleep = clock, sleep
+    def __init__(self, clock=time.monotonic, sleep=time.sleep, egress="direct"):
+        if egress not in ("direct", "sandbox"):
+            raise Stop("invalid_config")
+        self.clock, self.sleep, self.egress = clock, sleep, egress
+        # Env proxies stay disabled. sandbox egress is a pinned DNS answer, not an HTTP proxy.
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect,
-                                                  PublicHTTPHandler, PublicHTTPSHandler)
+                                                  PublicHTTPHandler(egress), PublicHTTPSHandler(egress))
         self.robots, self.last, self.halted = {}, {}, set()
 
     def _get(self, url, accept, limit, delay=2):

@@ -5,6 +5,16 @@ No real provider calls, credential reads, live collector execution, deployment,
 cron changes, or live database writes were performed during BUILD. Source changes
 are confined to this linked worktree; PID 18143 and its runtime files are untouched.
 
+## Amendment 2026-11-07
+
+Operator steps are in [docs/LLM_EXTRACT_ACTIVATE.md](LLM_EXTRACT_ACTIVATE.md).
+The checked-in flag is still false. The daily collector and its cron are unchanged.
+
+* Page fetches keep the direct route unless the private config sets `egress` to `sandbox`. That value is the explicit pin of the range `collect/net.py` documents as sandbox fake-IP egress, `198.18.0.0/15`, which contains the reported gateway `198.18.0.1`. In that mode every answer must be global, or every answer must be inside that fixed range, and the socket pins the vetted address. The shipped value is `direct`, which still rejects the gateway range. `PITCHBOARD_EGRESS_GATEWAY_CIDRS` is not read. Literal gateway URLs, private, link-local, loopback, and metadata hosts stay denied, including after redirects.
+* `monetary_cap` defaults to `enforced` with `daily_cost_cap_usd` of `5.00`. The only no-dollar-stop setting is `monetary_cap` of `none` together with `daily_cost_cap_usd` of `null`. The call cap, process lock, ceiling record, seven-day window, and pricing expiry still stop the run.
+
+Official DeepSeek Flash prices were re-read on 2026-11-07 from the pricing page. Peak cache-miss input is still USD 0.30 per million tokens and peak output is still USD 1.20 per million. The checked-in ceilings are unchanged. That page does not publish an expiry date; this repo still accepts one verification for at most seven days.
+
 ## Implemented entry points
 
 The initial integration is the standalone shadow lane specified in the design.
@@ -19,9 +29,10 @@ remains a separate, later change after the comparison.
   uses cached held-out HTML and the same optional runner and budget.
 * `src/pbdata/collect/shadow/`: config/credentials, fetch policy, evidence schema,
   pure baseline, permanent budget ledger, shadow output, and cohort comparison.
-* `config/llm_extract.json`: checked-in `enabled=false`, 50 calls/day, USD 5/day,
-  UTC accounting, 24,000 page-text UTF-8 bytes, 2,048 output tokens, 30-second
-  provider timeout. There are no retries, environment enable switches, or tools.
+* `config/llm_extract.json`: checked-in `enabled=false`, `monetary_cap=enforced`,
+  50 calls/day, USD 5/day, UTC accounting, 24,000 page-text UTF-8 bytes, 2,048
+  output tokens, 30-second provider timeout. There are no retries, environment
+  enable switches, or tools.
 
 Missing, disabled, malformed, unknown-key, inactive, or expired configuration
 stops before credentials, feature fetches, state creation, and network access.
@@ -46,8 +57,9 @@ USD 0.30/M input and USD 1.20/M output. Each attempt is permanently charged
 **USD 0.3024576** in the local ledger. This ceiling charge is not an invoice cost.
 Unlike the earlier settlement proposal below, successful calls do not release
 unused reservations: timeouts, malformed responses, crashes and successful calls
-all consume the same maximum. This deliberately simpler rule allows at most
-**16 calls/day, 112/week**, despite the nominal 50-call cap. The generator freezes
+all consume the same maximum. With the default enforced USD 5 cap this allows at most
+**16 calls/day, 112/week**, despite the nominal 50-call cap. `monetary_cap` of `none`
+does not raise that sample bound and does not remove the call cap. The generator freezes
 a deterministic sample of at most 112 unique pages, round-robin by cohort/language,
 including rule negatives. Unselected pages remain missing predictions.
 
@@ -55,7 +67,8 @@ One explicit private shadow root owns the experiment identity and shared ledger
 for both live shadow and cached generation; use that same root for every run and
 resume. Independent roots/machines do not provide account-wide coordination.
 `flock` serializes processes, SQLite commits a call plus Decimal ceiling charge
-before dispatch, and both daily limits must permit the reservation. Midnight
+before dispatch, and the call cap must permit it. The cost cap must also permit
+it when `monetary_cap` is `enforced`. Midnight
 crossing or backwards time stops dispatch; uncertain charges are never reclaimed.
 Deleting initialized state, corrupt state, unsafe outputs, or persistence errors
 fails closed. Validated completed records recover from the ledger without another
@@ -66,9 +79,11 @@ API call. A partial JSONL tail stops the run rather than guessing how to repair 
 The shadow fetcher checks canonical hostnames before DNS or requests and at each
 redirect. Instagram and every subdomain are unconditionally denied, independently
 of `blocked_hosts.txt`; the entire repository blocklist also applies. Canonical
-hints and links are never followed. DNS answers must all be public; connections
-pin a checked numeric address, retain TLS hostname validation, and have no egress
-gateway exception. Each new origin/path passes robots for the collector UA.
+hints and links are never followed. With shipped `egress=direct`, DNS answers must all
+be global. `egress=sandbox` also allows every answer to fall inside the fixed
+range `198.18.0.0/15`. Connections pin a checked numeric address and retain TLS
+hostname validation. Env proxy variables and `PITCHBOARD_EGRESS_GATEWAY_CIDRS`
+do not select or widen that range. Each new origin/path passes robots for the collector UA.
 Robots 404/410 allow; valid nonempty text/plain 200 is parsed; all other statuses,
 redirects, errors, invalid bodies and disallow rules stop the attempt. Origin caches
 last one hour. Requests honor a minimum two-second interval and robots crawl delay.

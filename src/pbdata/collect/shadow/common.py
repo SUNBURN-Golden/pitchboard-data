@@ -70,10 +70,12 @@ def load_config(path=CONFIG, now=None):
         c = loads(Path(path).read_bytes())
         if not isinstance(c, dict) or c.get("enabled") is not True:
             raise Stop("disabled")
-        keys = {"enabled", "mode", "model", "daily_call_cap", "daily_cost_cap_usd",
+        keys = {"enabled", "mode", "model", "daily_call_cap", "daily_cost_cap_usd", "monetary_cap", "egress",
                 "max_page_utf8_bytes", "max_output_tokens", "timeout_seconds",
                 "window_start_utc", "window_end_utc", "pricing"}
         if set(c) != keys or c["mode"] != "shadow" or c["model"] != "deepseek-flash":
+            raise Stop("invalid_config")
+        if c["monetary_cap"] not in ("enforced", "none") or c["egress"] not in ("direct", "sandbox"):
             raise Stop("invalid_config")
         for k, low, high in (("daily_call_cap", 0, 10000), ("max_page_utf8_bytes", 1, 24000),
                              ("max_output_tokens", 1, 2048), ("timeout_seconds", 1, 60)):
@@ -87,8 +89,14 @@ def load_config(path=CONFIG, now=None):
             raise Stop("invalid_config")
         if money(p["input_usd_per_million_ceiling"]) < Decimal("0.30") or money(p["output_usd_per_million_ceiling"]) < Decimal("1.20"):
             raise Stop("invalid_config")
-        if c["daily_call_cap"] == 0 or money(c["daily_cost_cap_usd"]) == 0:
+        if c["daily_call_cap"] == 0:
             raise Stop("budget_exhausted")
+        if c["monetary_cap"] == "enforced":
+            if money(c["daily_cost_cap_usd"]) == 0:
+                raise Stop("budget_exhausted")
+        elif c["daily_cost_cap_usd"] is not None:
+            # "none" is the only opt-in, and it cannot sit beside a dollar figure that looks enforced.
+            raise Stop("invalid_config")
         start, end = stamp(c["window_start_utc"]), stamp(c["window_end_utc"])
         now = now or utcnow()
         if not start < end or end - start > dt.timedelta(days=7):
