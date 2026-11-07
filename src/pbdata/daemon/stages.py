@@ -11,7 +11,7 @@ from .. import timeutil
 from ..ids import sha256_hex, stable_id
 from ..model import ValidationError
 from .. import statemachine
-from ..collect import collector, promote, gaps, store
+from ..collect import collector, promote, gaps, store, reconcile
 from ..collect.resolve import same_entity
 from ..profiles import pitchboard as prof
 from . import clips, project
@@ -178,6 +178,7 @@ def _live(c, call_id, pred):
 def s_state_update(c: RunContext) -> dict:
     now = c.clock()
     nowdt = timeutil.parse_iso(now)
+    reconciled = reconcile.reconcile(c.svc, now)
     moved = {"closed_by_clock": 0, "opened_by_clock": 0, "closed_by_evidence": 0, "cancelled_by_evidence": 0, "reopened_by_evidence": 0}
     for call in c.svc.execute("SELECT call_id, status, status_since, edition_key FROM pb_call_edition WHERE status IN "
                               "('announced','open','extended','standing','closed')").fetchall():
@@ -213,7 +214,8 @@ def s_state_update(c: RunContext) -> dict:
                 moved["opened_by_clock"] += 1
     by = dict(c.svc.execute("SELECT status, count(*) FROM pb_call_edition GROUP BY status").fetchall())
     hist = c.svc.execute("SELECT count(*) FROM pb_status_event").fetchone()[0]
-    return {**moved, "calls_by_status": by, "status_events_total": hist}
+    return {**moved, "reconcile": reconciled, "closed_nonwriting": reconciled["closed_nonwriting"],
+            "calls_by_status": by, "status_events_total": hist}
 
 
 # 8 ---------------------------------------------------------------- service recompute
