@@ -164,6 +164,16 @@ ID 규칙: ULID 기반 불변 ID. 기존 정수/UUID는 `alias` 테이블로 보
 | any → superseded | 같은 회차로 판정된 대체(검수 승인) | review_decision |
 | closed/cancelled → archived | 보관 정책 경과 | 시스템 |
 
+The daemon's state-update stage also rechecks existing announced/open/extended/standing
+editions against the current non-writing promotion gates. It uses current-version
+full-page labels for the latest stored content, or replays that content's retained
+evidence excerpts and headings. Only an explicit rejection of every stated backing
+basis closes the edition, via an evidence-based `correction` event recording the rule
+versions and source/raw/revision/fact/evidence (and cached label) IDs. `closed` here
+corrects the prior open-call classification; it does not assert source cancellation
+or a passed deadline. Facts are retained. Missing/ambiguous evidence, changed content
+without a current rejection, or a surviving eligible basis keeps the edition.
+
 금지: `cancelled → open` 직접 전이(새 회차로 생성), 증거 없는 수동 상태 변경, 시간만으로 `cancelled` 판정.
 
 ### 3.2 파생 판정 `applicable_now` (질의 시 계산, 저장 안 함)
