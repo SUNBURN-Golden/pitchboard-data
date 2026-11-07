@@ -144,7 +144,12 @@ class State:
         day = now.date().isoformat()
         charge = reservation(config)
         costs = [money(r[0]) for r in conn.execute("SELECT reserved_usd FROM attempts WHERE day=?", (day,))]
-        if len(costs) >= config["daily_call_cap"] or sum(costs, Decimal(0)) + charge > money(config["daily_cost_cap_usd"]):
+        mode = config["monetary_cap"]
+        if mode not in ("enforced", "none"):
+            raise Stop("invalid_config")
+        # The ceiling is always recorded. Only enforced mode also stops on the dollar sum.
+        over_cost = mode == "enforced" and sum(costs, Decimal(0)) + charge > money(config["daily_cost_cap_usd"])
+        if len(costs) >= config["daily_call_cap"] or over_cost:
             raise Stop("budget_exhausted")
         # Preflight output before the durable reservation. No network on failure.
         with secure_open(self.output(day), "a+"):

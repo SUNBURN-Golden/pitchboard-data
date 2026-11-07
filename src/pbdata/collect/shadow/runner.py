@@ -77,7 +77,7 @@ class ShadowRunner:
                 # Only the policy fetcher may assert live verification.
                 if fetcher is not None and not isinstance(fetcher, PolicyFetcher):
                     raise Stop("invalid_fetcher")
-                page = (fetcher or PolicyFetcher()).fetch(requested)
+                page = (fetcher or PolicyFetcher(egress=config["egress"])).fetch(requested)
             doc = page.doc()
             if len(doc.text().encode("utf-8")) > config["max_page_utf8_bytes"]:
                 raise Stop("page_too_large")
