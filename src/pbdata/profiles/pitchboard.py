@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 from ..collect.dates import find_dates
 from ..collect.parse import Doc, Link, Segment
 
-EXTRACTOR_VERSION = "pb-rules-6"   # 6: scholarship/student-finance gate with writing-cue override; non-writing page titles gate deadlines
+EXTRACTOR_VERSION = "pb-rules-7"   # 7: explicit simultaneous-submission declarations with parenthetical definitions
 LABELER_VERSION = "pb-labels-3"    # 3: non-writing titles also block rules-only call creation, even without recruitment cues
 OCR_EXTRACTOR = "ocr:tesseract+rules"
 
@@ -94,8 +94,16 @@ FEE_AMT_KO = re.compile(r"(응모료|참가비|접수비|참가료|심사비|응
 PAY_EN = re.compile(r"(?:we pay|pays?|paid|payment|honorarium|compensation|rate|rates)[^.\n]{0,50}?(?P<cur>[$£€]|USD|GBP|EUR)\s?(?P<lo>\d[\d,]*(?:\.\d+)?)(?:\s*(?:-|–|to)\s*(?:[$£€])?\s?(?P<hi>\d[\d,]*(?:\.\d+)?))?(?P<unit>\s*(?:per|/|a)\s*(?:word|piece|article|review|essay|story|poem|page))?", re.I)
 PAY_KO = re.compile(r"(원고료|고료|사례비)[^.\n]{0,30}?(?P<amt>\d[\d,]*)\s*(?P<man>만)?\s*원")
 UNPAID_EN = re.compile(r"\b(we do not pay|unpaid|no payment|does not pay|do not pay)\b", re.I)
-SIM_OK = re.compile(r"simultaneous (submissions?|submitting)[^.\n]{0,40}?(are |is )?(welcome|accepted|allowed|fine|ok(ay)?|permitted)|(welcome|accept|allow)s? simultaneous|(?:이중|동시)\s*투고\s*(가능|허용)", re.I)
-SIM_NO = re.compile(r"(no simultaneous (submissions?|submitting)|do(es)? not (accept|consider|allow) simultaneous|please do not submit simultaneously|simultaneous submissions? (are )?(not|aren't)|(?:이중|동시|중복)\s*투고\s*(금지|불가)|중복\s*투고\s*(금지|불가))", re.I)
+# Keep the policy subject and declaration adjacent, allowing a parenthetical definition.
+# A broad wildcard here mistakes "not accepted" or "if accepted elsewhere" for permission.
+_SIM_SUBJECT = r"simultaneous (?:submissions?|submitting)"
+_SIM_DEFINITION = r"(?:\s*\([^()\n]{1,160}\))?"
+SIM_OK = re.compile(_SIM_SUBJECT + _SIM_DEFINITION + r"\s+(?:(?:are|is)\s+)?(?:welcome|accepted|allowed|fine|okay|ok|permitted)\b|"
+                    r"\b(?:welcome|accept|allow)s? simultaneous (?:submissions?|submitting)\b|"
+                    r"(?:이중|동시)\s*투고\s*(?:가능|허용)", re.I)
+SIM_NO = re.compile(r"(?:no simultaneous (?:submissions?|submitting)|do(?:es)? not (?:accept|consider|allow) simultaneous|please do not submit simultaneously|"
+                    + _SIM_SUBJECT + _SIM_DEFINITION + r"\s+(?:(?:are|is)\s+not|aren't|isn't|not)\b|"
+                    r"(?:이중|동시|중복)\s*투고\s*(?:금지|불가))", re.I)
 AI_NO = re.compile(r"((do not|don't|will not|cannot|can't|not) (accept|consider|allow|publish|use)[^.\n]{0,50}(AI|artificial intelligence|generative|ChatGPT|LLM)|(AI|artificial intelligence|generative AI|ChatGPT)[^.\n]{0,50}(not (accepted|allowed|permitted|considered)|prohibited|banned)|no (AI|generative AI)[- ]generated|(생성형\s*AI|인공지능|AI)[^.\n]{0,30}(사용|활용)?[^.\n]{0,10}(금지|불가|제한))", re.I)
 AI_MENTION = re.compile(r"\b(generative AI|AI[- ]generated|artificial intelligence|ChatGPT|LLM)\b|생성형\s*AI|인공지능", re.I)
 WORLD_RE = re.compile(r"(open to (writers|submissions|everyone) (from )?(everywhere|worldwide|around the world|internationally)|international submissions are welcome|writers worldwide)", re.I)
