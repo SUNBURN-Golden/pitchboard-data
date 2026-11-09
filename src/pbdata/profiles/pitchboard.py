@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Tuple
 from ..collect.dates import find_dates
 from ..collect.parse import Doc, Link, Segment
 
-EXTRACTOR_VERSION = "pb-rules-6"   # 6: scholarship/student-finance gate with writing-cue override; non-writing page titles gate deadlines
+EXTRACTOR_VERSION = "pb-rules-7"   # 7: explicit submission-fee payment instructions can state a fee without an amount
 LABELER_VERSION = "pb-labels-3"    # 3: non-writing titles also block rules-only call creation, even without recruitment cues
 OCR_EXTRACTOR = "ocr:tesseract+rules"
 
@@ -91,6 +91,18 @@ NOT_DEADLINE_CUE = re.compile(r"(announce|winners?|results|notified|notification
 
 FEE_AMT_EN = re.compile(r"(?:(?:submission|reading|entry|application|contest|processing) fees?|fees?)[^.\n]{0,40}?(?P<cur>[$£€]|USD|GBP|EUR)\s?(?P<amt>\d+(?:\.\d{1,2})?)|(?P<cur2>[$£€])\s?(?P<amt2>\d+(?:\.\d{1,2})?)\s+(?:submission|reading|entry|application) fee", re.I)
 FEE_AMT_KO = re.compile(r"(응모료|참가비|접수비|참가료|심사비|응모비)(?:(?!없|무료|면제|원고료)[^.\n]){0,20}?(?P<amt>\d[\d,]*)\s*(?P<man>만)?\s*원")
+# Payment-method instructions assert a fee even when the amount is not retained.
+# A modal modifies *how to pay*, not whether a fee applies ("fees may apply" is not enough).
+# Anchor to a sentence so membership/workshop fees or descriptions of other outlets do not qualify.
+FEE_PAYMENT = re.compile(
+    r"(?:^|(?<=[.!?\n]))\s*(?:(?:our|the)\s+)?(?:submission|reading|entry) fees?\s+"
+    r"(?:(?:must|may|can) be paid|(?:is|are) payable)\s+(?:online\b|by\b|via\b|using\b|with\b)"
+    r"|(?:^|(?<=[.!?\n]))\s*(?:응모료|접수비|심사료)(?:는|를|은|을)?\s*"
+    r"(?:반드시\s*)?(?:(?:온라인|카드|계좌\s*이체)(?:으로|로)?\s*)?"
+    r"(?:납부|결제)\s*(?:해야\s*(?:합니다|한다)|필수)", re.I)
+FEE_PAYMENT_UNSCOPED = re.compile(
+    r"\b(if|unless|waiv\w*|exempt\w*|optional|members?|membership|subscription|workshops?|courses?|"
+    r"tuition|other|some|elsewhere)\b|회원|구독|수강|강좌|워크숍|면제|경우|선택", re.I)
 PAY_EN = re.compile(r"(?:we pay|pays?|paid|payment|honorarium|compensation|rate|rates)[^.\n]{0,50}?(?P<cur>[$£€]|USD|GBP|EUR)\s?(?P<lo>\d[\d,]*(?:\.\d+)?)(?:\s*(?:-|–|to)\s*(?:[$£€])?\s?(?P<hi>\d[\d,]*(?:\.\d+)?))?(?P<unit>\s*(?:per|/|a)\s*(?:word|piece|article|review|essay|story|poem|page))?", re.I)
 PAY_KO = re.compile(r"(원고료|고료|사례비)[^.\n]{0,30}?(?P<amt>\d[\d,]*)\s*(?P<man>만)?\s*원")
 UNPAID_EN = re.compile(r"\b(we do not pay|unpaid|no payment|does not pay|do not pay)\b", re.I)
@@ -320,6 +332,12 @@ def extract(doc: Doc, ocr: bool = False) -> List[Ext]:
                 m = EXPLICIT_NONE_PATTERNS["fee.submission"].search(t)
                 if m:
                     add("fee.submission", "explicitly_none", {"fee": "none"}, seg, m)
+                else:
+                    m = FEE_PAYMENT.search(t)
+                    if m and not page_nonwriting and not non_writing(t + " " + seg.heading, writing_context) \
+                            and not FEE_PAYMENT_UNSCOPED.search(t + " " + seg.heading + " " + doc.title):
+                        add("fee.submission", "stated", {"amount_min": None, "amount_max": None,
+                            "currency": None, "unit": None, "comparable": False}, seg, m)
         # --- compensation
         m = PAY_EN.search(t)
         if m and not re.search(r"\b(prize|award|winner)\b", t[:m.start() + 20], re.I):
