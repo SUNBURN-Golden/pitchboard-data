@@ -14,6 +14,12 @@ from unittest.mock import patch
 from pbdata.collect.shadow import batch, common, planner, runner, schema, state
 from test_llm_extract import Harness, NOW, URL, KEY, HTML, page, proposal, completion
 
+# sqlite3.Connection.deserialize landed in Python 3.11. CI still discovers on
+# 3.9, so success paths that snapshot a database in memory must skip there.
+HAS_DESERIALIZE = hasattr(sqlite3.Connection, "deserialize")
+deserialize_required = unittest.skipUnless(
+    HAS_DESERIALIZE, "sqlite3.Connection.deserialize requires Python 3.11+")
+
 
 def candidate(**changes):
     row = dict(gap_id="gap_1", subject_type="outlet", subject_id="out_1", predicate="fee.submission",
@@ -91,6 +97,7 @@ class InputSafetyTests(unittest.TestCase):
         self.assertFalse(planner.plan(export(candidate()), history=[h], config_hash="config")["targets"])
         self.assertTrue(planner.plan(export(candidate(predicate="status.declared")), history=[h], config_hash="config")["targets"])
 
+    @deserialize_required
     def test_db_snapshot_parity_and_no_writes(self):
         p = self.tmp_path / "fixture.sqlite"
         c = sqlite3.connect(p)
@@ -128,6 +135,13 @@ class InputSafetyTests(unittest.TestCase):
         c.execute("INSERT INTO pb_raw_ref SELECT 'raw_old',source_id,url,final_url,kind,'ok',200,content_hash,text_hash,'2026-11-04T00:00:00Z' FROM pb_raw_ref LIMIT 1")
         c.commit(); c.close()
         self.assertFalse(planner.plan(planner.read_db(p, NOW))["targets"])
+
+    # Fails on the sidecar check before deserialize, so it still guards 3.9.
+    def test_db_sidecars_require_export(self):
+        p = self.tmp_path / "fixture.sqlite"
+        c = sqlite3.connect(p)
+        c.execute("CREATE TABLE pb_gap(gap_id)")
+        c.commit(); c.close()
         Path(str(p) + "-wal").touch()
         with self.assertRaisesRegex(common.Stop, "db_requires_export"):
             planner.read_db(p, NOW)
@@ -352,6 +366,7 @@ class ReportTests(Harness):
         self.assertEqual(row["outcome"], "ok")
         return row, next(self.root.glob("data/shadow/llm_extract_*.jsonl")), score_shadow
 
+    @deserialize_required
     def test_offline_missing_gold_fee_denominators_cost_and_unfinished(self):
         row, path, score_shadow = self.inputs()
         self.run_page(url="https://example.org/failed", transport=lambda *_: (_ for _ in ()).throw(common.Stop("provider_error")))
@@ -417,8 +432,12 @@ with patch('socket.socket', side_effect=AssertionError('network')), patch.object
     sys.argv = sys.argv[1:]
     runpy.run_path(sys.argv[0], run_name='__main__')
 '''
-        result = subprocess.run([sys.executable, "-B", "-c", program, str(script), "--input-mode", "shadow", "--shadow-root", str(self.root),
-                                 "--predictions", str(path), "--config", str(self.config_path), "--as-of", "2026-11-05"], capture_output=True, text=True)
+        args = [sys.executable, "-B", "-c", program, str(script), "--input-mode", "shadow", "--shadow-root", str(self.root),
+                "--predictions", str(path), "--config", str(self.config_path), "--as-of", "2026-11-05"]
+        if not HAS_DESERIALIZE:
+            # Avoid the ledger snapshot on 3.9; these tripwires do not need it.
+            args += ["--ledger", str(self.base / "absent-ledger.sqlite3")]
+        result = subprocess.run(args, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["verified_unique_pages"], 1)
         report_path = self.root / "comparison_20261105.json"
@@ -447,7 +466,9 @@ class BatchIntegrationTests(Harness):
         self.assertNotIn(KEY, path.read_text())
         from pbdata.collect.shadow.report import score_shadow
         output = next(self.root.glob("data/shadow/llm_extract_*.jsonl"))
-        report = score_shadow([output], self.root, NOW, self.config, ledger_path=self.root / "budget.sqlite3")
+        # The cap/planning assertions below do not need the ledger snapshot.
+        report = score_shadow([output], self.root, NOW, self.config,
+                              ledger_path=self.root / "budget.sqlite3" if HAS_DESERIALIZE else None)
         self.assertEqual(report["planning"]["selected_urls"], 4)
         self.assertEqual(report["planning"]["selected_without_attempt"], 2)
 
@@ -562,8 +583,9 @@ class ServiceHashContractTests(Harness):
             self.assertEqual(pending["reasons"]["skip_static_already_done"], 1)
 
         outputs = list(self.root.glob("data/shadow/llm_extract_*.jsonl"))
+        # Counts/coverage below are ledger-independent; the snapshot needs 3.11.
         report = score_shadow(outputs, self.root, next_clock, self.config,
-                              ledger_path=self.root / "budget.sqlite3")
+                              ledger_path=self.root / "budget.sqlite3" if HAS_DESERIALIZE else None)
         self.assertEqual(report["counts"]["verified_unique_pages"], 2)
         self.assertEqual(report["counts"]["changed_source_attempts"], 0)
         self.assertEqual(report["field_coverage"]["submission_fee"]["targeted_pages"], 2)
@@ -606,6 +628,8 @@ class LegacyScoreTests(unittest.TestCase):
 
 
 class PlanOnlyHistoryTests(Harness):
+    # read_history snapshots the ledger through deserialize.
+    @deserialize_required
     def test_plan_only_reflects_prior_static_completion_without_writes(self):
         self.assertEqual(self.run_page()["outcome"], "ok")
         before = {p: p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
