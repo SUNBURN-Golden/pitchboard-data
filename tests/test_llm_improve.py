@@ -165,3 +165,78 @@ class CacheTests(Harness):
         assert cached.doc().segments == p.doc().segments
         assert cached.doc().meta == p.doc().meta
         assert runner.baseline(cached.doc(), r["as_of"]) == r["baseline"]
+
+
+def validate_one(field, value, quote, text=None):
+    from pbdata.collect.parse import Doc, Segment
+    raw = dict.fromkeys(schema.FIELDS)
+    raw[field] = dict(value=value, quote=quote)
+    return schema.validate(raw, Doc("html", segments=[Segment(0, "p", text or quote)]), "2026-11-05")
+
+
+def fee(text="Entry fee USD 20", **changes):
+    value = dict(text=text, state="stated", amount_min="20", amount_max="20", currency="USD", unit="per_submission")
+    value.update(changes)
+    return value
+
+
+def test_strict_tokens_fee_date_currency_unit_and_negation():
+    q = "Entry fee USD 20"
+    assert validate_one("submission_fee", fee(), q)[0]["submission_fee"]
+    for value in (fee(amount_min="2"), fee(currency="KRW"), fee(unit="per_word"), fee(text="invented")):
+        assert validate_one("submission_fee", value, q)[0]["submission_fee"] is None
+    for q in ("No entry fee is stated.", "There is a prize USD 20."):
+        assert validate_one("submission_fee", fee(text=q), q)[0]["submission_fee"] is None
+    q = "No submission fee."
+    assert validate_one("submission_fee", fee(text=q, state="explicitly_none", amount_min=None, amount_max=None, currency=None, unit=None), q)[0]["submission_fee"]
+    for q, amount in (("응모료 10,000원", "10000"), ("응모료 ２만원", "20000"), ("Entry fee USD 1,000.50", "1000.50")):
+        v = fee(text=q, amount_min=amount, amount_max=amount, currency="KRW" if "원" in q else "USD")
+        assert validate_one("submission_fee", v, q)[0]["submission_fee"]
+    q = "Entry fee USD 2026"
+    assert validate_one("submission_fee", fee(text=q), q)[1]["submission_fee"] == "unsupported_amount"
+    q = "Submissions close December 1, 2026."
+    v = dict(text="December 1, 2026", date="2026-12-02", timezone=None)
+    assert validate_one("deadline", v, q)[1]["deadline"] == "unsupported_date"
+    v.update(date="2026-12-01", timezone="KST")
+    assert validate_one("deadline", v, q)[1]["deadline"] == "unsupported_timezone"
+    v = dict(is_real_call=True, status="open")
+    assert validate_one("open_call", v, "We are not currently open to submissions.")[0]["open_call"] is None
+    assert validate_one("open_call", dict(is_real_call=False, status="not_call"), "Submissions are open.")[0]["open_call"] is None
+    raw = proposal(); raw.pop("submission_fee")
+    assert schema.validator("pb-shadow-1")(raw, page().doc(), "2026-11-05")[0]["pay"]
+
+
+class ReviewTests(Harness):
+    def test_conflicts_flags_missing_baseline_and_recover_once(self):
+        from pbdata.collect.shadow.review import reviews
+        row = self.run_page()
+        changed = copy.deepcopy(row)
+        changed["fields"]["deadline"]["value"]["date"] = "2026-12-02"
+        assert any("field_conflict" in r["reasons"] for r in reviews(changed))
+        changed = copy.deepcopy(row)
+        changed["fields"]["open_call"]["value"] = dict(is_real_call=False, status="not_call")
+        assert any(r["second_opinion_required"] for r in reviews(changed))
+        changed = copy.deepcopy(row)
+        changed["baseline"].update(current_open=False, real_call=False, labels=[dict(status="results_not_call")])
+        assert any(r["second_opinion_required"] for r in reviews(changed))
+        changed["baseline"].update(labels=[], extensions=[], deadline=[])
+        rs = reviews(changed)
+        assert not any(r["second_opinion_required"] for r in rs)
+        assert any("baseline_uncertain" in r["reasons"] for r in rs)
+        # Missing baseline fields produce candidate fills, never conflicts.
+        assert any(r["reasons"] == ["candidate_fill"] for r in rs)
+        # A failure publishing derived rows happens after the completed attempt
+        # is durable; recovery must publish them without another provider call.
+        self.root = self.base / "recover"
+        with patch.object(state.State, "publish_derived", side_effect=OSError("failure")), patch.object(runner, "baseline", return_value=changed["baseline"]):
+            assert self.run_page()["outcome"] == "skipped"
+        with state.State(self.root).locked():
+            pass
+        paths = list((self.root / "data/shadow").glob("review_conflicts_*.jsonl"))
+        assert paths
+        before = [p.read_bytes() for p in paths]
+        with state.State(self.root).locked():
+            pass
+        assert before == [p.read_bytes() for p in paths]
+        assert len(self.calls) == 2
+        assert KEY.encode() not in self.artifacts()

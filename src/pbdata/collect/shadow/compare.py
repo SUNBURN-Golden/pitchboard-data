@@ -11,7 +11,7 @@ from urllib.parse import parse_qs, urlsplit
 from .common import Stop, digest, dumps, loads, no_symlinks, page_limit
 from .policy import Page, canonical_url
 from .runner import baseline
-from .schema import FIELDS, validate
+from .schema import FIELDS, VERSION, validator
 
 COHORTS = (
     ("root", "manifest.json", "corpus", "2026-10-29"),
@@ -296,15 +296,18 @@ def score(items, rows):
             if row.get("text_sha256") != item.text_hash:
                 raise Stop("prediction_text_mismatch")
             proposals = row.get("fields")
-            if not isinstance(proposals, dict) or set(proposals) != set(FIELDS):
+            validation = validator(row.get("schema", VERSION))
+            expected = set(FIELDS) - ({"submission_fee"} if row.get("schema") == "pb-shadow-1" else set())
+            if not isinstance(proposals, dict) or set(proposals) != expected:
                 raise Stop("invalid_prediction_fields")
             try:
                 raw = {f: ({"value": proposals[f]["value"], "quote": proposals[f]["quote"]}
-                           if proposals[f] is not None else None) for f in FIELDS}
+                           if proposals[f] is not None else None) for f in expected}
             except (KeyError, TypeError):
                 # Foreign/hand-edited rows must become a fixed Stop, never KeyError.
                 raise Stop("invalid_prediction_fields") from None
-            fields, reasons = validate(raw, item.page.doc(), item.as_of)
+            fields, reasons = validation(raw, item.page.doc(), item.as_of)
+            fields.setdefault("submission_fee", None)
             if reasons:
                 raise Stop("prediction_evidence_invalid")
         call = fields["open_call"]

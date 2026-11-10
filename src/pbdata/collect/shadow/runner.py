@@ -157,6 +157,8 @@ class ShadowRunner:
                     record["outcome"] = str(exc) if str(exc) in allowed else "provider_error"
                 except Exception:
                     record["outcome"] = "provider_error"
+                from .review import reviews
+                record["reviews"] = reviews(record)
                 record["latency_ms"] = round((time.monotonic() - start) * 1000)
                 if key in dumps(record):
                     raise Stop("credential_in_record")

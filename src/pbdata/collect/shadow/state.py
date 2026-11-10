@@ -131,6 +131,36 @@ class State:
                 if row["id"] not in ids:
                     append_sync(f, loads(row["result"]))
             sync_dir(self.output(day).parent)
+        self.publish_derived(conn, day)
+
+    def publish_derived(self, conn, day):
+        rows = [loads(r[0]) for r in conn.execute(
+            "SELECT result FROM attempts WHERE day=? AND result IS NOT NULL ORDER BY rowid", (day,))]
+        self.append_unique(day, "review_conflicts", "review_id", [v for r in rows for v in r.get("reviews", [])])
+
+    def append_unique(self, day, stream, id_key, rows):
+        if not rows:
+            return
+        path = self.output(day).with_name(stream + "_" + day.replace("-", "") + ".jsonl")
+        with secure_open(path, "a+") as f:
+            f.seek(0)
+            text = f.read()
+            if text and not text.endswith("\n"):
+                raise Stop("partial_shadow_output")
+            existing = {}
+            for line in text.splitlines():
+                row = loads(line)
+                if row[id_key] in existing:
+                    raise Stop("duplicate_shadow_output")
+                existing[row[id_key]] = row
+            for row in rows:
+                if row[id_key] in existing:
+                    if row != existing[row[id_key]]:
+                        raise Stop("conflicting_shadow_output")
+                else:
+                    append_sync(f, row)
+                    existing[row[id_key]] = row
+        sync_dir(path.parent)
 
     def preflight(self, conn, config, now):
         time = now.isoformat()

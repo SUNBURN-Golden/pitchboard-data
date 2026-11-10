@@ -549,3 +549,14 @@ historical provenance. Corrupt/unsafe copies stop; unknown hashes fetch normally
 The whole page is rejected above the configured ceiling; no truncation. Cache
 writes occur under the ledger lock before reservation and after key checks.
 Validation: 64 tests and 165 subtests passed across extraction/comparison/improvement.
+
+Stage 3 adds schema `pb-shadow-2` with a separate submission fee, exact free-text
+spans and constraint support, complete explicit date mapping, bounded amount
+mapping (including thousands separators/full-width digits/Korean 만원), currency
+and unit cues, and conservative explicit status/polarity checks. Unsupported
+status/conditional pay cases abstain. The version-1 validator remains available
+for historical rows. Evidence checks cannot establish semantic accuracy; human
+gold is still required. Same-attempt comparisons record candidate fills, partial
+or incomparable scope, conflicts and two-way call second opinions. Durable result
+rows contain derived reviews; recovery publishes them idempotently without a
+provider call. Validation: 71 tests and 189 subtests passed, including fee tests.

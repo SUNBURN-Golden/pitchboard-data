@@ -33,6 +33,7 @@ def page(url=URL, body=HTML):
 
 def proposal():
     return {
+        "submission_fee": None,
         "open_call": {"value": {"is_real_call": True, "status": "open"}, "quote": QUOTE},
         "deadline": {"value": {"text": "December 1, 2026", "date": "2026-12-01", "timezone": None}, "quote": QUOTE},
         "pay": {"value": {"text": "USD 100 per story", "state": "paid", "amount_min": "100", "amount_max": "100",
@@ -223,14 +224,14 @@ class BudgetTests(Harness):
         with patch.object(state.State, "publish", side_effect=OSError(KEY)):
             self.assertEqual(self.run_page()["outcome"], "skipped")
         self.assertEqual(self.run_page()["reason"], "duplicate_page")
-        files = list(self.root.glob("data/shadow/*.jsonl"))
+        files = list(self.root.glob("data/shadow/llm_extract_*.jsonl"))
         self.assertEqual(len(files), 1)
         self.assertEqual(len(files[0].read_text().splitlines()), 1)
         self.assertEqual(len(self.calls), 1)
 
     def test_missing_corrupt_ledger_and_partial_output_fail_closed(self):
         self.assertEqual(self.run_page()["outcome"], "ok")
-        output = next(self.root.glob("data/shadow/*.jsonl"))
+        output = next(self.root.glob("data/shadow/llm_extract_*.jsonl"))
         with output.open("a") as f:
             f.write('{"partial":')
         self.assertEqual(self.run_page(URL + "next")["reason"], "partial_shadow_output")
@@ -395,7 +396,7 @@ class SecretAndIsolationTests(Harness):
         self.assertEqual(self.run_page()["reason"], "unrecognized_shadow_root")
         (self.root / "other").unlink()
         self.assertEqual(self.run_page()["outcome"], "ok")
-        output = next(self.root.glob("data/shadow/*.jsonl"))
+        output = next(self.root.glob("data/shadow/llm_extract_*.jsonl"))
         output.unlink()
         external = self.base / "external"
         external.write_text("safe")
@@ -411,6 +412,8 @@ class EvidenceTests(unittest.TestCase):
         result, reasons = schema.validate(proposal(), p.doc(), "2026-11-05")
         self.assertFalse(reasons)
         for field in result.values():
+            if field is None:
+                continue
             segment = p.doc().segments[field["segment_idx"]]
             self.assertEqual(segment.text[field["start"]:field["end"]], field["quote"])
         text = "한국어 작가 누구나 지원할 수 있습니다."
@@ -463,7 +466,8 @@ class EvidenceTests(unittest.TestCase):
         raw = proposal()
         raw["open_call"]["value"] = {"is_real_call": False, "status": "not_call"}
         result, _ = schema.validate(raw, page().doc(), "2026-11-05")
-        self.assertTrue(all(result[f] is None for f in schema.FIELDS[1:]))
+        self.assertIsNone(result["open_call"])
+        self.assertIsNotNone(result["pay"])
         raw = proposal()
         result, reasons = schema.validate(raw, page().doc(), "2026-12-02")
         self.assertIsNone(result["open_call"])
