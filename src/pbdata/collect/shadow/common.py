@@ -27,6 +27,20 @@ def digest(value):
     return hashlib.sha256(value).hexdigest()
 
 
+def source_content_hash(body):
+    """The service collector's content hash for a raw response body.
+
+    ``collect/net.py`` hashes ``body.decode("latin-1")`` through
+    ``ids.sha256_hex`` (UTF-8 encoding), which differs from the raw-byte
+    ``digest(body)`` for any non-ASCII page. Shadow target matching, cache
+    lookup and history use this service contract while ``body_sha256`` remains
+    the raw-byte identity used by held-out cohorts.
+    """
+    if not isinstance(body, bytes):
+        raise Stop("invalid_policy_envelope")
+    return digest(body.decode("latin-1"))
+
+
 def dumps(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
 

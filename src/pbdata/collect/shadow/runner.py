@@ -103,6 +103,8 @@ class ShadowRunner:
                     if (not checked["targets"] or checked["targets"][0]["url"] != requested
                             or checked["targets"][0]["content_hash"] != known_hash):
                         raise Stop("ineligible_source")
+                # ``known_hash`` is the service ``pb_raw_ref.content_hash``; the
+                # cache keys on that same service contract, never raw bytes.
                 page = source_cache.load(state.root, requested, known_hash, self.clock(), config["max_page_utf8_bytes"])
                 # Only the policy fetcher may assert live verification.
                 if fetcher is not None and not isinstance(fetcher, PolicyFetcher):
@@ -141,10 +143,11 @@ class ShadowRunner:
                           "timestamp_utc": now.isoformat(), "budget_day": day,
                           "requested_url": requested, "final_url": page.final_url, "redirect_chain": list(page.hops),
                           "provenance": page.provenance, "body_sha256": page.body_sha256,
+                          "source_content_hash": page.source_content_hash,
                           "text_sha256": digest(doc.text()), "parser_version": PARSER_VERSION,
                           "source_cache_key": cache_id,
                           "source_observed_at_utc": getattr(page, "observed_at_utc", "") or now.isoformat(),
-                          "source_changed": bool(target and target.get("content_hash") and target["content_hash"] != page.body_sha256),
+                          "source_changed": bool(target and target.get("content_hash") and target["content_hash"] != page.source_content_hash),
                           "prompt_sha256": PROMPT_HASH, "schema_sha256": SCHEMA_HASH,
                           "config_sha256": config_hash, "config_snapshot": config,
                           "runtime_commit": runtime_commit(), "as_of": as_of,

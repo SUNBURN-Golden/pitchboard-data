@@ -3,6 +3,7 @@ import copy
 import datetime as dt
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -11,7 +12,7 @@ from unittest.mock import patch
 
 import pytest
 from pbdata.collect.shadow import batch, common, planner, runner, schema, state
-from test_llm_extract import Harness, NOW, URL, KEY, page, proposal, completion
+from test_llm_extract import Harness, NOW, URL, KEY, HTML, page, proposal, completion
 
 
 def candidate(**changes):
@@ -19,7 +20,7 @@ def candidate(**changes):
                scope_ref="unspecified", state="open", gap_class="not_extracted", importance=.7,
                owner_outlet_id="out_1", source_id="src_1", owner_name="Example", outlet_name="Example",
                permission="allowed_public", raw_id="raw_1", url=URL, final_url=URL, kind="html", outcome="ok",
-               http_status=200, content_hash=common.digest(page().body), text_hash=None,
+               http_status=200, content_hash=common.source_content_hash(page().body), text_hash=None,
                fetched_at="2026-11-05T00:00:00Z", relevance=0, relationship_basis="outlet_source")
     row.update(changes)
     if "url" in changes and "final_url" not in changes:
@@ -178,7 +179,7 @@ class CacheTests(Harness):
         p = page(body='<html lang="ko"><title>모집</title><meta property="og:title" content="시 모집"><table><tr><td>응모료</td><td>10,000원</td></tr></table></html>'.encode())
         r = self.run_page(page=p)
         assert r["outcome"] == "ok"
-        cached = source_cache.load(self.root, URL, p.body_sha256, NOW)
+        cached = source_cache.load(self.root, URL, p.source_content_hash, NOW)
         assert cached.doc().segments == p.doc().segments
         assert cached.doc().meta == p.doc().meta
         assert runner.baseline(cached.doc(), r["as_of"]) == r["baseline"]
@@ -482,3 +483,135 @@ def test_omitting_deadline_cannot_keep_past_open_call():
     quote = "Submissions are open until December 1, 2025."
     fields, reasons = validate_one("open_call", dict(is_real_call=True, status="open"), quote)
     assert fields["open_call"] is None and reasons["open_call"] == "past_deadline_conflict"
+
+
+# F1/F2: the service `content_hash` (latin-1 decode -> UTF-8 hash) is the shadow
+# source identity for cache, history and source_changed. Korean bodies diverge
+# from the raw-byte hash, so this is the contract-level regression.
+KO_HTML = HTML.replace(b"</html>", "<p>한국어 안내 문구입니다.</p></html>".encode())
+
+
+class ServiceHashContractTests(Harness):
+    def test_korean_hash_reuse_history_coverage_and_digest(self):
+        from pbdata.collect.shadow import source_cache
+        from pbdata.collect.shadow.report import score_shadow
+        body = KO_HTML
+        service = common.source_content_hash(body)
+        raw_hash = common.digest(body)
+        assert service != raw_hash
+        p = page(body=body)
+        assert p.source_content_hash == service and p.body_sha256 == raw_hash
+
+        target = planner.plan(export(candidate(content_hash=service)))["targets"][0]
+        first = self.run_page(page=p, target=target, digest_languages=("ko", "en"))
+        assert first["outcome"] == "ok"
+        assert first["source_changed"] is False
+        assert first["source_content_hash"] == service
+        assert first["body_sha256"] == raw_hash
+        assert {d["language"] for d in first["digest_drafts"]} == {"ko", "en"}
+
+        # The bounded copy is discoverable through the service hash alone.
+        cached = source_cache.load(self.root, URL, service, NOW)
+        assert cached is not None
+        assert cached.source_content_hash == service and cached.body_sha256 == raw_hash
+        assert cached.doc() == p.doc()
+
+        # Next UTC day: same service hash reuses the copy with zero page fetch.
+        next_clock = NOW + dt.timedelta(days=1)
+        next_target = planner.plan({"schema": planner.EXPORT_SCHEMA, "exported_at_utc": next_clock.isoformat(),
+                                    "rows": [candidate(content_hash=service, fetched_at=next_clock.isoformat())]})["targets"][0]
+        with patch.object(runner.PolicyFetcher, "fetch", side_effect=AssertionError("refetch")), \
+                patch("socket.socket", side_effect=AssertionError("network")):
+            second = runner.ShadowRunner(self.config_path, clock=lambda: next_clock).run(
+                shadow_root=self.root, url=URL, target=next_target,
+                transport=self.transport, key_loader=lambda: KEY)
+        assert second["outcome"] == "ok"
+        assert second["provenance"] == "shadow_cached"
+        assert second["source_changed"] is False
+        assert len(self.calls) == 2
+
+        # Static-skip history matches on source_content_hash (config hash unknown
+        # in plan-only mode still matches a completed static row).
+        history = [dict(final_url=URL, body_sha256=raw_hash, source_content_hash=service, outcome="ok",
+                        prompt_sha256=schema.PROMPT_HASH, schema_sha256=schema.SCHEMA_HASH,
+                        config_sha256=common.digest(common.dumps(self.config)), timestamp_utc=NOW.isoformat())]
+        for config_hash in (common.digest(common.dumps(self.config)), None):
+            pending = planner.plan(export(candidate(content_hash=service)), history=history, config_hash=config_hash)
+            assert not pending["targets"]
+            assert pending["reasons"]["skip_static_already_done"] == 1
+
+        outputs = list(self.root.glob("data/shadow/llm_extract_*.jsonl"))
+        report = score_shadow(outputs, self.root, next_clock, self.config,
+                              ledger_path=self.root / "budget.sqlite3")
+        assert report["counts"]["verified_unique_pages"] == 2
+        assert report["counts"]["changed_source_attempts"] == 0
+        assert report["field_coverage"]["submission_fee"]["targeted_pages"] == 2
+
+    def test_genuinely_changed_body_sets_source_changed(self):
+        old, new = HTML, HTML.replace(b"December 1, 2026", b"December 2, 2026")
+        target = planner.plan(export(candidate(content_hash=common.source_content_hash(old))))["targets"][0]
+        result = self.run_page(page=page(body=new), target=target)
+        assert result["outcome"] == "ok"
+        assert result["source_changed"] is True
+        assert result["source_content_hash"] == common.source_content_hash(new)
+
+
+class CacheIdentityTests(Harness):
+    def test_final_url_collision_creates_a_distinct_snapshot(self):
+        from pbdata.collect.shadow import policy, source_cache
+        final_b = "https://example.org/final-b"
+        p1 = policy.Page(URL, URL, HTML, (URL,), "offline_cached")
+        p2 = policy.Page(URL, final_b, HTML, (URL, final_b), "offline_cached")
+        assert p1.source_content_hash == p2.source_content_hash
+        st = state.State(self.root)
+        with st.locked():
+            pass
+        name1 = source_cache.save(st, p1, p1.doc(), NOW, KEY)
+        name2 = source_cache.save(st, p2, p2.doc(), NOW, KEY)
+        assert name1 != name2
+        assert source_cache.load(self.root, URL, p1.source_content_hash, NOW, final_url=URL).final_url == URL
+        assert source_cache.load(self.root, URL, p1.source_content_hash, NOW, final_url=final_b).final_url == final_b
+
+
+def test_gap_inputs_require_regular_files(tmp_path):
+    fifo = tmp_path / "gaps.json"
+    os.mkfifo(fifo)
+    with pytest.raises(common.Stop, match="unsafe_file"):
+        planner.read_json(fifo, NOW)
+    with pytest.raises(common.Stop, match="unsafe_file"):
+        planner.read_db(fifo, NOW)
+    with pytest.raises(common.Stop, match="unsafe_file"):
+        planner.read_json(tmp_path, NOW)
+
+
+def test_python_floor_declares_deserialize_support():
+    pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+    assert 'requires-python = ">=3.11"' in pyproject
+
+
+class PlanOnlyHistoryTests(Harness):
+    def test_plan_only_reflects_prior_static_completion_without_writes(self):
+        assert self.run_page()["outcome"] == "ok"
+        before = {p: p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
+        gaps = self.base / "gaps.json"
+        gaps.write_text(common.dumps(export(candidate())))
+        script = Path(__file__).resolve().parents[1] / "scripts/llm_extract_shadow_batch.py"
+        result = subprocess.run([sys.executable, "-B", str(script), "--gaps-json", str(gaps),
+                                 "--plan-only", "--allow-stale", "--shadow-root", str(self.root)],
+                                capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        output = json.loads(result.stdout)
+        assert output["selected"] == 0
+        assert output["reasons"]["skip_static_already_done"] == 1
+        after = {p: p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
+        assert before == after
+
+
+def test_date_components_cannot_support_fee_amounts():
+    quote = "Entry fee. Submissions close December 2026."
+    value = fee(text=quote, amount_min="2026", amount_max="2026", currency=None, unit=None)
+    fields, reasons = validate_one("submission_fee", value, quote)
+    assert fields["submission_fee"] is None
+    assert reasons["submission_fee"] == "unsupported_amount"
+    quote = "Entry fee USD 20. Submissions close December 2026."
+    assert validate_one("submission_fee", fee(text="Entry fee USD 20"), quote)[0]["submission_fee"]

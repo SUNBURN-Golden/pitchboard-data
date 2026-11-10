@@ -136,9 +136,19 @@ PY
 
 Confirm the line does not contain an authorization header or the API key.
 The same URL on the same UTC day returns `duplicate_page` and does not call the provider again.
-The next UTC day is a new call. Three pages a day stay under the 50-call cap.
+The next UTC day is a new call. This three-page, hardcoded-URL invocation is
+**superseded** by the gap-targeted batch; see
+[LLM_EXTRACT_IMPROVE_DESIGN.md](LLM_EXTRACT_IMPROVE_DESIGN.md#operator-handoff-after-implementation).
 
 ## Separate schedule
+
+> **Superseded for the 40-URL activation.** The cron example below is retained
+> only as a historical record of the original five/hardcoded-URL job. Do not use
+> it for the gap-targeted rollout. Replace only the isolated shadow job's
+> command with `scripts/llm_extract_shadow_batch.py ... --limit 40` as documented
+> in
+> [LLM_EXTRACT_IMPROVE_DESIGN.md](LLM_EXTRACT_IMPROVE_DESIGN.md#operator-handoff-after-implementation).
+> This document does not edit cron.
 
 Install this only after the one-time check looks right.
 Do not add it to `scripts/daily.sh` and do not change the existing collector crontab lines.

@@ -634,10 +634,13 @@ The SQLite snapshot adapters require Python 3.11+ with `Connection.deserialize`;
 WAL-format or sidecar-bearing inputs require a consistent operator export/snapshot.
 
 Snapshots contain exact parsed text, not HTML. The cache filename hashes requested
-URL + body hash + format/parser/policy version; the integrity-protected payload
-also contains final URL and extracted-text hash. This permits lookup from service
-body hashes without assuming service `text_hash` normalization. Lookup expires
-copies 30 days after original observation; it never extends expiry on reuse.
+URL + the **service `content_hash`** + format/parser/policy version, plus a suffix
+over final URL and extracted-text hash; the integrity-protected payload carries
+both the raw-byte `body_sha256` and the service `source_content_hash`. This permits
+lookup from service body hashes without assuming service `text_hash`
+normalization, and an identical body resolving to a different final URL becomes a
+distinct snapshot instead of a collision. Lookup expires copies 30 days after
+original observation; it never extends expiry on reuse.
 There is no automatic deletion job in this increment. If operational cleanup is
 needed, remove only expired files in this private `source_text` directory. Keep
 ledger/extraction/review/draft history. Oversize pages abstain rather than truncate.

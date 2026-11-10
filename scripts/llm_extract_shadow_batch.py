@@ -36,6 +36,11 @@ def main():
             state.preflight(conn, config, now)
             from pbdata.collect.shadow.common import loads
             history = [loads(r[0]) for r in conn.execute("SELECT result FROM attempts WHERE result IS NOT NULL")]
+    elif args.shadow_root is not None:
+        # Plan-only counts should reflect prior static completions (F3). This is
+        # a read-only ledger snapshot: no lock, root initialization or writes.
+        from pbdata.collect.shadow.state import read_history
+        history = read_history(args.shadow_root)
     selected = plan(data, limit=args.limit, history=history, config_hash=digest(dumps(config)) if config else None)
     result = {"selected": len(selected["targets"]), "reasons": selected["reasons"]}
     if not args.plan_only:

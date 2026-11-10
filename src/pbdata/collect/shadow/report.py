@@ -116,6 +116,8 @@ def ledger_report(path, rows, config, checks):
     raw = frozen_read(path, checks)
     if raw[:16] != b"SQLite format 3\x00" or raw[18:20] != b"\x01\x01":
         raise Stop("invalid_ledger")
+    if not hasattr(sqlite3.Connection, "deserialize"):
+        raise Stop("python_requires_311")
     c = sqlite3.connect(":memory:")
     c.row_factory = sqlite3.Row
     try:
@@ -273,13 +275,20 @@ def score_shadow(paths, root, now, config, *, gold_path=None, ledger_path=None, 
         if row.get("schema_sha256") != SCHEMA_HASH or row.get("prompt_sha256") != PROMPT_HASH:
             exclusions.append({"attempt_id": row["attempt_id"], "reason": "schema_prompt_mismatch"})
             continue
-        name = source_cache.cache_key(row["requested_url"], row["body_sha256"])
-        cache_path = Path(root) / "data/shadow/source_text" / (name + ".json")
-        has_cache = cache_path.exists() or cache_path.is_symlink()
-        if has_cache:
+        # New rows record the service contract hash; legacy rows fall back to the
+        # raw byte identity (their old cache format is no longer reused).
+        source_hash = row.get("source_content_hash") or row["body_sha256"]
+        if not isinstance(source_hash, str) or not re.fullmatch(r"[a-f0-9]{64}", source_hash):
+            exclusions.append({"attempt_id": row["attempt_id"], "reason": "invalid_source_identity"})
+            continue
+        cache_paths = source_cache.candidate_paths(root, row["requested_url"], source_hash)
+        has_cache = bool(cache_paths)
+        for cache_path in cache_paths:
             frozen_read(cache_path, checks, source_cache.MAX_ENVELOPE, private=True)
         try:
-            cached = source_cache.load(root, row["requested_url"], row["body_sha256"], now, max_page_utf8_bytes) if has_cache else None
+            cached = (source_cache.load(root, row["requested_url"], source_hash, now, max_page_utf8_bytes,
+                                        final_url=row["final_url"], text_sha256=row["text_sha256"])
+                      if has_cache else None)
         except Stop as exc:
             if str(exc) != "page_too_large":
                 raise
@@ -288,8 +297,10 @@ def score_shadow(paths, root, now, config, *, gold_path=None, ledger_path=None, 
         if cached is None:
             exclusions.append({"attempt_id": row["attempt_id"], "reason": "unverifiable_missing_or_expired_text"})
             continue
-        frozen_read(cache_path, checks, source_cache.MAX_ENVELOPE, private=True)
-        if row.get("source_cache_key") != name or digest(cached.doc().text()) != row["text_sha256"] or cached.final_url != row["final_url"]:
+        for cache_path in cache_paths:
+            frozen_read(cache_path, checks, source_cache.MAX_ENVELOPE, private=True)
+        if (cached.cache_key != row.get("source_cache_key") or digest(cached.doc().text()) != row["text_sha256"]
+                or cached.final_url != row["final_url"] or cached.body_sha256 != row["body_sha256"]):
             exclusions.append({"attempt_id": row["attempt_id"], "reason": "source_identity_mismatch"})
             continue
         try:

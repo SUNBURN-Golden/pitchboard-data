@@ -13,7 +13,7 @@ import urllib.request
 import urllib.robotparser
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
-from .common import Stop, digest
+from .common import Stop, digest, source_content_hash
 from ..net import CHALLENGE_RE, PASSWORD_RE, LOGIN_RE, NoRedirect
 from ..parse import parse_html
 
@@ -198,6 +198,11 @@ class Page:
     @property
     def body_sha256(self):
         return digest(self.body)
+
+    @property
+    def source_content_hash(self):
+        """The service ``pb_raw_ref.content_hash`` for this raw body."""
+        return source_content_hash(self.body)
 
 
 class PolicyFetcher:

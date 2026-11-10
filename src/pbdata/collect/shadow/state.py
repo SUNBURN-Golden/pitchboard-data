@@ -7,9 +7,10 @@ import fcntl
 import os
 from pathlib import Path
 import sqlite3
+import stat
 import uuid
 
-from .common import Stop, append_sync, dumps, loads, money, secure_open, shadow_root, sync_dir
+from .common import Stop, append_sync, dumps, loads, money, no_symlinks, secure_open, shadow_root, sync_dir
 
 
 def reservation(config):
@@ -17,6 +18,70 @@ def reservation(config):
     return ((Decimal(p["input_token_reservation_ceiling"]) * money(p["input_usd_per_million_ceiling"]) +
              Decimal(config["max_output_tokens"]) * money(p["output_usd_per_million_ceiling"])) /
             Decimal(1000000)).quantize(Decimal("0.0000001"), rounding=ROUND_CEILING)
+
+
+def read_history(root):
+    """Read completed attempts from an initialized private ledger, read-only.
+
+    Used by plan-only inspection (F3) so counts account for prior static skips
+    without initializing a fresh root, taking a lock, or writing anything.
+    """
+    path = no_symlinks(root)
+    if not path.exists():
+        return []
+    if not path.is_dir() or path.stat().st_uid != os.getuid() or path.stat().st_mode & 0o077:
+        raise Stop("unsafe_root")
+    marker, ledger = path / "experiment.json", path / "budget.sqlite3"
+    if not marker.exists() and not ledger.exists():
+        try:
+            populated = any(path.iterdir())
+        except OSError:
+            raise Stop("unsafe_root") from None
+        if populated:
+            raise Stop("unrecognized_shadow_root")
+        return []
+    if not marker.exists() or not ledger.exists():
+        raise Stop("unrecognized_shadow_root")
+    with secure_open(marker, "r", create=False) as f:
+        identity = loads(f.read())
+    if set(identity) != {"schema", "experiment_id"} or identity["schema"] != 1:
+        raise Stop("invalid_experiment")
+    info = ledger.stat()
+    if not stat.S_ISREG(info.st_mode):
+        raise Stop("unsafe_file")
+    if info.st_size > 256_000_000:
+        raise Stop("budget_state_too_large")
+    try:
+        fd = os.open(ledger, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        raise Stop("unsafe_path") from None
+    try:
+        f = os.fdopen(fd, "rb")
+        fd = -1
+        with f:
+            raw = f.read(256_000_001)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(raw) > 256_000_000:
+        raise Stop("budget_state_too_large")
+    if not hasattr(sqlite3.Connection, "deserialize"):
+        raise Stop("python_requires_311")
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    try:
+        conn.deserialize(raw)
+        conn.execute("PRAGMA query_only=ON")
+        if conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+            raise Stop("corrupt_budget_state")
+        if conn.execute("SELECT value FROM meta WHERE key='experiment_id'").fetchone()[0] != identity["experiment_id"]:
+            raise Stop("invalid_experiment")
+        return [loads(r[0]) for r in conn.execute(
+            "SELECT result FROM attempts WHERE result IS NOT NULL ORDER BY rowid")]
+    except sqlite3.Error:
+        raise Stop("corrupt_budget_state") from None
+    finally:
+        conn.close()
 
 
 def comparison_output(root, extra_protected=()):

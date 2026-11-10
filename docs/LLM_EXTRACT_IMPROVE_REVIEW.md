@@ -212,3 +212,26 @@ static-page skip that protects the daily budget. It should be fixed, with the
 contract-level regression tests from F1/F2, before raising the isolated cron
 from the hardcoded URLs to the gap-targeted batch. F3–F8 can be handled
 incrementally.
+
+## REVIEW FIX log (2026-11-10)
+
+All findings were addressed on `feat/deepseek-shadow-target-gaps`; no live
+DB/crawler/cron/private config was touched and `config/llm_extract.json` remains
+`enabled=false`.
+
+| Finding | Resolution |
+| --- | --- |
+| F1 | Added `common.source_content_hash` (latin-1 decode then UTF-8 SHA-256) and `Page.source_content_hash`. The attempt record now carries both `body_sha256` and `source_content_hash`; cache lookup/save, planner history and `source_changed` use the service contract. Cache format bumped to `pb-shadow-text-2`. |
+| F2 | Added Korean-body contract tests: service hash differs from raw hash, cache hit with zero fetch, `source_changed=False`, static skip on the next plan, targeted coverage scored, ko/en digest drafts emitted, and a genuinely changed body still flags `source_changed=True`. |
+| F3 | Plan-only reads an initialized ledger through the new read-only `state.read_history` snapshot, so counts reflect prior static completions. It creates no lock, identity, directory or write. |
+| F4 | The snapshot filename now adds final URL + parsed-text-hash identity; differing redirect targets are distinct snapshots. Lookup can filter by `final_url`/`text_sha256`, and a regression test saves two final URLs for one body. |
+| F5 | `planner.read_json`/`read_db` open with `O_NOFOLLOW|O_NONBLOCK` and require `stat.S_ISREG`; FIFOs, devices and directories fail with `unsafe_file` instead of blocking. |
+| F6 | `requires-python` raised to `>=3.11`, with defensive `python_requires_311` stops before `Connection.deserialize` in the planner, report and read-history paths. |
+| F7 | `LLM_EXTRACT_ACTIVATE.md` now marks the three-page/hardcoded-URL example as superseded and cross-references the 40-URL batch handoff. No cron is edited. |
+| F8 | Fee amount extraction excludes spans already parsed as dates and month+year spans such as `December 2026`, so a year cannot satisfy an amount. A separate amount in the same quote still validates. |
+
+Verification (`PYTHONPATH=src python3 -B -m pytest -q -p no:cacheprovider`):
+the four affected suites pass **91 tests / 189 subtests**; the full run passes
+**227 tests / 221 subtests** with the same three pre-existing OCR-dependent
+failures (`test_image_ocr`, `test_scanned_pdf_uses_ocr`, `E2E.test_full_flow`)
+caused by a missing `tesseract`.

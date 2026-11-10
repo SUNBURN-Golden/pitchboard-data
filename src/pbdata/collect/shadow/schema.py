@@ -156,7 +156,7 @@ def validator(version):
 
 def support_reason(field, value, quote, doc, as_of):
     """Conservative lexical support; enums use explicit deterministic cue maps."""
-    from ..dates import find_dates
+    from ..dates import MON_RE, find_dates
     from ...profiles import pitchboard as prof
     from ...model import EXPLICIT_NONE_PATTERNS
     if field != "open_call" and value["text"] not in quote:
@@ -219,7 +219,20 @@ def support_reason(field, value, quote, doc, as_of):
         elif value["state"] != "paid" or re.search(r"\b(?:not|never|no)\b.{0,20}\b(?:pay|paid|payment)\b", q, re.I) or not re.search(r"\b(pay|pays|paid|payment|honorarium|compensation|rate)\b|원고료|고료", q, re.I):
             return "unsupported_pay_state"
     amounts = set()
+    # Years and other date components share the numeric token space with amounts.
+    # A fully parsed date span, or a month immediately followed by a year
+    # ("December 2026"), cannot support a fee amount.
+    date_spans = [(h.start, h.end) for h in find_dates(q)]
+    month_year = re.compile(r"(?i)\b(?:" + MON_RE + r")\.?\s+(?:19|20)\d{2}\b")
+    date_spans.extend(m.span() for m in month_year.finditer(q))
+
+    def in_date(span):
+        start, end = span
+        return any(start < b and a < end for a, b in date_spans)
+
     for m in re.finditer(r"(?<![\w.,])(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)(?:\.[0-9]+)?(?![0-9,]|\.[0-9])(?:\s*(만)\s*원)?", q):
+        if in_date(m.span()):
+            continue
         token = m.group().split("만")[0].strip().replace(",", "")
         amounts.add(Decimal(token) * (10000 if m.group(1) else 1))
     for k in ("amount_min", "amount_max"):

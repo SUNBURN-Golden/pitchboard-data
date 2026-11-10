@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import stat
 
 from .common import Stop, digest, dumps, loads, no_symlinks, stamp
 from .policy import canonical_url
@@ -15,12 +16,35 @@ PRIORITY = {p: i for i, p in enumerate(("fee.submission", "deadline.closes_on", 
 STATIC = {"fee.submission", "compensation.rate", "eligibility.region", "eligibility.statement"}
 
 
-def read_json(path, now, *, allow_stale=False):
+def _read_regular(path, maximum, too_large):
+    """Read a regular file only; FIFOs/devices never block an operator run."""
     path = no_symlinks(path)
-    if path.stat().st_size > 8_000_000:
-        raise Stop("gap_input_too_large")
     try:
-        data = loads(path.read_bytes())
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        raise Stop("unsafe_path") from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise Stop("unsafe_file")
+        if info.st_size > maximum:
+            raise Stop(too_large)
+        f = os.fdopen(fd, "rb")
+        fd = -1
+        with f:
+            raw = f.read(maximum + 1)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    if len(raw) > maximum:
+        raise Stop(too_large)
+    return raw
+
+
+def read_json(path, now, *, allow_stale=False):
+    raw = _read_regular(path, 8_000_000, "gap_input_too_large")
+    try:
+        data = loads(raw)
         if not isinstance(data, dict) or set(data) != {"schema", "exported_at_utc", "rows"} or data["schema"] != EXPORT_SCHEMA:
             raise Stop("invalid_gap_export")
         age = now - stamp(data["exported_at_utc"])
@@ -41,18 +65,23 @@ def read_db(path, now):
     """
     path = no_symlinks(path)
     def snapshot():
-        s = path.stat()
+        try:
+            s = path.stat()
+        except OSError:
+            raise Stop("unsafe_path") from None
+        if not stat.S_ISREG(s.st_mode):
+            raise Stop("unsafe_file")
         if any(Path(str(path) + suffix).exists() for suffix in ("-wal", "-shm", "-journal")):
             raise Stop("db_requires_export")
         return s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns
     before = snapshot()
     if before[1] > 256_000_000:
         raise Stop("gap_input_too_large")
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    with os.fdopen(fd, "rb") as f:
-        raw = f.read(256_000_001)
+    raw = _read_regular(path, 256_000_000, "gap_input_too_large")
     if snapshot() != before or raw[:16] != b"SQLite format 3\x00" or raw[18:20] != b"\x01\x01":
         raise Stop("db_requires_export")
+    if not hasattr(sqlite3.Connection, "deserialize"):
+        raise Stop("python_requires_311")
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     try:
@@ -149,13 +178,21 @@ def plan(data, *, limit=40, history=(), config_hash=None):
             importance = r.get("importance", .5)
             if type(importance) not in (int, float) or not 0 <= importance <= 1:
                 raise Stop("invalid_gap_export")
+            # The export carries the service ``content_hash``. Attempt rows record
+            # that same contract as ``source_content_hash``; ``body_sha256`` is the
+            # raw-byte fallback for legacy rows and held-out fixtures.
+            def same_source(h):
+                return (h.get("source_content_hash") or h.get("body_sha256")) == r.get("content_hash")
             attempts = [h for h in history if h.get("final_url") == r["final_url"] and r.get("content_hash")
-                        and h.get("body_sha256") == r["content_hash"]]
+                        and same_source(h)]
             r["shadow_attempted"] = bool(attempts)
             r["shadow_last_attempt"] = max((h.get("timestamp_utc", "") for h in attempts), default="")
+            # Plan-only inspection may not load a private config (credentials stay
+            # untouched), so it matches any recorded config hash.
             done = any(h.get("outcome") == "ok" and h.get("final_url") == r["final_url"] and r.get("content_hash")
-                       and h.get("body_sha256") == r["content_hash"] and h.get("prompt_sha256") == PROMPT_HASH
-                       and h.get("schema_sha256") == SCHEMA_HASH and h.get("config_sha256") == config_hash for h in history)
+                       and same_source(h) and h.get("prompt_sha256") == PROMPT_HASH
+                       and h.get("schema_sha256") == SCHEMA_HASH
+                       and (config_hash is None or h.get("config_sha256") == config_hash) for h in history)
             if done and r["predicate"] in STATIC:
                 raise Stop("skip_static_already_done")
             if done:
