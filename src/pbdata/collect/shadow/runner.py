@@ -71,6 +71,8 @@ class ShadowRunner:
         """Disabled path has no side effects. A Page is accepted for cached eval only."""
         try:
             config = load_config(self.config_path, self.clock())
+            if not isinstance(digest_languages, (tuple, list)) or set(digest_languages) - {"ko", "en"}:
+                raise Stop("invalid_digest_languages")
             requested = canonical_url(url if page is None else page.requested_url)
             if page is not None and page.provenance != "offline_cached":
                 raise Stop("invalid_policy_envelope")
@@ -159,6 +161,8 @@ class ShadowRunner:
                     record["outcome"] = "provider_error"
                 from .review import reviews
                 record["reviews"] = reviews(record)
+                from .digest import drafts
+                record["digest_drafts"] = drafts(record, digest_languages)
                 record["latency_ms"] = round((time.monotonic() - start) * 1000)
                 if key in dumps(record):
                     raise Stop("credential_in_record")

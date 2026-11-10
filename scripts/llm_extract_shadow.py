@@ -14,8 +14,10 @@ def main():
     parser.add_argument("--config", type=Path, default=CONFIG)
     parser.add_argument("--shadow-root", type=Path, required=True)
     parser.add_argument("--url", required=True)
+    parser.add_argument("--digest-languages", default="", choices=("", "ko", "en", "ko,en"))
     args = parser.parse_args()
-    result = ShadowRunner(args.config).run(shadow_root=args.shadow_root, url=args.url)
+    result = ShadowRunner(args.config).run(shadow_root=args.shadow_root, url=args.url,
+                                                  digest_languages=tuple(filter(None, args.digest_languages.split(","))))
     # Only fixed outcome metadata; the complete result stays in the shadow output.
     print(dumps({k: result[k] for k in ("outcome", "reason", "attempt_id") if k in result}))
 

@@ -560,3 +560,10 @@ gold is still required. Same-attempt comparisons record candidate fills, partial
 or incomparable scope, conflicts and two-way call second opinions. Durable result
 rows contain derived reviews; recovery publishes them idempotently without a
 provider call. Validation: 71 tests and 189 subtests passed, including fee tests.
+
+Stage 4 adds optional `--digest-languages ko,en` to single/batch commands. Defaults
+remain off. Deterministic accepted-field templates create short Korean/English
+private drafts with supporting field IDs and zero extra provider calls. Conflicts,
+second opinions, partial/incomparable reviews, changed revisions and missing open
+classification suppress drafts. The same durable-result recovery publishes each
+draft once. Validation: 72 tests and 189 subtests passed across affected suites.

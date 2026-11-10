@@ -240,3 +240,31 @@ class ReviewTests(Harness):
         assert before == [p.read_bytes() for p in paths]
         assert len(self.calls) == 2
         assert KEY.encode() not in self.artifacts()
+
+
+class DigestTests(Harness):
+    def test_default_off_ko_en_zero_calls_and_recovery(self):
+        row = self.run_page()
+        assert row["digest_drafts"] == []
+        assert not list(self.root.glob("data/shadow/digest_drafts_*.jsonl"))
+        self.root = self.base / "drafts"
+        # Interrupt publication after result durability.
+        with patch.object(state.State, "publish_derived", side_effect=OSError("failure")):
+            assert self.run_page(digest_languages=("ko", "en"))["outcome"] == "skipped"
+        with state.State(self.root).locked():
+            pass
+        p = next(self.root.glob("data/shadow/digest_drafts_*.jsonl"))
+        rows = [json.loads(line) for line in p.read_text().splitlines()]
+        assert {r["language"] for r in rows} == {"ko", "en"}
+        assert all(len(r["line"]) <= 280 and "\n" not in r["line"] and r["draft"] for r in rows)
+        before = p.read_bytes()
+        with state.State(self.root).locked():
+            pass
+        assert p.read_bytes() == before
+        assert len(self.calls) == 2
+        from pbdata.collect.shadow.digest import drafts
+        row["reviews"] = [dict(second_opinion_required=True, reasons=["call_disagreement"])]
+        assert not drafts(row, ("ko",))
+        row["reviews"] = []; row["fields"] = dict.fromkeys(schema.FIELDS)
+        assert not drafts(row, ("en",))
+        assert KEY.encode() not in self.artifacts()

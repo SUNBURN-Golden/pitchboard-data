@@ -137,6 +137,7 @@ class State:
         rows = [loads(r[0]) for r in conn.execute(
             "SELECT result FROM attempts WHERE day=? AND result IS NOT NULL ORDER BY rowid", (day,))]
         self.append_unique(day, "review_conflicts", "review_id", [v for r in rows for v in r.get("reviews", [])])
+        self.append_unique(day, "digest_drafts", "draft_id", [v for r in rows for v in r.get("digest_drafts", [])])
 
     def append_unique(self, day, stream, id_key, rows):
         if not rows:
