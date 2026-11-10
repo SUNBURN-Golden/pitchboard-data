@@ -40,7 +40,7 @@ def canonical_url(url, blocked=None):
             raise Stop("bad_url")
         if blocked is None:
             blocked = {s.strip().lower() for s in BLOCKLIST.read_text().splitlines() if s.strip() and not s.startswith("#")}
-        if any(host == b or host.endswith("." + b) for b in {"instagram.com", *blocked}):
+        if any(host == b or host.endswith("." + b) for b in {"instagram.com", "soulbound.co.kr", "soulbound.kr", *blocked}):
             raise Stop("blocked_host")
         if _blocked_network_host(host):
             raise Stop("blocked_network")

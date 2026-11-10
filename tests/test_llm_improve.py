@@ -22,6 +22,8 @@ def candidate(**changes):
                http_status=200, content_hash=common.digest(page().body), text_hash=None,
                fetched_at="2026-11-05T00:00:00Z", relevance=0, relationship_basis="outlet_source")
     row.update(changes)
+    if "url" in changes and "final_url" not in changes:
+        row["final_url"] = changes["url"]
     return row
 
 
@@ -56,7 +58,7 @@ def test_stale_and_static_history(tmp_path):
         planner.read_json(p, NOW + dt.timedelta(days=2))
     assert planner.read_json(p, NOW + dt.timedelta(days=2), allow_stale=True)
     h = dict(outcome="ok", final_url=URL, body_sha256=candidate()["content_hash"],
-             prompt_sha256=schema.PROMPT_HASH, schema_sha256=schema.SCHEMA_HASH, config_sha256="config")
+             prompt_sha256=schema.PROMPT_HASH, schema_sha256=schema.SCHEMA_HASH, config_sha256="config", baseline={"deadline": ["2026-11-06"]})
     assert not planner.plan(export(candidate()), history=[h], config_hash="config")["targets"]
     assert planner.plan(export(candidate(predicate="status.declared")), history=[h], config_hash="config")["targets"]
 
@@ -83,6 +85,21 @@ def test_db_snapshot_parity_and_no_writes(tmp_path):
     before = (p.read_bytes(), p.stat().st_mtime_ns, set(tmp_path.iterdir()))
     assert planner.plan(planner.read_db(p, NOW)) == planner.plan(export(r))
     assert before == (p.read_bytes(), p.stat().st_mtime_ns, set(tmp_path.iterdir()))
+    c = sqlite3.connect(p)
+    c.execute("INSERT INTO pb_call_edition VALUES('call_1','out_1')")
+    c.execute("INSERT INTO pb_call_edition VALUES('call_organizer_only',NULL)")
+    c.execute("INSERT INTO pb_gap SELECT 'gap_call','call','call_1',predicate,scope_ref,state,gap_class,importance FROM pb_gap LIMIT 1")
+    c.execute("INSERT INTO pb_gap SELECT 'gap_organizer','call','call_organizer_only',predicate,scope_ref,state,gap_class,importance FROM pb_gap LIMIT 1")
+    c.commit(); c.close()
+    joined = planner.plan(planner.read_db(p, NOW))
+    assert {t["gap_id"] for t in joined["targets"][0]["targets"]} == {"gap_1", "gap_call"}
+    assert joined["reasons"]["no_outlet_relation"] == 1
+    c = sqlite3.connect(p)
+    # New denial inserted before an older success: rowid ordering would be wrong.
+    c.execute("INSERT INTO pb_raw_ref SELECT 'raw_denied',source_id,url,final_url,kind,'denied_robots',403,content_hash,text_hash,'2026-11-06T00:00:00Z' FROM pb_raw_ref LIMIT 1")
+    c.execute("INSERT INTO pb_raw_ref SELECT 'raw_old',source_id,url,final_url,kind,'ok',200,content_hash,text_hash,'2026-11-04T00:00:00Z' FROM pb_raw_ref LIMIT 1")
+    c.commit(); c.close()
+    assert not planner.plan(planner.read_db(p, NOW))["targets"]
     Path(str(p) + "-wal").touch()
     with pytest.raises(common.Stop, match="db_requires_export"):
         planner.read_db(p, NOW)
@@ -268,3 +285,200 @@ class DigestTests(Harness):
         row["reviews"] = []; row["fields"] = dict.fromkeys(schema.FIELDS)
         assert not drafts(row, ("en",))
         assert KEY.encode() not in self.artifacts()
+
+
+class ReportTests(Harness):
+    def inputs(self):
+        from pbdata.collect.shadow.report import score_shadow
+        row = self.run_page(target=planner.plan(export(candidate()))["targets"][0])
+        assert row["outcome"] == "ok"
+        return row, next(self.root.glob("data/shadow/llm_extract_*.jsonl")), score_shadow
+
+    def test_offline_missing_gold_fee_denominators_cost_and_unfinished(self):
+        row, path, score_shadow = self.inputs()
+        self.run_page(url="https://example.org/failed", transport=lambda *_: (_ for _ in ()).throw(common.Stop("provider_error")))
+        with state.State(self.root).locked() as c:
+            state.State(self.root).reserve(c, self.config, "unfinished", NOW)
+        with patch("socket.socket", side_effect=AssertionError("network")), patch.object(runner, "provider", side_effect=AssertionError("provider")), patch.object(common, "load_key", side_effect=AssertionError("key")):
+            report = score_shadow([path], self.root, NOW, self.config, ledger_path=self.root / "budget.sqlite3")
+        assert report["counts"]["attempted"] == 2
+        assert report["counts"]["verified_unique_pages"] == 1
+        assert report["field_coverage"]["submission_fee"]["targeted_pages"] == 1
+        assert report["field_coverage"]["submission_fee"]["accepted"] == 0
+        assert report["accuracy"]["real_call"]["llm"]["accuracy_end_to_end"] is None
+        assert report["accuracy"]["real_call"]["llm"]["reason"] == "missing_gold"
+        assert report["ledger"]["ceiling_usd"] == "0.9073728"
+        day = report["ledger"]["days"]["2026-11-05"]
+        assert (day["attempts"], day["failed"], day["unfinished"], day["unknown_usage"]) == (3, 1, 1, 2)
+        assert day["cap_basis"] == "recorded_config"
+        assert "not invoices" in report["ledger"]["meaning"]
+        assert report["runtime_commits"]
+
+    def test_gold_accuracy_fields_invalid_evidence_missing_text_duplicates(self):
+        row, path, score_shadow = self.inputs()
+        names = ("requested_url", "final_url", "body_sha256", "text_sha256", "as_of", "schema_sha256", "prompt_sha256")
+        label = {k: row[k] for k in names}
+        label.update(scope_ref="page", reviewer="fixture reviewer", reviewed_at_utc=NOW.isoformat(),
+                     real_call=True, current_open=False, fields={"pay": row["fields"]["pay"]["value"], "submission_fee": None},
+                     evidence={"real_call": row["fields"]["open_call"]["quote"], "current_open": row["fields"]["open_call"]["quote"], "pay": row["fields"]["pay"]["quote"]})
+        gold = self.base / "gold.json"
+        gold.write_text(common.dumps(dict(schema="pb-shadow-gold-1", rows=[label])))
+        report = score_shadow([path], self.root, NOW, self.config, gold_path=gold)
+        assert report["accuracy"]["real_call"]["llm"]["tp"] == 1
+        assert report["accuracy"]["current_open"]["llm"]["fp"] == 1
+        assert report["field_accuracy"]["pay"]["llm"]["tp"] == 1
+        assert report["field_accuracy"]["pay"]["rules"]["tp"] == 1
+        assert report["ledger"]["reason"] == "missing_ledger"
+        duplicate = self.base / "duplicate.jsonl"
+        changed = copy.deepcopy(row); changed["fields"]["pay"]["quote"] = "invented"
+        duplicate.write_text(common.dumps(row) + "\n" + common.dumps(changed) + "\n")
+        with pytest.raises(common.Stop, match="conflicting_predictions"):
+            score_shadow([duplicate], self.root, NOW, self.config)
+        duplicate.write_text(common.dumps(changed) + "\n")
+        report = score_shadow([duplicate], self.root, NOW, self.config)
+        assert report["exclusions"][0]["reason"] == "invalid_evidence"
+        cache = self.root / "data/shadow/source_text" / (row["source_cache_key"] + ".json")
+        cache.unlink()
+        report = score_shadow([path], self.root, NOW, self.config)
+        assert report["counts"]["verified_unique_pages"] == 0
+        assert report["exclusions"][0]["reason"] == "unverifiable_missing_or_expired_text"
+        assert report["field_coverage"]["submission_fee"]["coverage"] is None
+        duplicate.write_text("{}")
+        with pytest.raises(common.Stop, match="partial_shadow_output"):
+            score_shadow([duplicate], self.root, NOW, self.config)
+
+    def test_offline_cli_subprocess_tripwires(self):
+        row, path, _ = self.inputs()
+        script = Path(__file__).resolve().parents[1] / "scripts/compare_llm_extract.py"
+        program = '''
+import runpy, sys
+from unittest.mock import patch
+import pbdata.collect.shadow.common as common
+import pbdata.collect.shadow.runner as runner
+with patch('socket.socket', side_effect=AssertionError('network')), patch.object(common, 'load_key', side_effect=AssertionError('secret')), patch.object(runner, 'provider', side_effect=AssertionError('provider')), patch('pbdata.db.connect', side_effect=AssertionError('live DB')):
+    sys.argv = sys.argv[1:]
+    runpy.run_path(sys.argv[0], run_name='__main__')
+'''
+        result = subprocess.run([sys.executable, "-B", "-c", program, str(script), "--input-mode", "shadow", "--shadow-root", str(self.root),
+                                 "--predictions", str(path), "--config", str(self.config_path), "--as-of", "2026-11-05"], capture_output=True, text=True)
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout)["verified_unique_pages"] == 1
+        report_path = self.root / "comparison_20261105.json"
+        assert report_path.exists() and report_path.with_suffix(".md").exists()
+        assert KEY not in report_path.read_text()
+
+
+def test_planner_best_page_attempt_order_and_metadata_only():
+    rows = [candidate(url="https://example.org/other", relevance=2), candidate(),
+            candidate(gap_id="gap_2", owner_outlet_id="out_2", url="https://example.net/new")]
+    p = planner.plan(export(*rows))
+    assert {r["url"] for r in p["targets"]} == {URL, "https://example.net/new"}
+    history = [dict(final_url=URL, body_sha256=candidate()["content_hash"], outcome="provider_error", timestamp_utc=NOW.isoformat())]
+    p = planner.plan(export(candidate(), candidate(gap_id="gap_2", url="https://example.org/new")), history=history)
+    assert p["targets"][0]["url"] == "https://example.org/new"
+    with pytest.raises(common.Stop, match="invalid_gap_export"):
+        planner.plan(export(candidate(body="must never enter metadata")))
+
+
+def test_legacy_heldout_rows_remain_readable():
+    from pbdata.collect.shadow import compare
+    raw = proposal(); raw.pop("submission_fee")
+    fields, _ = schema.validator("pb-shadow-1")(raw, page().doc(), "2026-11-05")
+    item = compare.Item("fixture", URL, "2026-11-05", page(), page().body_sha256,
+                        common.digest(page().doc().text()), "en", runner.baseline(page().doc(), "2026-11-05"))
+    result = compare.score([item], {item.key: dict(schema="pb-shadow-1", fields=fields, text_sha256=item.text_hash)})
+    assert result["summaries"]["fixture"]["field_coverage"]["submission_fee"] == 0
+
+
+class BatchIntegrationTests(Harness):
+    def test_batch_stops_before_fetch_at_cap_and_records_private_plan(self):
+        self.config["daily_call_cap"] = 2
+        self.write_config()
+        plan = planner.plan(export(*(candidate(gap_id=f"gap_{i}", url=f"https://example.org/{i}") for i in range(4))))
+        fetched = []
+        def fetch(url):
+            fetched.append(url)
+            return page(url)
+        with patch.object(runner.PolicyFetcher, "fetch", side_effect=fetch):
+            rows = batch.execute(runner.ShadowRunner(self.config_path, clock=lambda: NOW), self.root, plan,
+                                 key_loader=lambda: KEY, transport=self.transport)
+        assert [r["outcome"] for r in rows] == ["ok", "ok", "skipped"]
+        assert rows[-1]["reason"] == "budget_exhausted"
+        assert len(fetched) == len(self.calls) == 2
+        path = next(self.root.glob("data/shadow/plans_*.jsonl"))
+        assert path.stat().st_mode & 0o077 == 0
+        assert KEY not in path.read_text()
+        from pbdata.collect.shadow.report import score_shadow
+        output = next(self.root.glob("data/shadow/llm_extract_*.jsonl"))
+        report = score_shadow([output], self.root, NOW, self.config, ledger_path=self.root / "budget.sqlite3")
+        assert report["planning"]["selected_urls"] == 4
+        assert report["planning"]["selected_without_attempt"] == 2
+
+    def test_key_in_plan_stops_before_persisting(self):
+        plan = planner.plan(export(candidate(owner_name=KEY)))
+        with pytest.raises(common.Stop, match="credential_in_record"):
+            batch.execute(runner.ShadowRunner(self.config_path, clock=lambda: NOW), self.root, plan, key_loader=lambda: KEY)
+        assert not self.root.exists()
+
+
+def test_shadow_excludes_soulbound_before_dns_and_legacy_score_versions():
+    from pbdata.collect.shadow.policy import canonical_url
+    with patch("socket.socket", side_effect=AssertionError("network")):
+        for url in ("https://soulbound.co.kr/", "https://pitchboard.soulbound.co.kr/", "https://soulbound.kr/"):
+            with pytest.raises(common.Stop, match="blocked_host"):
+                canonical_url(url)
+    assert planner.plan(export(candidate(owner_name="소울바운드")))["reasons"] == {"excluded_owner": 1}
+
+
+class FinalSafetyTests(Harness):
+    def test_shared_concurrent_batch_single_cap_and_halts(self):
+        from concurrent.futures import ThreadPoolExecutor
+        self.config["daily_call_cap"] = 3
+        self.write_config()
+        with state.State(self.root).locked():
+            pass
+        plan = planner.plan(export(*(candidate(gap_id=f"gap_{i}", url=f"https://example.org/{i}") for i in range(4))))
+        with patch.object(runner.PolicyFetcher, "fetch", side_effect=lambda url: page(url)), ThreadPoolExecutor(max_workers=2) as pool:
+            one = pool.submit(self.run_page, url="https://example.org/single")
+            many = pool.submit(batch.execute, runner.ShadowRunner(self.config_path, clock=lambda: NOW), self.root, plan,
+                               key_loader=lambda: KEY, transport=self.transport)
+            single, rows = one.result(), many.result()
+        assert len(self.calls) == 3
+        with state.State(self.root).locked() as c:
+            assert c.execute("SELECT count(*) FROM attempts").fetchone()[0] == 3
+        assert any(r.get("reason") == "budget_exhausted" for r in [single] + rows)
+        self.root = self.base / "halted"
+        def mismatch(*args):
+            self.calls.append(None)
+            value = completion(); value["model"] = "unexpected"
+            return value
+        with patch.object(runner.PolicyFetcher, "fetch", side_effect=lambda url: page(url)):
+            rows = batch.execute(runner.ShadowRunner(self.config_path, clock=lambda: NOW), self.root, plan,
+                                 key_loader=lambda: KEY, transport=mismatch)
+        assert len(rows) == 1 and rows[0]["outcome"] == "model_mismatch"
+
+    def test_corrupt_matching_cache_never_refetched_and_denials_not_reused(self):
+        first = self.run_page()
+        target = planner.plan(export(candidate()))["targets"][0]
+        path = self.root / "data/shadow/source_text" / (first["source_cache_key"] + ".json")
+        path.write_text("bad cache")
+        with patch.object(runner.PolicyFetcher, "fetch", side_effect=AssertionError("refetch")):
+            r = runner.ShadowRunner(self.config_path, clock=lambda: NOW).run(shadow_root=self.root, url=URL, target=target,
+                    transport=self.transport, key_loader=lambda: KEY)
+        assert r["reason"] == "invalid_source_cache" and len(self.calls) == 1
+        target["targets"][0]["outcome"] = "denied_robots"
+        with patch.object(runner.PolicyFetcher, "fetch", side_effect=AssertionError("refetch")):
+            r = runner.ShadowRunner(self.config_path, clock=lambda: NOW).run(shadow_root=self.root, url=URL, target=target,
+                    transport=self.transport, key_loader=lambda: KEY)
+        assert r["reason"] == "ineligible_source" and len(self.calls) == 1
+
+
+def test_ambiguous_currency_does_not_infer_usd():
+    q = "Entry fee $20"
+    assert validate_one("submission_fee", fee(text=q), q)[1]["submission_fee"] == "unsupported_currency"
+
+
+def test_omitting_deadline_cannot_keep_past_open_call():
+    quote = "Submissions are open until December 1, 2025."
+    fields, reasons = validate_one("open_call", dict(is_real_call=True, status="open"), quote)
+    assert fields["open_call"] is None and reasons["open_call"] == "past_deadline_conflict"

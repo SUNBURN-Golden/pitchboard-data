@@ -1,7 +1,7 @@
 # DeepSeek shadow improvement design
 
-Stage: **BUILD**, 2026-11-10. Implementation follows the reviewed design below. Implement the five stages
-in the order listed, with affected pytest checks and a commit for each stage on
+Stage: **BUILD**, 2026-11-10. The five stages are implemented in order, with
+affected pytest checks and a commit for each stage on
 `feat/deepseek-shadow-target-gaps`. Never push to `main` or force-push.
 
 ## Boundaries and starting evidence
@@ -436,7 +436,7 @@ this report does not trigger activation or promotion.
 
 ## Operator handoff after implementation
 
-These are future operator steps, not commands executed by DESIGN. Existing
+These are operator steps after BUILD; they were not executed by this change. Existing
 activation/background details remain in [LLM_EXTRACT_ACTIVATE.md](LLM_EXTRACT_ACTIVATE.md).
 
 1. Verify the implemented branch and offline tests. Keep the existing isolated
@@ -450,7 +450,7 @@ activation/background details remain in [LLM_EXTRACT_ACTIVATE.md](LLM_EXTRACT_AC
    initialize a fresh execution root, and inspecting counts must not require the
    provider key. Confirm replay, fees, review output, caps and fixed-reason
    logging before raising the limit.
-3. Replace only the isolated shadow job's five hardcoded URLs with the proposed
+3. Replace only the isolated shadow job's five hardcoded URLs with the
    invocation below, keeping its schedule, non-overlap lock and private log
    permissions. The 40 default is a selection limit, not an authorization to
    spend; the batch still stops on the shared caps. This document neither edits
@@ -464,7 +464,7 @@ activation/background details remain in [LLM_EXTRACT_ACTIVATE.md](LLM_EXTRACT_AC
      --gaps-json /absolute/private/gaps.json --limit 40
    ```
 
-   Paths are placeholders; the command is available only after implementation.
+   Paths are placeholders; the batch command is now implemented.
    Export refresh failure must stop the job rather than reuse stale input or fall
    back to the old hardcoded URLs. All invocations share the same ledger.
 4. Keep `daily_call_cap=50`. At repository-snapshot prices, 40 reservations cost
@@ -515,17 +515,10 @@ inspect the diff and `git diff --check`, verify branch and disabled checked-in
 config, and ensure no runtime data or secrets are staged. Each implementation
 commit must report its actual test results and remaining limitations.
 
-DESIGN-stage validation is the existing extraction/comparison suite and a
-documentation-only diff. It does not claim that the proposed behaviors have been
-implemented or tested. No provider calls, live DB reads, cron/private-config edits,
-or runtime activation are required to review or commit this design.
-
-Validation on 2026-11-10 (DESIGN review): the command above passed **55 tests
-and 165 subtests**. The review re-read the shadow runner/schema/state/policy,
-comparison adapter and service migrations, and folded the verified corrections
-above into stages 1–5 and the operator handoff. The checked-in config remains
-disabled; no provider calls, live DB reads, cron/private-config edits, or runtime
-activation were performed. Only this design document is changed.
+Historical DESIGN validation on 2026-11-10 passed 55 tests and 165 subtests.
+BUILD validation and the implemented interfaces are recorded below. No provider
+calls, live DB reads, cron/private-config edits or runtime activation were
+performed during either stage.
 
 
 ## BUILD implementation log
@@ -537,8 +530,11 @@ single-file snapshot deserialized into a query-only in-memory SQLite connection,
 instead of opening the service file with SQLite. This stronger sidecar-write
 boundary rejects WAL-format databases and any journal/sidecar; use a consistent
 JSON export for those databases. No live database was opened during BUILD.
-Time-sensitive fields allow an explicit daily recheck (same-day ledger dedup still
-applies); static fields skip matching completed schema/prompt/config/body hashes.
+Unchanged time-sensitive fields allow a daily recheck within three days of a
+recorded deadline boundary (same-day ledger dedup still applies); otherwise they
+skip with `skip_time_sensitive_no_boundary`. Static fields skip matching completed
+schema/prompt/config/body hashes. Unattempted or changed hashes precede failed
+attempts; the best related page per gap is selected before URL deduplication.
 Plan-only prints counts/reasons without creating a root. Detailed execution plans
 are private JSONL under the initialized shadow root.
 
@@ -567,3 +563,141 @@ private drafts with supporting field IDs and zero extra provider calls. Conflict
 second opinions, partial/incomparable reviews, changed revisions and missing open
 classification suppress drafts. The same durable-result recovery publishes each
 draft once. Validation: 72 tests and 189 subtests passed across affected suites.
+
+
+Stage 5 adds `--input-mode shadow` to `compare_llm_extract.py`, retaining default
+`score` and the held-out mode. It freezes input checksums, cohort identities,
+baseline versions and runtime/scoring commits; revalidates exact accepted fields
+against matching bounded snapshots; separates repeats, legacy/version mismatches,
+invalid evidence and missing/expired sources; and reads ledger byte snapshots
+without creating budget state. Coverage has separate fee and targeted-page
+denominators and language/sampling-tier strata. Changed-source attempts do not
+count as filling their original gap revision. Optional independently reviewed gold
+scores both methods with the same labels; without gold, accuracy stays null with
+`missing_gold`. Exact Decimal ceilings include failures and unfinished attempts.
+The Markdown companion shows gold accuracy/F1, coverage and ceiling totals.
+
+Additional integration checks cover concurrent single/batch budget sharing,
+pre-fetch cap stops, provider halts, credential-bearing plans rejected before
+persistence, cache-corruption/denial rejection and SOULBOUND redirect exclusions.
+No live collection or provider accuracy measurement was performed by BUILD.
+
+## Implemented operator commands and file contracts
+
+The batch interface is available now. Plan-only does not read credentials, enable
+config, create state or make requests. It prints counts and fixed exclusion
+reasons; it does not write a detailed private execution plan. Execution writes
+`data/shadow/plans_YYYYMMDD.jsonl` after initializing the existing experiment and
+checking credentials. All commands below are examples for the operator, not jobs
+installed by this branch.
+
+```sh
+python3 -B scripts/llm_extract_shadow_batch.py \
+  --gaps-json /absolute/private/gaps.json --plan-only --limit 40
+
+python3 -B scripts/llm_extract_shadow_batch.py \
+  --config /absolute/private/llm_extract.json \
+  --shadow-root /absolute/existing/shadow-root \
+  --gaps-json /absolute/private/gaps.json --limit 40 --digest-languages ko,en
+```
+
+Use the existing isolated schedule, lock, root and ledger when replacing the five
+hardcoded URLs. Refresh the export before each execution; failure or a stale
+export stops the job. `--allow-stale` is limited to plan-only inspection. Do not
+change collector/daemon, HANSET or Instagram jobs, production content, or the
+checked-in disabled config. Do not edit `~/.config` from the repo.
+
+An export is UTF-8 JSON, at most 8 MB and 20,000 candidate rows:
+
+```json
+{
+  "schema": "pb-shadow-gaps-1",
+  "exported_at_utc": "2026-11-14T00:00:00Z",
+  "rows": []
+}
+```
+
+Each row carries `gap_id`, `subject_type` (`call|outlet`), `subject_id`,
+`predicate`, `scope_ref`, `state`, `gap_class`, `importance` (0–1),
+`owner_outlet_id`, `outlet_name`, `source_id`, `permission`, `raw_id`, `url`,
+`final_url` (nullable), `kind`, `outcome`, `http_status` (nullable),
+`content_hash`/`text_hash` (nullable lowercase SHA-256), `fetched_at` (UTC),
+`relationship_basis="outlet_source"`, and `relevance` (`0` same-raw predicate cue,
+`1` relevant rules/recruitment, `2` outlet fallback). `owner_name` and `target_id`
+are optional metadata. Names are needed to exclude SOULBOUND ownership even when
+its source hostname differs. Include the newest observations, including denied
+ones; an export must never hide a newer denial behind an older success. Unknown
+keys (including body/text payloads) are rejected. All URL associations must come
+from outlet→source→raw relations, never hostname guesses. A call without an outlet
+relation is excluded. The adapter computes these relations for `--service-db`.
+The SQLite snapshot adapters require Python 3.11+ with `Connection.deserialize`;
+WAL-format or sidecar-bearing inputs require a consistent operator export/snapshot.
+
+Snapshots contain exact parsed text, not HTML. The cache filename hashes requested
+URL + body hash + format/parser/policy version; the integrity-protected payload
+also contains final URL and extracted-text hash. This permits lookup from service
+body hashes without assuming service `text_hash` normalization. Lookup expires
+copies 30 days after original observation; it never extends expiry on reuse.
+There is no automatic deletion job in this increment. If operational cleanup is
+needed, remove only expired files in this private `source_text` directory. Keep
+ledger/extraction/review/draft history. Oversize pages abstain rather than truncate.
+
+For the review around **2026-11-14**, freeze/copy daily JSONL, source snapshots,
+plan files and ledger together while the isolated job is idle. The report checks
+for input changes and refuses active ledger sidecars. Run offline:
+
+```sh
+python3 -B scripts/compare_llm_extract.py --input-mode shadow \
+  --shadow-root /absolute/existing/shadow-root \
+  --predictions /absolute/private/llm_extract_20261114.jsonl \
+  --ledger /absolute/private/budget.sqlite3 --as-of 2026-11-14
+```
+
+`--predictions` accepts multiple files. Snapshot paths may differ from the root's
+original daily JSONL paths; matching source copies remain under the supplied
+shadow root. Output is only `comparison_20261114.json` and `.md` under that root.
+`--as-of` freezes report time to the end of that UTC day; extraction dates remain
+those stored per row. Score mode reads disabled configs through `page_limit()`;
+it does not require an active private window. Historical rows without config
+snapshots use an explicitly labeled operator-config cap reference, not a claim
+about past authorization. A missing ledger leaves cost completeness unknown.
+
+Optional `--gold-json /absolute/private/gold.json` expects
+`{"schema":"pb-shadow-gold-1","rows":[...]}`. Every human row copies the exact
+`requested_url`, `final_url`, `body_sha256`, `text_sha256`, `as_of`,
+`schema_sha256` and `prompt_sha256` from the reviewed extraction and includes
+`scope_ref="page"`, a nonempty reviewer identifier, `reviewed_at_utc`, nullable
+boolean `real_call`/`current_open`, and optional `fields`. Field keys are
+`deadline|pay|submission_fee|eligibility`; each is null for adjudicated absence or
+a complete version-2 value object. `evidence` maps each non-null label/field to an
+exact ≤280-character source segment quote. Field evidence is revalidated using
+the version-2 support checks. Missing keys mean unlabeled, not false. Include
+rule negatives, agreements and abstentions in human sampling; selecting only
+conflicts cannot establish accuracy. Never treat the rules baseline as gold.
+
+The private window **may** renew through the exclusive endpoint
+`2026-11-21T00:00:00Z` after a real pricing re-check. Keep each window at most seven
+days, avoid overlap, use the actual verified date and ensure pricing validity
+through the end. An example renewal starting `2026-11-14T00:00:00Z` fits the
+seven-day limit, provided it starts after the prior window and pricing is actually
+rechecked then. This branch neither renews a window nor edits private config.
+The checked-in USD 5 cap still permits only 16 conservative reservations at the
+repository pricing snapshot; 40 selections never bypass the monetary cap.
+
+
+Final BUILD validation (2026-11-10):
+
+```sh
+PYTHONPATH=src python3 -B -m pytest -q -p no:cacheprovider \
+  tests/test_llm_extract.py tests/test_llm_compare.py \
+  tests/test_llm_improve.py tests/test_fee_submission.py
+```
+
+**84 tests and 189 subtests passed.** The full `tests` run passed **220 tests and
+221 subtests**, with three pre-existing OCR-dependent failures:
+`ParserTests.test_image_ocr`, `ParserTests.test_scanned_pdf_uses_ocr`, and
+`E2E.test_full_flow` in `test_collector.py`. All three were reproduced against a
+clean archive of pre-BUILD commit `af07c9c`; `tesseract` is unavailable in this
+environment. No collector/parser behavior was changed to bypass these tests.
+The checked-in config remains disabled. This branch has not been pushed, no
+runtime cron or private window was changed, and no live DB or provider was used.

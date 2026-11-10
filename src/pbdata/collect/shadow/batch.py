@@ -1,5 +1,5 @@
 """Fail-closed shared batch outcome classification and bounded dispatch."""
-from .common import Stop, digest, dumps, load_config
+from .common import Stop, digest, dumps, load_config, load_key
 from .policy import PolicyFetcher
 from .state import State
 
@@ -24,6 +24,10 @@ def terminal(result):
 
 def execute(runner, root, plan, *, digest_languages=(), **run_options):
     config = load_config(runner.config_path, runner.clock())
+    key = (run_options.get("key_loader") or load_key)()
+    if key in dumps(plan):
+        raise Stop("credential_in_record")
+    run_options["key_loader"] = lambda: key
     start_day = runner.clock().date()
     state = State(root)
     with state.locked() as conn:
@@ -38,8 +42,11 @@ def execute(runner, root, plan, *, digest_languages=(), **run_options):
         if runner.clock().date() != start_day:
             results.append({"outcome": "skipped", "reason": "dispatch_clock_changed"})
             break
+        if load_config(runner.config_path, runner.clock()) != config:
+            results.append({"outcome": "skipped", "reason": "config_changed"})
+            break
         result = runner.run(shadow_root=root, url=target["url"], fetcher=fetcher,
-                            target=target, digest_languages=digest_languages, **run_options)
+                            target=target, digest_languages=digest_languages, batch_day=start_day.isoformat(), **run_options)
         results.append(result)
         if terminal(result):
             break

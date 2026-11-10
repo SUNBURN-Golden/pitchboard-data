@@ -45,9 +45,12 @@ Submission fees are separate from pay/prizes. Absent fee is null, never free.
 Use explicitly_none only for an explicit no-fee statement. Free-text values and
 constraints must be exact spans in the quote. All amounts, date parts, currency
 and units must be supported by verbatim quote tokens; do not infer components.
+A bare $ does not establish USD. Explicit past closing dates or future opening
+dates forbid current-open even when the deadline proposal is null.
 Example JSON: {"open_call":null,"deadline":null,"pay":null,"eligibility":null,"submission_fee":null}
 """
-SCHEMA_HASH = digest(dumps({k: sorted(v) for k, v in VALUE_KEYS.items()}))
+SCHEMA_HASH = digest(dumps({"version": VERSION, "evidence_version": "verbatim-2.1",
+                            "value_keys": {k: sorted(v) for k, v in VALUE_KEYS.items()}}))
 PROMPT_HASH = digest(PROMPT)
 
 
@@ -172,6 +175,13 @@ def support_reason(field, value, quote, doc, as_of):
         if status != "not_call" and prof.non_writing(quote, prof.writing_submission_context(doc)):
             return "unsupported_status"
         if status == "open":
+            temporal = prof.extract(doc)
+            closes = {e.value["date"] for e in temporal if e.field == "deadline.closes_on"}
+            opens = {e.value["date"] for e in temporal if e.field == "deadline.opens_on"}
+            if closes and max(closes) < as_of:
+                return "past_deadline_conflict"
+            if opens and min(opens) > as_of:
+                return "future_open_conflict"
             if negative or not (prof.OPEN_RE.search(quote) or prof.STANDING_RE.search(quote)):
                 return "unsupported_status"
             if prof.CLOSED_RE.search(doc.text()) or prof.status_cancel_match(doc.text()):
@@ -216,7 +226,7 @@ def support_reason(field, value, quote, doc, as_of):
         if value[k] is not None and Decimal(value[k]) not in amounts:
             return "unsupported_amount"
     currency = value["currency"]
-    currency_cues = {"USD": r"\bUSD\b|\$", "GBP": r"\bGBP\b|£", "EUR": r"\bEUR\b|€", "KRW": r"\bKRW\b|₩|[0-9]\s*(?:만\s*)?원"}
+    currency_cues = {"USD": r"\bUSD\b|\bUS\$|\bU\.S\. dollars\b", "GBP": r"\bGBP\b|£", "EUR": r"\bEUR\b|€", "KRW": r"\bKRW\b|₩|[0-9]\s*(?:만\s*)?원"}
     if currency and (currency not in currency_cues or not re.search(currency_cues[currency], q)):
         return "unsupported_currency"
     unit = value["unit"]

@@ -106,6 +106,13 @@ def plan(data, *, limit=40, history=(), config_hash=None):
     for original in rows:
         r = dict(original)
         try:
+            allowed = {"gap_id", "subject_type", "subject_id", "target_id", "predicate", "scope_ref", "state", "gap_class", "importance",
+                       "owner_outlet_id", "source_id", "owner_name", "outlet_name", "permission", "raw_id", "url", "final_url", "kind", "outcome",
+                       "http_status", "content_hash", "text_hash", "fetched_at", "relevance", "relationship_basis"}
+            if set(r) - allowed or type(r.get("relevance", 2)) is not int or not 0 <= r.get("relevance", 2) <= 2:
+                raise Stop("invalid_gap_export")
+            if any(isinstance(v, str) and len(v) > (4096 if k in ("url", "final_url") else 280) for k, v in r.items()):
+                raise Stop("invalid_gap_export")
             for key in ("gap_id", "subject_type", "subject_id", "predicate", "state", "gap_class", "scope_ref"):
                 if not isinstance(r.get(key), str) or not 0 < len(r[key]) <= 280:
                     raise Stop("invalid_gap_export")
@@ -118,9 +125,11 @@ def plan(data, *, limit=40, history=(), config_hash=None):
                 raise Stop("unsupported_subject")
             if not r.get("owner_outlet_id"):
                 raise Stop("no_outlet_relation")
-            if any("soulbound" in str(r.get(k, "")).casefold() for k in
+            if any(any(name in str(r.get(k, "")).casefold() for name in ("soulbound", "소울바운드")) for k in
                    ("owner_outlet_id", "owner_name", "outlet_name", "source_id", "url", "final_url")):
                 raise Stop("excluded_owner")
+            if not isinstance(r.get("outlet_name"), str) or not r["outlet_name"].strip():
+                raise Stop("missing_owner_metadata")
             if not r.get("url"):
                 raise Stop("no_related_url")
             if (stamp(r["fetched_at"]), r["raw_id"]) != latest[r["url"]]:
@@ -133,33 +142,49 @@ def plan(data, *, limit=40, history=(), config_hash=None):
             r["url"] = canonical_url(r["url"])
             r["final_url"] = canonical_url(r.get("final_url") or r["url"])
             for key in ("content_hash", "text_hash"):
-                if r.get(key) is not None and not re.fullmatch(r"[a-f0-9]{64}", r[key]):
+                if r.get(key) is not None and (not isinstance(r[key], str) or not re.fullmatch(r"[a-f0-9]{64}", r[key])):
                     raise Stop("invalid_gap_export")
             if not isinstance(r.get("source_id"), str) or r.get("relationship_basis") != "outlet_source":
                 raise Stop("invalid_gap_export")
             importance = r.get("importance", .5)
             if type(importance) not in (int, float) or not 0 <= importance <= 1:
                 raise Stop("invalid_gap_export")
+            attempts = [h for h in history if h.get("final_url") == r["final_url"] and r.get("content_hash")
+                        and h.get("body_sha256") == r["content_hash"]]
+            r["shadow_attempted"] = bool(attempts)
+            r["shadow_last_attempt"] = max((h.get("timestamp_utc", "") for h in attempts), default="")
             done = any(h.get("outcome") == "ok" and h.get("final_url") == r["final_url"] and r.get("content_hash")
                        and h.get("body_sha256") == r["content_hash"] and h.get("prompt_sha256") == PROMPT_HASH
                        and h.get("schema_sha256") == SCHEMA_HASH and h.get("config_sha256") == config_hash for h in history)
             if done and r["predicate"] in STATIC:
                 raise Stop("skip_static_already_done")
             if done:
-                # Explicit next-day temporal recheck; same-day dedup still applies.
+                day = stamp(data["exported_at_utc"]).date()
+                boundaries = [dt.date.fromisoformat(date) for h in attempts
+                              for date in h.get("baseline", {}).get("deadline", [])]
+                if not any(abs((boundary - day).days) <= 3 for boundary in boundaries):
+                    raise Stop("skip_time_sensitive_no_boundary")
                 reasons["retry_time_sensitive"] += 1
             candidates.append(r)
         except Stop as exc:
             if str(exc) == "invalid_gap_export":
                 raise
             reasons[str(exc)] += 1
-    candidates.sort(key=lambda r: (PRIORITY[r["predicate"]], -r.get("importance", .5),
-                                  r.get("relevance", 2), r["gap_id"], r["url"]))
+    # Pick one best related source per gap before URL deduplication. A successful
+    # static page is already removed, so subsequent plans can inspect alternatives.
+    candidates.sort(key=lambda r: (r["shadow_attempted"], r.get("relevance", 2),
+                                  r["shadow_last_attempt"], r["url"], r["raw_id"]))
+    best = {}
+    for r in candidates:
+        best.setdefault(r["gap_id"], r)
+    candidates = list(best.values())
+    def tier(r):
+        return PRIORITY[r["predicate"]], r["shadow_attempted"], -r.get("importance", .5)
     ordered = []
-    for tier in sorted(set(PRIORITY[r["predicate"]] for r in candidates)):
+    for priority in sorted({tier(r) for r in candidates}):
         outlets = defaultdict(deque)
-        for r in candidates:
-            if PRIORITY[r["predicate"]] == tier:
+        for r in sorted(candidates, key=lambda r: (r["shadow_last_attempt"], r["gap_id"], r["url"])):
+            if tier(r) == priority:
                 outlets[r["owner_outlet_id"]].append(r)
         while any(outlets.values()):
             for outlet in sorted(outlets):

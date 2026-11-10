@@ -4,6 +4,8 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import time
+import subprocess
+from pathlib import Path
 import urllib.error
 import urllib.request
 
@@ -42,6 +44,15 @@ def baseline(doc, as_of):
             "current_open": bool(keys), "deadline": closes}
 
 
+def runtime_commit():
+    try:
+        value = subprocess.check_output(["git", "-C", str(Path(__file__).resolve().parents[4]), "rev-parse", "HEAD"],
+                                        text=True, stderr=subprocess.DEVNULL).strip()
+        return value if len(value) == 40 and all(c in "0123456789abcdef" for c in value) else "unknown"
+    except Exception:
+        return "unknown"
+
+
 def provider(body, key, timeout):
     """Fixed endpoint, verified TLS, no proxies, redirects, tools, or retries."""
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
@@ -67,12 +78,14 @@ class ShadowRunner:
         self.config_path, self.clock = config, clock
 
     def run(self, *, shadow_root, url=None, page=None, as_of=None, fetcher=None,
-            transport=None, key_loader=None, extra_protected=(), target=None, digest_languages=()):
+            transport=None, key_loader=None, extra_protected=(), target=None, digest_languages=(), batch_day=None):
         """Disabled path has no side effects. A Page is accepted for cached eval only."""
         try:
             config = load_config(self.config_path, self.clock())
             if not isinstance(digest_languages, (tuple, list)) or set(digest_languages) - {"ko", "en"}:
                 raise Stop("invalid_digest_languages")
+            if batch_day is not None and self.clock().date().isoformat() != batch_day:
+                raise Stop("dispatch_clock_changed")
             requested = canonical_url(url if page is None else page.requested_url)
             if page is not None and page.provenance != "offline_cached":
                 raise Stop("invalid_policy_envelope")
@@ -86,8 +99,9 @@ class ShadowRunner:
                     # latest denied observation into a cached successful source.
                     from .planner import plan, EXPORT_SCHEMA
                     checked = plan({"schema": EXPORT_SCHEMA, "exported_at_utc": self.clock().isoformat(),
-                                    "rows": target["targets"]}, limit=1)
-                    if not checked["targets"] or checked["targets"][0]["url"] != requested:
+                                    "rows": [{k: v for k, v in t.items() if not k.startswith("shadow_")} for t in target["targets"]]}, limit=1)
+                    if (not checked["targets"] or checked["targets"][0]["url"] != requested
+                            or checked["targets"][0]["content_hash"] != known_hash):
                         raise Stop("ineligible_source")
                 page = source_cache.load(state.root, requested, known_hash, self.clock(), config["max_page_utf8_bytes"])
                 # Only the policy fetcher may assert live verification.
@@ -107,17 +121,19 @@ class ShadowRunner:
             state = State(shadow_root, extra_protected)
             key = (key_loader or load_key)()
             # The key is never sent as model data, nor allowed into persisted values.
-            if key in dumps(body):
+            if key in dumps(body) or key in dumps(target) or key in requested:
                 raise Stop("credential_in_page")
             config_hash = digest(dumps(config))
             dedup = digest(dumps([page.final_url, page.body_sha256, as_of, PROMPT_HASH, SCHEMA_HASH,
-                                  config_hash, page.provenance]))
+                                  config_hash, "offline_cached" if page.provenance == "offline_cached" else "policy_source"]))
             with state.locked() as conn:
                 # Honor disabling/config changes even when waiting for another process.
                 current = load_config(self.config_path, self.clock())
                 if current != config:
                     raise Stop("config_changed")
                 now = self.clock()
+                if batch_day is not None and now.date().isoformat() != batch_day:
+                    raise Stop("dispatch_clock_changed")
                 cache_id = source_cache.save(state, page, doc, now, key)
                 attempt, day, cost = state.reserve(conn, config, dedup, now)
                 experiment_id = conn.execute("SELECT value FROM meta WHERE key='experiment_id'").fetchone()[0]
@@ -130,7 +146,8 @@ class ShadowRunner:
                           "source_observed_at_utc": getattr(page, "observed_at_utc", "") or now.isoformat(),
                           "source_changed": bool(target and target.get("content_hash") and target["content_hash"] != page.body_sha256),
                           "prompt_sha256": PROMPT_HASH, "schema_sha256": SCHEMA_HASH,
-                          "config_sha256": config_hash, "as_of": as_of,
+                          "config_sha256": config_hash, "config_snapshot": config,
+                          "runtime_commit": runtime_commit(), "as_of": as_of,
                           "as_of_source": "frozen cohort KST calendar date" if page.provenance == "offline_cached" else "UTC calendar date",
                           "baseline": rules, "gap_target": target,
                           "requested_model": config["model"], "returned_model": None,

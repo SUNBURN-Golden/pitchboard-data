@@ -79,6 +79,14 @@ def save(state, page, doc, now, key):
         raise Stop("page_too_large")
     name = cache_key(page.requested_url, page.body_sha256)
     path = directory(state) / (name + ".json")
+    if path.exists() or path.is_symlink():
+        previous = load(state.root, page.requested_url, page.body_sha256, now)
+        if previous is not None:
+            prior = previous.doc()
+            if (previous.final_url != page.final_url or prior.text() != doc.text() or prior.title != doc.title
+                    or prior.lang != doc.lang or prior.meta != payload["doc"]["meta"] or prior.segments != doc.segments):
+                raise Stop("corrupt_source_cache")
+            return name
     atomic_json(path, {"payload": payload, "sha256": digest(data)})
     return name
 
@@ -119,7 +127,7 @@ def load(root, url, body_hash, now, limit=24000):
         d = p["doc"]
         if set(d) != {"kind", "title", "lang", "meta", "segments"} or d["kind"] != "html" or not isinstance(d["segments"], list) or len(d["segments"]) > 2048:
             raise Stop("invalid_source_cache")
-        if not all(isinstance(d[k], str) for k in ("title", "lang")) or not isinstance(d["meta"], dict) or set(d["meta"]) - {"og:title"}:
+        if not all(isinstance(d[k], str) for k in ("title", "lang")) or not isinstance(d["meta"], dict) or set(d["meta"]) - {"og:title"} or not all(isinstance(v, str) for v in d["meta"].values()):
             raise Stop("invalid_source_cache")
         segments = [Segment(**s) for s in d["segments"]]
         for i, s in enumerate(segments):
