@@ -2,7 +2,7 @@
 name = "pbdata"
 version = "0.1.0"
 description = "Pitchboard data foundation (ontology, fact model, stage runner). Standard library only."
-requires-python = ">=3.9"
+requires-python = ">=3.11"  # sqlite3.Connection.deserialize (planner/report snapshots)
 dependencies = []
 
 [tool.setuptools.packages.find]

@@ -1,0 +1,21 @@
+{
+  "enabled": false,
+  "mode": "shadow",
+  "model": "deepseek-flash",
+  "daily_call_cap": 50,
+  "daily_cost_cap_usd": "5.00",
+  "monetary_cap": "enforced",
+  "egress": "direct",
+  "max_page_utf8_bytes": 24000,
+  "max_output_tokens": 2048,
+  "timeout_seconds": 30,
+  "window_start_utc": null,
+  "window_end_utc": null,
+  "pricing": {
+    "input_usd_per_million_ceiling": "0.30",
+    "output_usd_per_million_ceiling": "1.20",
+    "input_token_reservation_ceiling": 1000000,
+    "verified_on": "2026-11-05",
+    "valid_until_utc": "2026-11-12T00:00:00Z"
+  }
+}
