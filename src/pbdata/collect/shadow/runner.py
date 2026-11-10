@@ -11,6 +11,7 @@ from .common import CONFIG, Stop, digest, dumps, load_config, load_key, loads, u
 from .policy import PolicyFetcher, canonical_url
 from .schema import VERSION, PROMPT_HASH, SCHEMA_HASH, request_body, response
 from .state import State
+from . import source_cache
 from ..net import NoRedirect
 from ..parse import PARSER_VERSION
 from ...profiles import pitchboard as prof
@@ -77,10 +78,21 @@ class ShadowRunner:
                 state = State(shadow_root, extra_protected)
                 with state.locked() as conn:
                     state.preflight(conn, load_config(self.config_path, self.clock()), self.clock())
+                known_hash = target.get("content_hash") if target else None
+                if target:
+                    # Reapply export eligibility on reuse; a caller cannot turn a
+                    # latest denied observation into a cached successful source.
+                    from .planner import plan, EXPORT_SCHEMA
+                    checked = plan({"schema": EXPORT_SCHEMA, "exported_at_utc": self.clock().isoformat(),
+                                    "rows": target["targets"]}, limit=1)
+                    if not checked["targets"] or checked["targets"][0]["url"] != requested:
+                        raise Stop("ineligible_source")
+                page = source_cache.load(state.root, requested, known_hash, self.clock(), config["max_page_utf8_bytes"])
                 # Only the policy fetcher may assert live verification.
                 if fetcher is not None and not isinstance(fetcher, PolicyFetcher):
                     raise Stop("invalid_fetcher")
-                page = (fetcher or PolicyFetcher(egress=config["egress"])).fetch(requested)
+                if page is None:
+                    page = (fetcher or PolicyFetcher(egress=config["egress"])).fetch(requested)
             doc = page.doc()
             if len(doc.text().encode("utf-8")) > config["max_page_utf8_bytes"]:
                 raise Stop("page_too_large")
@@ -104,6 +116,7 @@ class ShadowRunner:
                 if current != config:
                     raise Stop("config_changed")
                 now = self.clock()
+                cache_id = source_cache.save(state, page, doc, now, key)
                 attempt, day, cost = state.reserve(conn, config, dedup, now)
                 experiment_id = conn.execute("SELECT value FROM meta WHERE key='experiment_id'").fetchone()[0]
                 record = {"schema": VERSION, "experiment_id": experiment_id, "attempt_id": attempt,
@@ -111,6 +124,9 @@ class ShadowRunner:
                           "requested_url": requested, "final_url": page.final_url, "redirect_chain": list(page.hops),
                           "provenance": page.provenance, "body_sha256": page.body_sha256,
                           "text_sha256": digest(doc.text()), "parser_version": PARSER_VERSION,
+                          "source_cache_key": cache_id,
+                          "source_observed_at_utc": getattr(page, "observed_at_utc", "") or now.isoformat(),
+                          "source_changed": bool(target and target.get("content_hash") and target["content_hash"] != page.body_sha256),
                           "prompt_sha256": PROMPT_HASH, "schema_sha256": SCHEMA_HASH,
                           "config_sha256": config_hash, "as_of": as_of,
                           "as_of_source": "frozen cohort KST calendar date" if page.provenance == "offline_cached" else "UTC calendar date",

@@ -117,3 +117,51 @@ class BatchTests(Harness):
         with patch.object(runner.PolicyFetcher, "fetch", side_effect=AssertionError("fetch")):
             r = runner.ShadowRunner(self.config_path, clock=lambda: NOW).run(shadow_root=self.root, url=URL)
         assert r["reason"] == "budget_exhausted"
+
+
+class CacheTests(Harness):
+    def test_matching_copy_no_fetch_baseline_roundtrip_and_corruption(self):
+        from pbdata.collect.shadow import source_cache
+        first = self.run_page()
+        assert first["outcome"] == "ok"
+        cached = source_cache.load(self.root, URL, page().body_sha256, NOW)
+        assert cached.document == page().doc()
+        assert runner.baseline(cached.doc(), "2026-11-05") == first["baseline"]
+        assert cached.provenance == "shadow_cached"
+        cached.provenance = "live_verified"
+        with pytest.raises(common.Stop, match="invalid_policy_envelope"):
+            cached.doc()
+        target = planner.plan(export(candidate()))["targets"][0]
+        with patch.object(runner.PolicyFetcher, "fetch", side_effect=AssertionError("refetch")), patch("socket.socket", side_effect=AssertionError("network")):
+            r = runner.ShadowRunner(self.config_path, clock=lambda: NOW).run(shadow_root=self.root, url=URL, target=target,
+                    transport=self.transport, key_loader=lambda: KEY)
+        assert r["outcome"] == "ok"
+        assert r["provenance"] == "shadow_cached"
+        path = self.root / "data/shadow/source_text" / (first["source_cache_key"] + ".json")
+        raw = json.loads(path.read_text()); raw["payload"]["doc"]["title"] = "changed"
+        path.write_text(common.dumps(raw))
+        with pytest.raises(common.Stop, match="corrupt_source_cache"):
+            source_cache.load(self.root, URL, page().body_sha256, NOW)
+
+    def test_missing_null_oversize_expired_and_save_failure_no_spend(self):
+        from pbdata.collect.shadow import source_cache
+        assert source_cache.load(self.root, URL, None, NOW) is None
+        with patch.object(source_cache, "save", side_effect=common.Stop("unsafe_path")):
+            assert self.run_page()["reason"] == "unsafe_path"
+        with state.State(self.root).locked() as c:
+            assert c.execute("SELECT count(*) FROM attempts").fetchone()[0] == 0
+        self.run_page()
+        with pytest.raises(common.Stop, match="page_too_large"):
+            source_cache.load(self.root, URL, page().body_sha256, NOW, limit=10)
+        assert source_cache.load(self.root, URL, page().body_sha256, NOW + dt.timedelta(days=30)) is None
+        assert KEY.encode() not in self.artifacts()
+
+    def test_cache_preserves_table_metadata_and_utf8(self):
+        from pbdata.collect.shadow import source_cache
+        p = page(body='<html lang="ko"><title>모집</title><meta property="og:title" content="시 모집"><table><tr><td>응모료</td><td>10,000원</td></tr></table></html>'.encode())
+        r = self.run_page(page=p)
+        assert r["outcome"] == "ok"
+        cached = source_cache.load(self.root, URL, p.body_sha256, NOW)
+        assert cached.doc().segments == p.doc().segments
+        assert cached.doc().meta == p.doc().meta
+        assert runner.baseline(cached.doc(), r["as_of"]) == r["baseline"]

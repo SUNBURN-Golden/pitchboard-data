@@ -541,3 +541,11 @@ Time-sensitive fields allow an explicit daily recheck (same-day ledger dedup sti
 applies); static fields skip matching completed schema/prompt/config/body hashes.
 Plan-only prints counts/reasons without creating a root. Detailed execution plans
 are private JSONL under the initialized shadow root.
+
+Stage 2 adds atomic 0600 source snapshots with exact parsed segments/title/meta,
+URL/body/text integrity, format/parser/policy versions and a 30-day expiry. Known
+matching body hashes reuse text without DNS, robots or page requests and retain
+historical provenance. Corrupt/unsafe copies stop; unknown hashes fetch normally.
+The whole page is rejected above the configured ceiling; no truncation. Cache
+writes occur under the ledger lock before reservation and after key checks.
+Validation: 64 tests and 165 subtests passed across extraction/comparison/improvement.
