@@ -1,7 +1,6 @@
 # DeepSeek shadow improvement design
 
-Stage: **DESIGN review**, 2026-11-10. This change documents proposed work; none
-of the interfaces below is implemented by this stage. Implement the five stages
+Stage: **BUILD**, 2026-11-10. Implementation follows the reviewed design below. Implement the five stages
 in the order listed, with affected pytest checks and a commit for each stage on
 `feat/deepseek-shadow-target-gaps`. Never push to `main` or force-push.
 
@@ -527,3 +526,18 @@ comparison adapter and service migrations, and folded the verified corrections
 above into stages 1–5 and the operator handoff. The checked-in config remains
 disabled; no provider calls, live DB reads, cron/private-config edits, or runtime
 activation were performed. Only this design document is changed.
+
+
+## BUILD implementation log
+
+Stage 1 implements the metadata planner, default-40 CLI, shared terminal classifier,
+schema-aware deduplication and pre-fetch budget checks. JSON input uses the
+versioned envelope above. The DB adapter deliberately uses an O_RDONLY stable
+single-file snapshot deserialized into a query-only in-memory SQLite connection,
+instead of opening the service file with SQLite. This stronger sidecar-write
+boundary rejects WAL-format databases and any journal/sidecar; use a consistent
+JSON export for those databases. No live database was opened during BUILD.
+Time-sensitive fields allow an explicit daily recheck (same-day ledger dedup still
+applies); static fields skip matching completed schema/prompt/config/body hashes.
+Plan-only prints counts/reasons without creating a root. Detailed execution plans
+are private JSONL under the initialized shadow root.

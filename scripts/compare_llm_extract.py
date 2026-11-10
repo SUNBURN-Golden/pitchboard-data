@@ -13,22 +13,7 @@ from pbdata.collect.shadow.common import CONFIG, Stop, digest, dumps, load_confi
 from pbdata.collect.shadow.compare import load_cohorts, predictions, score
 from pbdata.collect.shadow.state import State, comparison_output
 
-# Per-page/host skips that should not end a generation run. Anything else
-# (including experiment_halted, disabled, expired_pricing, bad state) is
-# terminal, so the loop must not walk the rest of the frozen sample for free.
-CONTINUE_REASONS = frozenset({
-    "bad_url", "blocked_host", "blocked_network", "denied_robots", "host_halted",
-    "fetch_error", "denied_http", "unsupported_content", "invalid_transport_body",
-    "invalid_robots", "redirect_limit", "access_wall", "empty_page", "page_too_large",
-    "duplicate_page", "invalid_policy_envelope"})
-
-
-def terminal(result):
-    if not isinstance(result, dict):
-        return True
-    if result.get("outcome") in ("model_mismatch", "usage_invariant"):
-        return True
-    return result.get("outcome") == "skipped" and result.get("reason") not in CONTINUE_REASONS
+from pbdata.collect.shadow.batch import CONTINUE_REASONS, terminal
 
 
 def write_report(path, report):

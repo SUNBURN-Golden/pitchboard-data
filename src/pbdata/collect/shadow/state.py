@@ -132,15 +132,13 @@ class State:
                     append_sync(f, loads(row["result"]))
             sync_dir(self.output(day).parent)
 
-    def reserve(self, conn, config, dedup, now):
+    def preflight(self, conn, config, now):
         time = now.isoformat()
         last = conn.execute("SELECT value FROM meta WHERE key='watermark'").fetchone()[0]
         if last and time < last:
             raise Stop("clock_backwards")
         if conn.execute("SELECT value FROM meta WHERE key='halted'").fetchone()[0]:
             raise Stop("experiment_halted")
-        if conn.execute("SELECT 1 FROM attempts WHERE dedup=?", (dedup,)).fetchone():
-            raise Stop("duplicate_page")
         day = now.date().isoformat()
         charge = reservation(config)
         costs = [money(r[0]) for r in conn.execute("SELECT reserved_usd FROM attempts WHERE day=?", (day,))]
@@ -151,6 +149,14 @@ class State:
         over_cost = mode == "enforced" and sum(costs, Decimal(0)) + charge > money(config["daily_cost_cap_usd"])
         if len(costs) >= config["daily_call_cap"] or over_cost:
             raise Stop("budget_exhausted")
+
+    def reserve(self, conn, config, dedup, now):
+        if conn.execute("SELECT value FROM meta WHERE key='halted'").fetchone()[0]:
+            raise Stop("experiment_halted")
+        if conn.execute("SELECT 1 FROM attempts WHERE dedup=?", (dedup,)).fetchone():
+            raise Stop("duplicate_page")
+        self.preflight(conn, config, now)
+        time, day, charge = now.isoformat(), now.date().isoformat(), reservation(config)
         # Preflight output before the durable reservation. No network on failure.
         with secure_open(self.output(day), "a+"):
             pass

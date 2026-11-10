@@ -66,7 +66,7 @@ class ShadowRunner:
         self.config_path, self.clock = config, clock
 
     def run(self, *, shadow_root, url=None, page=None, as_of=None, fetcher=None,
-            transport=None, key_loader=None, extra_protected=()):
+            transport=None, key_loader=None, extra_protected=(), target=None, digest_languages=()):
         """Disabled path has no side effects. A Page is accepted for cached eval only."""
         try:
             config = load_config(self.config_path, self.clock())
@@ -74,6 +74,9 @@ class ShadowRunner:
             if page is not None and page.provenance != "offline_cached":
                 raise Stop("invalid_policy_envelope")
             if page is None:
+                state = State(shadow_root, extra_protected)
+                with state.locked() as conn:
+                    state.preflight(conn, load_config(self.config_path, self.clock()), self.clock())
                 # Only the policy fetcher may assert live verification.
                 if fetcher is not None and not isinstance(fetcher, PolicyFetcher):
                     raise Stop("invalid_fetcher")
@@ -93,7 +96,7 @@ class ShadowRunner:
             if key in dumps(body):
                 raise Stop("credential_in_page")
             config_hash = digest(dumps(config))
-            dedup = digest(dumps([page.final_url, page.body_sha256, as_of, PROMPT_HASH,
+            dedup = digest(dumps([page.final_url, page.body_sha256, as_of, PROMPT_HASH, SCHEMA_HASH,
                                   config_hash, page.provenance]))
             with state.locked() as conn:
                 # Honor disabling/config changes even when waiting for another process.
@@ -111,7 +114,7 @@ class ShadowRunner:
                           "prompt_sha256": PROMPT_HASH, "schema_sha256": SCHEMA_HASH,
                           "config_sha256": config_hash, "as_of": as_of,
                           "as_of_source": "frozen cohort KST calendar date" if page.provenance == "offline_cached" else "UTC calendar date",
-                          "baseline": rules,
+                          "baseline": rules, "gap_target": target,
                           "requested_model": config["model"], "returned_model": None,
                           "reserved_usd": cost, "charged_ceiling_usd": cost, "usage": None,
                           "fields": None, "validation_reasons": {}, "outcome": "unknown"}
