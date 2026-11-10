@@ -96,10 +96,19 @@ def seg_hash(text: str) -> str:
     return sha256_hex(" ".join(text.split()).lower())[:12]
 
 
+def _record_source_success(svc: sqlite3.Connection, source_id: str, fetched_at: str) -> None:
+    """Keep the latest successful fetch time, including when older raws are replayed."""
+    svc.execute("UPDATE pb_source SET last_success_at=? WHERE source_id=? "
+                "AND (last_success_at IS NULL OR last_success_at<?)", (fetched_at, source_id, fetched_at))
+
+
 def insert_raw(svc: sqlite3.Connection, now: str, **kw) -> str:
     raw_id = new_id("raw", _ms(now))
     cols = ["raw_id"] + list(kw)
-    svc.execute("INSERT INTO pb_raw_ref(%s) VALUES(%s)" % (",".join(cols), ",".join("?" * len(cols))), [raw_id] + [kw[c] for c in kw])
+    with transaction(svc):
+        svc.execute("INSERT INTO pb_raw_ref(%s) VALUES(%s)" % (",".join(cols), ",".join("?" * len(cols))), [raw_id] + [kw[c] for c in kw])
+        if kw.get("outcome") == "ok" and kw.get("source_id"):
+            _record_source_success(svc, kw["source_id"], kw["fetched_at"])
     return raw_id
 
 

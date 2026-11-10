@@ -11,7 +11,7 @@ from .. import timeutil
 from ..ids import sha256_hex, stable_id
 from ..model import ValidationError
 from .. import statemachine
-from ..collect import collector, promote, gaps, store
+from ..collect import collector, promote, gaps, store, reconcile
 from ..collect.resolve import same_entity
 from ..profiles import pitchboard as prof
 from . import clips, project
@@ -178,6 +178,7 @@ def _live(c, call_id, pred):
 def s_state_update(c: RunContext) -> dict:
     now = c.clock()
     nowdt = timeutil.parse_iso(now)
+    reconciled = reconcile.reconcile(c.svc, now)
     moved = {"closed_by_clock": 0, "opened_by_clock": 0, "closed_by_evidence": 0, "cancelled_by_evidence": 0, "reopened_by_evidence": 0}
     for call in c.svc.execute("SELECT call_id, status, status_since, edition_key FROM pb_call_edition WHERE status IN "
                               "('announced','open','extended','standing','closed')").fetchall():
@@ -213,7 +214,8 @@ def s_state_update(c: RunContext) -> dict:
                 moved["opened_by_clock"] += 1
     by = dict(c.svc.execute("SELECT status, count(*) FROM pb_call_edition GROUP BY status").fetchall())
     hist = c.svc.execute("SELECT count(*) FROM pb_status_event").fetchone()[0]
-    return {**moved, "calls_by_status": by, "status_events_total": hist}
+    return {**moved, "reconcile": reconciled, "closed_nonwriting": reconciled["closed_nonwriting"],
+            "calls_by_status": by, "status_events_total": hist}
 
 
 # 8 ---------------------------------------------------------------- service recompute
@@ -257,7 +259,9 @@ def s_quality_check(c: RunContext) -> dict:
     q["conflicts_open"] = svc.execute("SELECT count(*) FROM pb_conflict_group WHERE resolved_at IS NULL").fetchone()[0]
     q["dead_letter_jobs"] = c.infra.execute("SELECT count(*) FROM job WHERE state='dead'").fetchone()[0]
     q["failure_queue_open"] = c.infra.execute("SELECT count(*) FROM failure_queue WHERE state='open'").fetchone()[0]
-    q["sources_never_succeeded"] = svc.execute("SELECT count(*) FROM pb_source WHERE permission IN ('allowed_public','allowed_conditional') AND last_success_at IS NULL").fetchone()[0]
+    # Raw history is authoritative: historical successful writers left last_success_at NULL.
+    q["sources_never_succeeded"] = svc.execute("SELECT count(*) FROM pb_source s WHERE s.permission IN ('allowed_public','allowed_conditional') "
+                                              "AND NOT EXISTS (SELECT 1 FROM pb_raw_ref r WHERE r.source_id=s.source_id AND r.outcome='ok')").fetchone()[0]
     fetch = c.state.get("incremental_fetch", {})
     chg = c.state.get("change_detection", {})
     prev_empty = c.infra.execute("SELECT count(*) FROM (SELECT metrics FROM metric_snapshot WHERE label='daemon_quality' ORDER BY taken_at DESC LIMIT 2) "
