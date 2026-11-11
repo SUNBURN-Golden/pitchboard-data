@@ -10,6 +10,8 @@ import argparse, json, os, sqlite3, sys, time, urllib.request, urllib.robotparse
 from urllib.parse import urlsplit
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "src"))
+from pbdata.collect import egress
 UA = "PitchboardBot/0.1 (+https://pitchboard.soulbound.co.kr; research collector; honors robots.txt)"
 
 
@@ -31,8 +33,11 @@ def anon_ok(url):
     s = urlsplit(url)
     rp = urllib.robotparser.RobotFileParser()
     try:
-        r = urllib.request.urlopen(urllib.request.Request("%s://%s/robots.txt" % (s.scheme, s.netloc), headers={"User-Agent": UA}), timeout=15)
-        rp.parse(r.read(500000).decode("utf-8", "replace").splitlines())
+        r = egress.urlopen(urllib.request.Request("%s://%s/robots.txt" % (s.scheme, s.netloc), headers={"User-Agent": UA}), timeout=15)
+        robots = r.read(500000)
+        if egress.configured_proxy():
+            egress.log_traffic(len(robots), s.hostname or "")
+        rp.parse(robots.decode("utf-8", "replace").splitlines())
         if not rp.can_fetch(UA, url):
             return False, "robots_disallow"
     except urllib.error.HTTPError as e:
@@ -41,8 +46,11 @@ def anon_ok(url):
     except Exception as e:
         return False, "robots_error:%s" % type(e).__name__
     try:
-        r = urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": UA}), timeout=20)
-        body = r.read(800000).decode("utf-8", "replace").lower()
+        r = egress.urlopen(urllib.request.Request(url, headers={"User-Agent": UA}), timeout=20)
+        raw = r.read(800000)
+        if egress.configured_proxy():
+            egress.log_traffic(len(raw), s.hostname or "")
+        body = raw.decode("utf-8", "replace").lower()
         if r.status != 200:
             return False, "http_%d" % r.status
         if ("type=\"password\"" in body or "type='password'" in body) and len(body) < 20000:

@@ -16,6 +16,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 from .common import Stop, digest, source_content_hash
 from ..net import CHALLENGE_RE, PASSWORD_RE, LOGIN_RE, NoRedirect
 from ..parse import parse_html
+from .. import egress as socks_egress
 
 BLOCKLIST = Path(__file__).resolve().parents[4] / "config/blocked_hosts.txt"
 MAX_BODY = 4_000_000
@@ -210,9 +211,19 @@ class PolicyFetcher:
         if egress not in ("direct", "sandbox"):
             raise Stop("invalid_config")
         self.clock, self.sleep, self.egress = clock, sleep, egress
-        # Env proxies stay disabled. sandbox egress is a pinned DNS answer, not an HTTP proxy.
-        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect,
-                                                  PublicHTTPHandler(egress), PublicHTTPSHandler(egress))
+        # Env HTTP_PROXY/HTTPS_PROXY/ALL_PROXY stay disabled. sandbox egress is a
+        # pinned DNS answer, not an HTTP proxy. An explicit loopback SOCKS5
+        # (PITCHBOARD_SOCKS5_PROXY) is a separate, fail-closed path.
+        try:
+            self.proxy = socks_egress.configured_proxy()
+        except socks_egress.ProxyConfigError as exc:
+            raise Stop("invalid_config") from exc
+        if self.proxy:
+            self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect,
+                                                      socks_egress.SocksHTTPHandler(self.proxy), socks_egress.SocksHTTPSHandler(self.proxy))
+        else:
+            self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect,
+                                                      PublicHTTPHandler(egress), PublicHTTPSHandler(egress))
         self.robots, self.last, self.halted = {}, {}, set()
 
     def _get(self, url, accept, limit, delay=2):
@@ -233,11 +244,16 @@ class PolicyFetcher:
                 resp = e
             with resp:
                 status, headers = resp.code, resp.headers
+                if self.proxy and socks_egress.is_binary_media(url, headers.get("Content-Type", "")):
+                    socks_egress.log_traffic(0, urlsplit(url).hostname or "", "skipped_binary_media")
+                    raise Stop("unsupported_content")
                 body = resp.read(limit + 1)
             if status in (401, 402, 403, 429, 451) or status >= 500:
                 self.halted.add(origin)
             if len(body) > limit or headers.get("Content-Encoding", "identity").lower() != "identity":
                 raise Stop("invalid_transport_body")
+            if self.proxy:
+                socks_egress.log_traffic(len(body), urlsplit(url).hostname or "")
             return status, headers, body
         except Stop:
             raise

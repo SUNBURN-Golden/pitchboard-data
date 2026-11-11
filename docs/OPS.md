@@ -42,3 +42,12 @@ No automatic fetching of social sites. A human drops `$ROOT/inbox/manual_clips/*
 
 ## public_document renewal
 `scripts/renew_public_document.py [--dry-run] [--horizon 48]` renews 7-day public approvals only if robots allows our UA and an anonymous GET returns 200 without a login wall; it backs up the crawler DB first and never touches blocked hosts. Report: `exports/renewal_YYYYMMDD.json`.
+
+## SOCKS5 egress (zecbot)
+
+Daily collector jobs (`scripts/daily.sh`, `scripts/daemon_daily.sh`, and the DeepSeek shadow wrapper) set
+`PITCHBOARD_SOCKS5_PROXY=socks5h://127.0.0.1:1080` and fail closed if that loopback proxy is down: the run is skipped
+and no fetch falls back to the box IP. DNS for those fetches is resolved by the proxy. DeepSeek API calls
+(`api.deepseek.com` via `shadow.runner.provider`) stay direct and still ignore `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`.
+Headless Chromium uses `--proxy-server=socks5://127.0.0.1:1080` with remote DNS and blocks images, fonts, and media.
+Bytes fetched through the proxy are appended to `$PB_DATA_ROOT/logs/proxy_traffic.log`.

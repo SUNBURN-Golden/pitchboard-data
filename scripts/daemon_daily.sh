@@ -5,6 +5,13 @@ cd "${PB_REPO:-/workspace/pitchboard-data-main}"
 git pull --ff-only -q || true
 ROOT=/workspace/pitchboard/data-root
 mkdir -p "$ROOT/logs"
+export PYTHONPATH="${PWD}/src${PYTHONPATH:+:$PYTHONPATH}"
+export PITCHBOARD_SOCKS5_PROXY="${PITCHBOARD_SOCKS5_PROXY:-socks5h://127.0.0.1:1080}"
+export PITCHBOARD_PROXY_TRAFFIC_LOG="${PITCHBOARD_PROXY_TRAFFIC_LOG:-$ROOT/logs/proxy_traffic.log}"
+if ! python3 -c 'from pbdata.collect.egress import preflight; preflight()'; then
+  echo "socks5 proxy unavailable; skipping daemon $(date)" >>"$ROOT/logs/daemon.log"
+  exit 0
+fi
 # The 04:20 collector can run past 05:30; wait (up to 3h) for it to release collector.lock instead of failing.
 # collector.lock is released briefly between daily.sh's run and refresh steps, so first wait for the
 # whole daily.sh (it holds daily.lock for its entire run), then for collector.lock.

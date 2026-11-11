@@ -16,6 +16,7 @@ from typing import Dict, Optional, Tuple
 from urllib.parse import urljoin, urlparse, urlunparse
 
 from ..ids import sha256_hex
+from . import egress
 
 USER_AGENT = os.environ.get("PITCHBOARD_UA", "PitchboardBot/0.1 (+https://pitchboard.soulbound.co.kr; research collector; honors robots.txt)")
 GATEWAY_CIDRS = [c.strip() for c in os.environ.get("PITCHBOARD_EGRESS_GATEWAY_CIDRS", "198.18.0.0/15").split(",") if c.strip()]
@@ -81,7 +82,16 @@ class Fetcher:
         self.allow_loopback = allow_loopback
         self.request_cap = request_cap
         self.requests = 0
-        self.opener = urllib.request.build_opener(NoRedirect)
+        try:
+            self.proxy = egress.configured_proxy()
+        except egress.ProxyConfigError:
+            self.proxy = False
+        if self.proxy:
+            self.opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}), NoRedirect,
+                egress.SocksHTTPHandler(self.proxy), egress.SocksHTTPSHandler(self.proxy))
+        else:
+            self.opener = urllib.request.build_opener(NoRedirect)
         self._robots: Dict[str, Optional[urllib.robotparser.RobotFileParser]] = {}
 
     # ---- network safety -------------------------------------------------
@@ -110,6 +120,18 @@ class Fetcher:
         port = p.port or (443 if p.scheme == "https" else 80)
         if not self.allow_loopback and port not in (80, 443):
             return False, "bad_port"
+        if self.proxy is False:
+            return False, "invalid_proxy"
+        if self.proxy:
+            try:
+                ip = ipaddress.ip_address(p.hostname)
+            except ValueError:
+                return True, ""
+            if ip.is_loopback and self.allow_loopback:
+                return True, ""
+            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+                return False, "non_public_address"
+            return True, ""
         return self._addr_ok(p.hostname, port)
 
     # ---- host state -----------------------------------------------------
@@ -135,6 +157,8 @@ class Fetcher:
 
     # ---- robots ---------------------------------------------------------
     def _raw_get(self, url: str, accept: str, max_bytes: int, timeout: float = 10.0):
+        if self.proxy is False or self.opener is None:
+            raise OSError("invalid_proxy")
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": accept, "Accept-Language": "en,ko;q=0.8"})
         self.requests += 1
         try:
@@ -142,7 +166,18 @@ class Fetcher:
             status, hdrs = resp.status, dict(resp.headers.items())
         except urllib.error.HTTPError as e:
             resp, status, hdrs = e, e.code, dict(e.headers.items()) if e.headers else {}
+        ctype = hdrs.get("Content-Type") or hdrs.get("content-type") or ""
+        if self.proxy and egress.is_binary_media(url, ctype):
+            try:
+                resp.close()
+            except Exception:
+                pass
+            if self.proxy:
+                egress.log_traffic(0, urlparse(url).hostname or "", "skipped_binary_media")
+            return status, hdrs, None
         data = resp.read(max_bytes + 1)
+        if self.proxy:
+            egress.log_traffic(len(data), urlparse(url).hostname or "")
         return status, hdrs, data
 
     def _robots_for(self, url: str) -> Tuple[Optional[urllib.robotparser.RobotFileParser], Optional[str], Optional[float]]:
@@ -204,6 +239,8 @@ class Fetcher:
                     return FetchResult(url, cur, None, "", b"", "denied_http", "host_halted:" + reason, stamp, requests_used=self.requests - start_requests)
                 if self.request_cap is not None and self.requests >= self.request_cap:
                     return FetchResult(url, cur, None, "", b"", "error", "request_budget_exhausted", stamp, requests_used=self.requests - start_requests)
+                if self.proxy and egress.is_binary_media(cur):
+                    return FetchResult(url, cur, None, "", b"", "error", "skipped_binary_media", stamp, requests_used=self.requests - start_requests)
                 rp, err, delay = self._robots_for(cur)
                 if rp is None and err == "robots_unreachable":      # network failure, not a denial: nothing is fetched, retry later
                     return FetchResult(url, cur, None, "", b"", "error", "robots_unreachable", stamp, requests_used=self.requests - start_requests)
@@ -211,6 +248,8 @@ class Fetcher:
                     return FetchResult(url, cur, None, "", b"", "denied_robots", err or "robots_disallow", stamp, requests_used=self.requests - start_requests)
                 self._throttle(host, delay)
                 status, hdrs, data = self._raw_get(cur, accept, max_bytes)
+                if data is None:
+                    return FetchResult(url, cur, status, "", b"", "error", "skipped_binary_media", stamp, requests_used=self.requests - start_requests)
                 if status in (301, 302, 303, 307, 308) and hdrs.get("Location"):
                     cur = urljoin(cur, hdrs["Location"])
                     continue
