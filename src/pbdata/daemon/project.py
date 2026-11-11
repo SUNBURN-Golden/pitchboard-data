@@ -8,6 +8,7 @@ from typing import Dict, List, Optional
 
 from ..ids import sha256_hex
 from .. import timeutil
+from ..collect import names
 
 # ontology chain: outlet/organizer -> call edition -> genre & eligibility -> pay/fee/rights -> deadline
 CONDITIONS = ["scope.genre", "scope.submission_category", "eligibility.region", "eligibility.statement",
@@ -76,6 +77,20 @@ def applicable_now(status: str, closes_on, now: dt.datetime, fresh_until: Option
     return "maybe"
 
 
+def _display_name(svc, owner_id: str, canonical: Optional[str]) -> Optional[str]:
+    """Never show a non-name (CTA label / bare QID / empty): fall back to the owner's host-derived name.
+    Deterministic and read-only; legacy rows registered before the naming rules still display sensibly."""
+    if not names.is_junk_name(canonical):
+        return canonical
+    row = svc.execute("SELECT registered_domain FROM pb_source_site WHERE outlet_id=? AND registered_domain IS NOT NULL "
+                      "ORDER BY source_id LIMIT 1", (owner_id,)).fetchone()
+    if row is None:
+        row = svc.execute("SELECT host FROM pb_source WHERE owner_outlet_id=? AND host IS NOT NULL ORDER BY source_id LIMIT 1",
+                          (owner_id,)).fetchone()
+    fallback = names.host_name(row[0]) if row else ""
+    return fallback or canonical
+
+
 def build_payload(svc, call_id: str, now: Optional[dt.datetime] = None) -> dict:
     now = now or timeutil.utcnow()
     c = svc.execute("SELECT * FROM pb_call_edition WHERE call_id=?", (call_id,)).fetchone()
@@ -83,6 +98,7 @@ def build_payload(svc, call_id: str, now: Optional[dt.datetime] = None) -> dict:
     tbl = "pb_outlet" if c["outlet_id"] else "pb_organizer"
     col = "outlet_id" if c["outlet_id"] else "organizer_id"
     owner = svc.execute("SELECT canonical_name FROM %s WHERE %s=?" % (tbl, col), (owner_id,)).fetchone()
+    owner_name = _display_name(svc, owner_id, owner["canonical_name"]) if owner else None
     aliases = [r[0] for r in svc.execute("SELECT alias_raw FROM pb_alias WHERE subject_id IN (?,?) ORDER BY alias_raw", (owner_id, call_id))]
     conds = {p: _condition(svc, [call_id, owner_id], p) for p in CONDITIONS}
     closes = None
@@ -99,7 +115,7 @@ def build_payload(svc, call_id: str, now: Optional[dt.datetime] = None) -> dict:
                                            "WHERE call_id=? ORDER BY recorded_at", (call_id,))]
     revs = sorted({r[0] for r in svc.execute("SELECT DISTINCT e.revision_id FROM pb_fact f JOIN pb_evidence e ON e.evidence_id=f.evidence_id "
                                               "WHERE f.subject_id IN (?,?) AND f.superseded_at IS NULL", (call_id, owner_id))})
-    return {"call_id": call_id, "owner": {"id": owner_id, "type": col[:-3], "name": owner["canonical_name"] if owner else None, "aliases": aliases},
+    return {"call_id": call_id, "owner": {"id": owner_id, "type": col[:-3], "name": owner_name, "aliases": aliases},
             "edition_key": c["edition_key"], "title": c["title_raw"], "scope_ref": c["scope_ref"],
             "status": c["status"], "status_since": c["status_since"], "status_basis": c["status_basis"],
             "applicable_now": applicable_now(c["status"], closes, now, fresh), "closes_on": closes["date"] if closes else None,

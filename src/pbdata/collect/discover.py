@@ -16,7 +16,7 @@ from .. import timeutil
 from ..db import transaction
 from ..ids import new_id
 from ..profiles import pitchboard as prof
-from . import store
+from . import names, store
 from .net import normalize_url, origin_of, registered_domain
 from .wiki import Api
 
@@ -82,7 +82,7 @@ def _from_entities(ents: Dict[str, dict], strategy: str, origin_ref: str, prior:
     for qid, e in ents.items():
         for s in e["sites"][:1]:
             if _acceptable(s):
-                out.append(Cand(s, e["label"], strategy, origin_ref + ":" + qid, prior, qid))
+                out.append(Cand(s, names.clean_name(e["label"]) or "", strategy, origin_ref + ":" + qid, prior, qid))
     return out
 
 
@@ -105,7 +105,9 @@ def wikidata_class(api: Api, target: dict, limit: int = 200) -> List[Cand]:
         for b in api.sparql(q):
             site = b["site"]["value"]
             if _acceptable(site):
-                out.append(Cand(site, b.get("itemLabel", {}).get("value", ""), "wikidata_class", "%s/%s:%s" % (target["id"], qid, b["item"]["value"].rsplit("/", 1)[-1]), 0.5,
+                # the label service echoes the QID when the item has no en/ko label: that is not a name
+                lab = names.clean_name(b.get("itemLabel", {}).get("value", "")) or ""
+                out.append(Cand(site, lab, "wikidata_class", "%s/%s:%s" % (target["id"], qid, b["item"]["value"].rsplit("/", 1)[-1]), 0.5,
                                 b["item"]["value"].rsplit("/", 1)[-1]))
     return out
 
@@ -174,7 +176,7 @@ def call_index(fetcher, target: dict, now: str, year: int, max_pages: int = 3) -
     for ix in target.get("call_indexes", []):
         url, kind = ix["url"], ix.get("kind", "official")
         if kind == "official" and _acceptable(url):
-            out.append(Cand(url, ix.get("label", ""), "call_index", "%s:%s" % (target["id"], url), 0.8))
+            out.append(Cand(url, names.clean_name(ix.get("label", "")) or "", "call_index", "%s:%s" % (target["id"], url), 0.8))
         if kind != "directory":
             continue
         pages, seen = [url], set()
@@ -204,5 +206,6 @@ def call_index(fetcher, target: dict, now: str, year: int, max_pages: int = 3) -
                     continue
                 if prof.cycle_score((l.text or "") + " " + l.href, None) < 0:
                     continue
-                out.append(Cand(l.href, (l.text or "")[:120], "directory_hub", "%s:%s" % (target["id"], u), 0.6))
+                # link text is often a CTA ("온라인 접수하기"), not the organiser's name: keep only real names
+                out.append(Cand(l.href, names.clean_name(l.text or "") or "", "directory_hub", "%s:%s" % (target["id"], u), 0.6))
     return out

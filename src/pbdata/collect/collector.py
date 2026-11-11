@@ -13,7 +13,7 @@ from urllib.parse import urlparse
 from .. import timeutil
 from ..db import transaction
 from ..profiles import pitchboard as prof
-from . import discover, evaluate, executor, gaps, parse, promote, resolve, scheduler, store
+from . import discover, evaluate, executor, gaps, names, parse, promote, resolve, scheduler, store
 from .net import Fetcher, FetchResult, normalize_url, origin_of, registered_domain
 from .wiki import Api
 
@@ -95,19 +95,20 @@ def h_evaluate(ctx: Ctx, p: dict, job) -> dict:
     ev = evaluate.trial_crawl(ctx.svc, ctx.fetcher, cand, t, now)
     source_id = None
     if ev.state == "registered":
-        dup = resolve.find_existing(ctx.svc, cand["label"] or next(iter(ev.docs.values())).title, cand["host"])
+        first = next(iter(ev.pages.values()))
+        origin = origin_of(first.final_url)
+        host = urlparse(origin).netloc.lower()
+        alt = names.doc_names(next(iter(ev.docs.values())), host)
+        label = names.pick_name([cand["label"], *alt], host)   # CTA/QID labels never become the canonical name
+        dup = resolve.find_existing(ctx.svc, label, cand["host"])
         if dup:
             ev.state, ev.reason = "deprioritized", "duplicate_entity:" + dup
             ev.scores["duplicate"] = dup
     if ev.state == "registered":
-        first = next(iter(ev.pages.values()))
-        origin = origin_of(first.final_url)
-        host = urlparse(origin).netloc.lower()
         if store.is_blocked(host):
             ev.state, ev.reason = "rejected", "blocked_domain_after_redirect"
         else:
-            title = next(iter(ev.docs.values())).title
-            source_id = store.register_site(ctx.svc, origin, cand["label"] or title, now, target_id=t["id"],
+            source_id = store.register_site(ctx.svc, origin, label, now, target_id=t["id"], alt_names=alt,
                                             qid=(cand["origin_ref"].rsplit(":", 1)[-1] if cand["origin_ref"] and cand["origin_ref"].rsplit(":", 1)[-1].startswith("Q") else None))
     with transaction(ctx.svc):
         ctx.svc.execute("UPDATE pb_discovery_candidate SET state=?, reason=?, score_json=?, source_id=?, evaluated_at=? WHERE cand_id=?",
