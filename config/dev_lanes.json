@@ -1,11 +1,11 @@
 {
-  "_note": "준태님 2026-11-03 12:55 KST. Pitchboard dev-daemon stage lanes: first entry is primary, rest are backups in order.",
-  "design":        ["codex:gpt-6-astra", "deepseek:deepseek-flash", "glm", "swe2:swe-2-high"],
-  "design_review": ["deepseek:deepseek-flash", "codex:gpt-6.1-sol", "glm", "swe2:swe-2-high"],
-  "build":         ["codex:gpt-6.1-sol", "deepseek:deepseek-flash", "glm", "swe2:swe-2-high"],
-  "build_review":  ["glm", "deepseek:deepseek-flash", "codex:gpt-6.1-sol", "swe2:swe-2-high"],
-  "review_fix":    ["deepseek:deepseek-flash", "codex:gpt-6.1-sol", "glm", "swe2:swe-2-high"],
-  "re_review":     ["devin:adaptive", "deepseek:deepseek-flash", "codex:gpt-6.1-sol", "swe2:swe-2-high"],
-  "audit":         ["codex:gpt-6-astra", "glm", "swe2:swe-2-high"],
+  "_note": "준태님 2026-11-03 12:55 KST. Pitchboard dev-daemon stage lanes: first entry is primary, rest are backups in order. 2026-11-11: Qwen4-Max (qwen4-max-preview) is the first backup on every stage.",
+  "design":        ["codex:gpt-6-astra", "qwen:qwen4-max-preview", "deepseek:deepseek-flash", "glm", "swe2:swe-2-high"],
+  "design_review": ["deepseek:deepseek-flash", "qwen:qwen4-max-preview", "codex:gpt-6.1-sol", "glm", "swe2:swe-2-high"],
+  "build":         ["codex:gpt-6.1-sol", "qwen:qwen4-max-preview", "deepseek:deepseek-flash", "glm", "swe2:swe-2-high"],
+  "build_review":  ["glm", "qwen:qwen4-max-preview", "deepseek:deepseek-flash", "codex:gpt-6.1-sol", "swe2:swe-2-high"],
+  "review_fix":    ["deepseek:deepseek-flash", "qwen:qwen4-max-preview", "codex:gpt-6.1-sol", "glm", "swe2:swe-2-high"],
+  "re_review":     ["devin:adaptive", "qwen:qwen4-max-preview", "deepseek:deepseek-flash", "codex:gpt-6.1-sol", "swe2:swe-2-high"],
+  "audit":         ["codex:gpt-6-astra", "qwen:qwen4-max-preview", "glm", "swe2:swe-2-high"],
   "audit_every_prs": 10
 }
