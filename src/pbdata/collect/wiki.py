@@ -10,6 +10,7 @@ import urllib.request
 from typing import Dict, List, Optional
 
 from .net import USER_AGENT
+from . import egress
 
 API_UA = os.environ.get("PITCHBOARD_API_UA", "PitchboardBot/0.1 (research collector; contact hanset@soulbound.co.kr)")
 
@@ -34,8 +35,11 @@ class Api:
         url = base + "?" + urllib.parse.urlencode(params)
         req = urllib.request.Request(url, headers={"User-Agent": API_UA, "Accept": accept})
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                return json.loads(r.read(8_000_000).decode("utf-8", "replace"))
+            with egress.urlopen(req, timeout=timeout) as r:
+                data = r.read(8_000_000)
+            if egress.configured_proxy():
+                egress.log_traffic(len(data), urllib.parse.urlparse(url).hostname or "")
+            return json.loads(data.decode("utf-8", "replace"))
         except (urllib.error.URLError, OSError, ValueError):
             self.errors += 1
             return None
