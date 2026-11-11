@@ -86,7 +86,8 @@ class Api:
                     if v and c.get("rank") != "deprecated":
                         sites.append(v)
                 lab = e.get("labels", {})
-                out[q] = {"label": (lab.get("en") or lab.get("ko") or {}).get("value", q), "sites": sites,
+                # no en/ko label -> empty, never the bare QID (a QID is not a name; downstream falls back to title/host)
+                out[q] = {"label": (lab.get("en") or lab.get("ko") or {}).get("value", ""), "sites": sites,
                           "desc": (e.get("descriptions", {}).get("en") or e.get("descriptions", {}).get("ko") or {}).get("value", "")}
         return out
 

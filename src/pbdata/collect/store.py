@@ -13,6 +13,7 @@ from .. import timeutil
 from ..db import transaction
 from ..ids import new_id, sha256_hex, stable_id
 from ..rules import sanitize_excerpt
+from . import names
 from .net import normalize_url, origin_of, registered_domain
 
 CONFIG = Path(__file__).resolve().parents[3] / "config"
@@ -53,16 +54,18 @@ def _ms(now: str) -> int:
 
 def register_site(svc: sqlite3.Connection, origin: str, label: str, now: str, *, target_id: str, qid: Optional[str] = None,
                   authority: str = "official_primary", permission: str = "allowed_public", basis: str = "robots_allow+trial_crawl",
-                  source_type: str = "official_guidelines", max_epistemic: str = "verified_fact") -> str:
+                  source_type: str = "official_guidelines", max_epistemic: str = "verified_fact",
+                  alt_names: Iterable[str] = ()) -> str:
     host = urlparse(origin).netloc.lower()
+    name = names.pick_name([label, *alt_names], host)      # reject CTA/QID/URL labels; fall back, never invent
     sid = stable_id("src", origin + "/")
     with transaction(svc):
         if svc.execute("SELECT 1 FROM pb_source WHERE source_id=?", (sid,)).fetchone() is None:
             oid = new_id("out", _ms(now))
-            svc.execute("INSERT INTO pb_outlet(outlet_id,canonical_name,created_at) VALUES(?,?,?)", (oid, label[:120] or host, now))
+            svc.execute("INSERT INTO pb_outlet(outlet_id,canonical_name,created_at) VALUES(?,?,?)", (oid, name, now))
             svc.execute("INSERT INTO pb_source(source_id,canonical_url,host,source_type,authority,owner_outlet_id,owner_name,permission,"
                         "permission_basis,permission_checked_on,max_epistemic,refresh_hours) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (sid, origin + "/", host, source_type, authority, oid, label[:120], permission, basis, now[:10], max_epistemic, 24))
+                        (sid, origin + "/", host, source_type, authority, oid, name, permission, basis, now[:10], max_epistemic, 24))
             svc.execute("INSERT INTO pb_source_site(source_id,outlet_id,origin,registered_domain,in_seed_list,wikidata_qid,target_id) VALUES(?,?,?,?,?,?,?)",
                         (sid, oid, origin, registered_domain(host), 1 if is_seed(host) else 0, qid, target_id))
             svc.execute("INSERT OR IGNORE INTO pb_target_hit VALUES(?,?,?,?,?)", (target_id, "source", sid, now, 1 if is_seed(host) else 0))
