@@ -173,6 +173,34 @@ def load_key(env=None, path=None):
     return value
 
 
+QWEN_KEY_PATH = Path("/home/box/.qwen/token_plan_key")
+
+
+def load_qwen_key(path=None):
+    """Return the Qwen token-plan key, or "" if the file is absent.
+
+    A missing key disables fallback. An existing but unsafe or malformed
+    file raises, so a bad credential is never used. The value is never logged.
+    """
+    path = Path(path) if path is not None else QWEN_KEY_PATH
+    try:
+        path = no_symlinks(path)
+        if not path.exists():
+            return ""
+        with secure_open(path, "r", create=False) as f:
+            text = f.read(65537)
+        if len(text) > 65536:
+            raise Stop("invalid_credentials")
+        value = text.strip()
+    except Stop:
+        raise
+    except Exception:
+        return ""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,512}", value):
+        raise Stop("invalid_credentials")
+    return value
+
+
 def no_symlinks(path):
     path = Path(os.path.abspath(path))
     if any(p.is_symlink() for p in (path, *path.parents)):

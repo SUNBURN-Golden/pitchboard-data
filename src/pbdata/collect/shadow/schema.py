@@ -252,17 +252,30 @@ def support_reason(field, value, quote, doc, as_of):
     return None
 
 
-def request_body(doc, as_of, config):
-    return {"model": "deepseek-flash", "messages": [
+QWEN_MODEL = "qwen4-max-preview"
+DEEPSEEK_MODELS = ("deepseek-flash", "DeepSeek-V4.1-Flash-1017")
+QWEN_MODELS = (QWEN_MODEL, "qwen4.0-max-preview")
+
+
+def request_body(doc, as_of, config, provider="deepseek"):
+    messages = [
         {"role": "system", "content": PROMPT},
-        {"role": "user", "content": dumps({"as_of": as_of, "page_text": doc.text()})}],
-        "thinking": {"type": "disabled"}, "temperature": 0, "top_p": 1,
-        "max_tokens": config["max_output_tokens"], "response_format": {"type": "json_object"},
-        "stream": False, "tool_choice": "none"}
+        {"role": "user", "content": dumps({"as_of": as_of, "page_text": doc.text()})}]
+    body = {"messages": messages, "temperature": 0, "top_p": 1,
+            "max_tokens": config["max_output_tokens"], "response_format": {"type": "json_object"},
+            "stream": False, "tool_choice": "none"}
+    if provider == "qwen":
+        body["model"] = QWEN_MODEL
+        body["enable_thinking"] = False
+    else:
+        body["model"] = "deepseek-flash"
+        body["thinking"] = {"type": "disabled"}
+    return body
 
 
-def response(raw, doc, as_of, config):
-    if not isinstance(raw, dict) or raw.get("model") not in ("deepseek-flash", "DeepSeek-V4.1-Flash-1017"):
+def response(raw, doc, as_of, config, provider="deepseek"):
+    allowed = QWEN_MODELS if provider == "qwen" else DEEPSEEK_MODELS
+    if not isinstance(raw, dict) or raw.get("model") not in allowed:
         raise Stop("model_mismatch")
     usage = raw.get("usage")
     if not isinstance(usage, dict) or not all(type(usage.get(k)) is int and usage[k] >= 0 for k in ("prompt_tokens", "completion_tokens", "total_tokens")):

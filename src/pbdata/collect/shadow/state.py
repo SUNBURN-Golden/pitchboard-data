@@ -20,6 +20,21 @@ def reservation(config):
             Decimal(1000000)).quantize(Decimal("0.0000001"), rounding=ROUND_CEILING)
 
 
+def _call_units(reserved_usd, result, unit):
+    if result:
+        rec = loads(result)
+        calls = rec.get("provider_calls")
+        if type(calls) is int and calls >= 1:
+            return calls
+    return max(1, int((money(reserved_usd) / unit).to_integral_value(rounding=ROUND_CEILING)))
+
+
+def day_usage(conn, day, unit):
+    rows = list(conn.execute("SELECT reserved_usd, result FROM attempts WHERE day=?", (day,)))
+    costs = [money(r[0]) for r in rows]
+    return costs, sum(_call_units(r[0], r[1], unit) for r in rows)
+
+
 def read_history(root):
     """Read completed attempts from an initialized private ledger, read-only.
 
@@ -237,13 +252,14 @@ class State:
             raise Stop("experiment_halted")
         day = now.date().isoformat()
         charge = reservation(config)
-        costs = [money(r[0]) for r in conn.execute("SELECT reserved_usd FROM attempts WHERE day=?", (day,))]
+        costs, calls = day_usage(conn, day, charge)
         mode = config["monetary_cap"]
         if mode not in ("enforced", "none"):
             raise Stop("invalid_config")
         # The ceiling is always recorded. Only enforced mode also stops on the dollar sum.
+        # Fallback provider calls share this cap: each API invocation is one unit.
         over_cost = mode == "enforced" and sum(costs, Decimal(0)) + charge > money(config["daily_cost_cap_usd"])
-        if len(costs) >= config["daily_call_cap"] or over_cost:
+        if calls >= config["daily_call_cap"] or over_cost:
             raise Stop("budget_exhausted")
 
     def reserve(self, conn, config, dedup, now):
@@ -261,6 +277,31 @@ class State:
         conn.execute("UPDATE meta SET value=? WHERE key='watermark'", (time,))
         conn.commit()
         return attempt_id, day, str(charge)
+
+    def reserve_fallback(self, conn, config, now, attempt_id):
+        """Charge one extra call on an in-flight attempt before a Qwen retry."""
+        if conn.execute("SELECT value FROM meta WHERE key='halted'").fetchone()[0]:
+            raise Stop("experiment_halted")
+        time = now.isoformat()
+        last = conn.execute("SELECT value FROM meta WHERE key='watermark'").fetchone()[0]
+        if last and time < last:
+            raise Stop("clock_backwards")
+        row = conn.execute("SELECT day, reserved_usd, result FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+        if row is None or row["result"] is not None:
+            raise Stop("shadow_state_error")
+        charge = reservation(config)
+        costs, calls = day_usage(conn, row["day"], charge)
+        mode = config["monetary_cap"]
+        if mode not in ("enforced", "none"):
+            raise Stop("invalid_config")
+        over_cost = mode == "enforced" and sum(costs, Decimal(0)) + charge > money(config["daily_cost_cap_usd"])
+        if calls >= config["daily_call_cap"] or over_cost:
+            raise Stop("budget_exhausted")
+        new_reserved = money(row["reserved_usd"]) + charge
+        conn.execute("UPDATE attempts SET reserved_usd=? WHERE id=? AND result IS NULL", (str(new_reserved), attempt_id))
+        conn.execute("UPDATE meta SET value=? WHERE key='watermark'", (time,))
+        conn.commit()
+        return str(new_reserved)
 
     def finish(self, conn, record):
         if record["outcome"] in ("model_mismatch", "usage_invariant"):

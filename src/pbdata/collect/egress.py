@@ -5,8 +5,10 @@ through that proxy with remote DNS (SOCKS5h). The proxy must be a loopback
 address. If the variable is set but invalid, or the proxy is unreachable,
 fetches fail and never fall back to a direct connect.
 
-DeepSeek calls in ``shadow.runner.provider`` do not use this module and keep
-an empty ProxyHandler so they stay direct.
+LLM provider calls in ``shadow.runner.provider`` (DeepSeek and the Qwen
+fallback) do not use this module and keep an empty ProxyHandler so they stay
+direct. Only the allowlisted hosts ``api.deepseek.com`` and
+``token-plan.maas.qwencloudapi.com`` are reached.
 """
 from __future__ import annotations
 
