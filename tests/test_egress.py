@@ -370,6 +370,39 @@ class ChromeAndProviderTests(unittest.TestCase):
         self.assertEqual(build.return_value.open.call_args.args[0].full_url, runner.ENDPOINT)
         self.assertTrue(runner.ENDPOINT.startswith("https://api.deepseek.com"))
 
+    def test_qwen_provider_ignores_socks_and_env_proxies(self):
+        key = "sk-test-not-a-real-key"
+        payload = {"model": "qwen4-max-preview", "choices": [{"message": {"content": "{}"}}]}
+
+        class Response:
+            status = 200
+            headers = type("Headers", (), {"get_content_type": lambda _: "application/json"})()
+            def __enter__(self):
+                return self
+            def __exit__(self, *_):
+                pass
+            def read(self, limit):
+                return json.dumps(payload).encode()
+
+        env = {
+            egress.ENV_PROXY: "socks5h://127.0.0.1:1080",
+            "HTTPS_PROXY": "http://127.0.0.1:9",
+            "HTTP_PROXY": "http://127.0.0.1:9",
+            "ALL_PROXY": "socks5h://127.0.0.1:1080",
+        }
+        with patch.dict(os.environ, env), patch.object(egress, "socks5h_connect", side_effect=AssertionError("qwen must stay direct")):
+            with patch.object(runner.urllib.request, "build_opener") as build:
+                build.return_value.open.return_value = Response()
+                raw = runner.qwen_provider({"model": "qwen4-max-preview"}, key, 30)
+        self.assertEqual(raw["model"], "qwen4-max-preview")
+        args = build.call_args.args
+        self.assertEqual(args[0].proxies, {})
+        self.assertIs(args[1], runner.NoRedirect)
+        self.assertEqual(len(args), 2)
+        self.assertEqual(build.return_value.open.call_args.args[0].full_url, runner.QWEN_ENDPOINT)
+        self.assertTrue(runner.QWEN_ENDPOINT.startswith("https://token-plan.maas.qwencloudapi.com"))
+        self.assertIn("token-plan.maas.qwencloudapi.com", runner.ALLOWED_PROVIDER_HOSTS)
+
 
 class MediaHelperTests(unittest.TestCase):
     def test_detects_types_and_extensions(self):

@@ -9,7 +9,9 @@ from pathlib import Path
 import urllib.error
 import urllib.request
 
-from .common import CONFIG, Stop, digest, dumps, load_config, load_key, loads, utcnow
+from urllib.parse import urlsplit
+
+from .common import CONFIG, Stop, digest, dumps, load_config, load_key, load_qwen_key, loads, utcnow
 from .policy import PolicyFetcher, canonical_url
 from .schema import VERSION, PROMPT_HASH, SCHEMA_HASH, request_body, response
 from .state import State
@@ -20,6 +22,15 @@ from ...profiles import pitchboard as prof
 from ...model import EMAIL_RE, PHONE_RE
 
 ENDPOINT = "https://api.deepseek.com/chat/completions"
+QWEN_ENDPOINT = "https://token-plan.maas.qwencloudapi.com/compatible-mode/v1/chat/completions"
+ALLOWED_PROVIDER_HOSTS = frozenset({"api.deepseek.com", "token-plan.maas.qwencloudapi.com"})
+FALLBACK_CODES = frozenset({"provider_error", "provider_http_error"})
+RECORD_STOPS = frozenset({
+    "provider_http_error", "provider_too_large", "provider_error", "duplicate_json_key",
+    "invalid_json_number", "model_mismatch", "invalid_usage", "usage_invariant",
+    "invalid_completion", "invalid_model_json", "invalid_schema", "credential_in_response",
+    "dispatch_clock_changed", "inactive_window", "disabled", "invalid_config", "config_changed",
+    "budget_exhausted", "expired_pricing"})
 
 
 def baseline(doc, as_of):
@@ -53,10 +64,13 @@ def runtime_commit():
         return "unknown"
 
 
-def provider(body, key, timeout):
-    """Fixed endpoint, verified TLS, no proxies, redirects, tools, or retries."""
+def provider(body, key, timeout, endpoint=ENDPOINT):
+    """Fixed allowlisted HTTPS endpoint, verified TLS, no proxies, redirects, tools, or retries."""
+    parts = urlsplit(endpoint)
+    if parts.scheme != "https" or parts.port not in (None, 443) or parts.hostname not in ALLOWED_PROVIDER_HOSTS:
+        raise Stop("blocked_network")
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
-    req = urllib.request.Request(ENDPOINT, data=dumps(body).encode("utf-8"), method="POST",
+    req = urllib.request.Request(endpoint, data=dumps(body).encode("utf-8"), method="POST",
                                  headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
     try:
         with opener.open(req, timeout=timeout) as resp:
@@ -73,12 +87,21 @@ def provider(body, key, timeout):
         raise Stop("provider_error") from None
 
 
+def qwen_provider(body, key, timeout):
+    return provider(body, key, timeout, endpoint=QWEN_ENDPOINT)
+
+
+def _stop_code(exc):
+    return str(exc) if str(exc) in RECORD_STOPS else "provider_error"
+
+
 class ShadowRunner:
     def __init__(self, config=CONFIG, clock=utcnow):
         self.config_path, self.clock = config, clock
 
     def run(self, *, shadow_root, url=None, page=None, as_of=None, fetcher=None,
-            transport=None, key_loader=None, extra_protected=(), target=None, digest_languages=(), batch_day=None):
+            transport=None, key_loader=None, fallback_transport=None, fallback_key_loader=None,
+            extra_protected=(), target=None, digest_languages=(), batch_day=None):
         """Disabled path has no side effects. A Page is accepted for cached eval only."""
         try:
             config = load_config(self.config_path, self.clock())
@@ -154,37 +177,75 @@ class ShadowRunner:
                           "as_of_source": "frozen cohort KST calendar date" if page.provenance == "offline_cached" else "UTC calendar date",
                           "baseline": rules, "gap_target": target,
                           "requested_model": config["model"], "returned_model": None,
+                          "provider": "deepseek", "provider_calls": 1, "fallback_from": None,
                           "reserved_usd": cost, "charged_ceiling_usd": cost, "usage": None,
                           "fields": None, "validation_reasons": {}, "outcome": "unknown"}
                 start = time.monotonic()
+                primary = transport or provider
+                # Custom transports stay primary-only unless a fallback is injected.
+                fb_transport = fallback_transport or (qwen_provider if transport is None else None)
+                secrets = [key]
                 try:
                     dispatch = self.clock()
                     if load_config(self.config_path, dispatch) != config:
                         raise Stop("config_changed")
                     if dispatch.date().isoformat() != day or dispatch < now:
                         raise Stop("dispatch_clock_changed")
-                    raw = (transport or provider)(body, key, config["timeout_seconds"])
+                    raw = primary(body, key, config["timeout_seconds"])
                     if key in dumps(raw):
                         raise Stop("credential_in_response")
                     fields, reasons, usage = response(raw, doc, as_of, config)
                     record.update(fields=fields, validation_reasons=reasons, usage=usage,
-                                  returned_model=raw["model"], outcome="ok")
+                                  returned_model=raw["model"], outcome="ok", provider="deepseek")
                 except Stop as exc:
                     # Only local fixed reasons; an injected transport cannot leak text.
-                    allowed = {"provider_http_error", "provider_too_large", "provider_error", "duplicate_json_key",
-                               "invalid_json_number", "model_mismatch", "invalid_usage", "usage_invariant",
-                               "invalid_completion", "invalid_model_json", "invalid_schema", "credential_in_response",
-                               "dispatch_clock_changed", "inactive_window", "disabled", "invalid_config", "config_changed",
-                               "budget_exhausted", "expired_pricing"}
-                    record["outcome"] = str(exc) if str(exc) in allowed else "provider_error"
+                    record["outcome"] = _stop_code(exc)
                 except Exception:
                     record["outcome"] = "provider_error"
+                if record["outcome"] in FALLBACK_CODES and fb_transport is not None:
+                    fb_key = ""
+                    try:
+                        fb_key = (fallback_key_loader or load_qwen_key)()
+                    except Stop:
+                        fb_key = ""
+                    qwen_body = request_body(doc, as_of, config, provider="qwen")
+                    if fb_key and fb_key not in dumps(qwen_body) and fb_key not in dumps(target) and fb_key not in requested:
+                        secrets.append(fb_key)
+                        try:
+                            dispatch = self.clock()
+                            if load_config(self.config_path, dispatch) != config:
+                                raise Stop("config_changed")
+                            if dispatch.date().isoformat() != day or dispatch < now:
+                                raise Stop("dispatch_clock_changed")
+                            new_cost = state.reserve_fallback(conn, config, dispatch, attempt)
+                            record["reserved_usd"] = new_cost
+                            record["charged_ceiling_usd"] = new_cost
+                            record["provider_calls"] = 2
+                            record["fallback_from"] = record["outcome"]
+                            record["provider"] = "qwen"
+                            raw = fb_transport(qwen_body, fb_key, config["timeout_seconds"])
+                            if any(s in dumps(raw) for s in secrets):
+                                raise Stop("credential_in_response")
+                            fields, reasons, usage = response(raw, doc, as_of, config, provider="qwen")
+                            record.update(fields=fields, validation_reasons=reasons, usage=usage,
+                                          returned_model=raw["model"], outcome="ok")
+                        except Stop as exc:
+                            if record["provider_calls"] == 1:
+                                # Fallback was not charged; keep the primary failure.
+                                record["provider"] = "deepseek"
+                                record["fallback_from"] = None
+                            else:
+                                record["outcome"] = _stop_code(exc)
+                                record["provider"] = "qwen"
+                        except Exception:
+                            record["outcome"] = "provider_error"
+                            record["provider"] = "qwen"
                 from .review import reviews
                 record["reviews"] = reviews(record)
                 from .digest import drafts
                 record["digest_drafts"] = drafts(record, digest_languages)
                 record["latency_ms"] = round((time.monotonic() - start) * 1000)
-                if key in dumps(record):
+                if any(s in dumps(record) for s in secrets):
                     raise Stop("credential_in_record")
                 state.finish(conn, record)
                 return record

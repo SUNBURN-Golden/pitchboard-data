@@ -47,7 +47,10 @@ No automatic fetching of social sites. A human drops `$ROOT/inbox/manual_clips/*
 
 Daily collector jobs (`scripts/daily.sh`, `scripts/daemon_daily.sh`, and the DeepSeek shadow wrapper) set
 `PITCHBOARD_SOCKS5_PROXY=socks5h://127.0.0.1:1080` and fail closed if that loopback proxy is down: the run is skipped
-and no fetch falls back to the box IP. DNS for those fetches is resolved by the proxy. DeepSeek API calls
-(`api.deepseek.com` via `shadow.runner.provider`) stay direct and still ignore `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`.
+and no fetch falls back to the box IP. DNS for those fetches is resolved by the proxy. LLM API calls
+(`api.deepseek.com` and, on DeepSeek failure only, `token-plan.maas.qwencloudapi.com` via
+`shadow.runner.provider`) stay direct and still ignore `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`.
+A Qwen fallback call counts toward the same daily call cap. If both providers fail, the attempt
+is recorded and the batch skips to the next target.
 Headless Chromium uses `--proxy-server=socks5://127.0.0.1:1080` with remote DNS and blocks images, fonts, and media.
 Bytes fetched through the proxy are appended to `$PB_DATA_ROOT/logs/proxy_traffic.log`.
