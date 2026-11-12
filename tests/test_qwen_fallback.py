@@ -88,6 +88,17 @@ class QwenFallbackTests(Harness):
         self.assertEqual(result["provider_calls"], 1)
         self.assertEqual(len(self.calls), 1)
 
+    def test_returned_qwen_alias_is_accepted(self):
+        def qwen(*_):
+            raw = qwen_completion()
+            raw["model"] = "qwen4.0-max-preview"
+            return raw
+
+        result = self.fallback(qwen=qwen)
+        self.assertEqual(result["outcome"], "ok")
+        self.assertEqual(result["provider"], "qwen")
+        self.assertEqual(result["returned_model"], "qwen4.0-max-preview")
+
     def test_validation_failure_does_not_fall_back(self):
         raw = completion()
         raw["model"] = "other-model"

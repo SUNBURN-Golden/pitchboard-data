@@ -254,7 +254,7 @@ def support_reason(field, value, quote, doc, as_of):
 
 QWEN_MODEL = "qwen4-max-preview"
 DEEPSEEK_MODELS = ("deepseek-flash", "DeepSeek-V4.1-Flash-1017")
-QWEN_MODELS = (QWEN_MODEL,)
+QWEN_MODELS = (QWEN_MODEL, "qwen4.0-max-preview")
 
 
 def request_body(doc, as_of, config, provider="deepseek"):
