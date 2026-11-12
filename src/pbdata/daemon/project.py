@@ -7,7 +7,7 @@ import json
 from typing import Dict, List, Optional
 
 from ..ids import sha256_hex
-from .. import timeutil
+from .. import facts, timeutil
 from ..collect import names
 
 # ontology chain: outlet/organizer -> call edition -> genre & eligibility -> pay/fee/rights -> deadline
@@ -23,10 +23,11 @@ def _fact_view(svc, f) -> dict:
                      "JOIN pb_source s ON s.source_id=e.source_id WHERE e.evidence_id=?", (f["evidence_id"],)).fetchone() if f["evidence_id"] else None
     src = svc.execute("SELECT canonical_url, source_type FROM pb_source WHERE source_id=?", (f["source_id"],)).fetchone()
     now = timeutil.iso(timeutil.utcnow())
-    stale = bool(f["fresh_until"] and f["fresh_until"] < now)
+    fresh_until = facts.effective_fresh_until(svc, f["fact_id"])
+    stale = bool(fresh_until and fresh_until < now)
     return {"fact_id": f["fact_id"], "value": json.loads(f["value_json"]) if f["value_json"] else None, "value_state": f["value_state"],
             "epistemic": f["epistemic"], "stale": stale, "collected_at": f["collected_at"], "effective_from": f["effective_from"],
-            "effective_to": f["effective_to"], "fresh_until": f["fresh_until"], "conflict_group_id": f["conflict_group_id"],
+            "effective_to": f["effective_to"], "fresh_until": fresh_until, "conflict_group_id": f["conflict_group_id"],
             "source": {"url": src["canonical_url"], "type": src["source_type"]},
             "evidence": None if ev is None else {"url": ev["canonical_url"], "excerpt": ev["excerpt"], "heading": ev["heading"],
                                                  "paragraph": ev["paragraph_index"], "chars": [ev["char_start"], ev["char_end"]]}}
