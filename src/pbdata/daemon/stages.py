@@ -7,7 +7,7 @@ import json
 import os
 from typing import Dict, List
 
-from .. import timeutil
+from .. import facts, timeutil
 from ..ids import sha256_hex, stable_id
 from ..model import ValidationError
 from .. import statemachine
@@ -156,8 +156,10 @@ def s_evidence_verification(c: RunContext) -> dict:
             bad["ai_as_fact"].append(r["fact_id"])
         if r["value_state"] in ("stated", "explicitly_none") and not r["evidence_id"]:
             bad["stated_without_evidence"].append(r["fact_id"])
-        if r["epistemic"] == "verified_fact" and r["fresh_until"] and r["fresh_until"] < now:
-            stale_verified += 1
+        if r["epistemic"] == "verified_fact":
+            fresh_until = facts.effective_fresh_until(c.svc, r["fact_id"])
+            if fresh_until and fresh_until < now:
+                stale_verified += 1
     for code, ids in bad.items():
         for fid in ids:
             c.infra.execute("INSERT INTO failure_queue(failure_id,stage,subject_id,input_digest,error_code,first_seen,last_seen,attempts,resume_from)"
@@ -255,7 +257,8 @@ def s_quality_check(c: RunContext) -> dict:
     q["verified_without_evidence"] = svc.execute("SELECT count(*) FROM pb_fact WHERE superseded_at IS NULL AND epistemic='verified_fact' AND evidence_id IS NULL").fetchone()[0]
     q["ai_facts_promoted"] = svc.execute("SELECT count(*) FROM pb_fact WHERE extractor LIKE 'ai:%' AND epistemic NOT IN ('ai_inference','unverified')").fetchone()[0]
     q["manual_clip_above_claim"] = svc.execute("SELECT count(*) FROM pb_fact f JOIN pb_source s ON s.source_id=f.source_id WHERE s.source_type='manual_clip' AND f.epistemic='verified_fact'").fetchone()[0]
-    q["stale_live_facts"] = svc.execute("SELECT count(*) FROM pb_fact WHERE superseded_at IS NULL AND fresh_until IS NOT NULL AND fresh_until<?", (now,)).fetchone()[0]
+    q["stale_live_facts"] = svc.execute("SELECT count(*) FROM pb_fact f WHERE superseded_at IS NULL AND fresh_until IS NOT NULL AND fresh_until<? "
+                                          "AND NOT EXISTS (SELECT 1 FROM pb_fact_confirmation c WHERE c.fact_id=f.fact_id AND c.fresh_until>=?)", (now, now)).fetchone()[0]
     q["conflicts_open"] = svc.execute("SELECT count(*) FROM pb_conflict_group WHERE resolved_at IS NULL").fetchone()[0]
     q["dead_letter_jobs"] = c.infra.execute("SELECT count(*) FROM job WHERE state='dead'").fetchone()[0]
     q["failure_queue_open"] = c.infra.execute("SELECT count(*) FROM failure_queue WHERE state='open'").fetchone()[0]
