@@ -13,8 +13,11 @@ direct. Only the allowlisted hosts ``api.deepseek.com`` and
 from __future__ import annotations
 
 import ipaddress
+import math
 import os
 import socket
+import sys
+import time
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Tuple
@@ -96,6 +99,40 @@ def preflight(timeout: float = 5.0) -> Tuple[str, int]:
     finally:
         sock.close()
     return proxy
+
+
+def _wait_env(name, default, parse):
+    try:
+        value = parse(os.environ.get(name, str(default)))
+        if value < 0 or not math.isfinite(value):
+            return default
+        return value
+    except (ValueError, OverflowError):
+        return default
+
+
+def wait_for_proxy(attempts=None, interval=None, timeout=5.0, sleep=time.sleep, log=None):
+    """Wait for loopback SOCKS5 readiness; configuration errors fail immediately.
+
+    Environment defaults allow 10 attempts, 60 seconds apart. No direct
+    connection is attempted, and the final preflight OSError is preserved.
+    """
+    if attempts is None:
+        attempts = _wait_env("PITCHBOARD_PROXY_WAIT_ATTEMPTS", 10, int)
+    if interval is None:
+        interval = _wait_env("PITCHBOARD_PROXY_WAIT_INTERVAL_S", 60, float)
+    attempts = max(1, attempts)
+    for attempt in range(1, attempts + 1):
+        try:
+            return preflight(timeout=timeout)
+        except ProxyConfigError:
+            raise
+        except OSError as exc:
+            if log is not None:
+                log("socks5 proxy attempt %d/%d failed: %s" % (attempt, attempts, exc))
+            if attempt == attempts:
+                raise
+            sleep(interval)
 
 
 def is_binary_media(url: str, content_type: str = "") -> bool:
@@ -267,3 +304,13 @@ class SocksHTTPSHandler(urllib.request.HTTPSHandler):
         def factory(*args, **kwargs):
             return SocksHTTPSConnection(*args, proxy=self._pb_proxy, **kwargs)
         return self.do_open(factory, req, context=self._context)
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] != ["wait"]:
+        sys.exit("usage: python3 -m pbdata.collect.egress wait")
+    try:
+        wait_for_proxy(log=lambda line: print(line, file=sys.stderr))
+    except OSError as exc:
+        print("socks5 proxy unavailable: %s" % exc, file=sys.stderr)
+        sys.exit(1)

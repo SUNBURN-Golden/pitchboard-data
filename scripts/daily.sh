@@ -15,7 +15,7 @@ export PYTHONPATH=$REPO/src
 export PITCHBOARD_SOCKS5_PROXY="${PITCHBOARD_SOCKS5_PROXY:-socks5h://127.0.0.1:1080}"
 export PITCHBOARD_PROXY_TRAFFIC_LOG="${PITCHBOARD_PROXY_TRAFFIC_LOG:-$ROOT/logs/proxy_traffic.log}"
 mkdir -p "$ROOT/logs"
-if ! python3 -c 'from pbdata.collect.egress import preflight; preflight()'; then
+if ! python3 -m pbdata.collect.egress wait; then
   echo "$(date -Is) socks5 proxy unavailable; skipping collector run" >> "$LOG"
   exit 0
 fi
