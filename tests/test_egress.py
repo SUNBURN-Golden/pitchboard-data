@@ -206,6 +206,68 @@ class ConfiguredProxyTests(unittest.TestCase):
                     egress.configured_proxy()
 
 
+class WaitForProxyTests(unittest.TestCase):
+    def test_greeting_immediate_and_recovery(self):
+        for failures in (0, 3):
+            with self.subTest(failures=failures):
+                proxy = ("127.0.0.1", 1080)
+                sleeps, logs = [], []
+                with patch.dict(os.environ, {egress.ENV_PROXY: "%s:%d" % proxy}):
+                    with patch.object(egress.socket, "create_connection") as connect:
+                        sock = connect.return_value
+                        sock.recv.side_effect = [b"\x05\xff"] * failures + [b"\x05\x00"]
+                        result = egress.wait_for_proxy(attempts=5, interval=7, timeout=1,
+                                                       sleep=sleeps.append, log=logs.append)
+                self.assertEqual(result, proxy)
+                self.assertEqual(connect.call_count, failures + 1)
+                self.assertEqual(connect.call_args.args, (proxy, 1))
+                self.assertEqual(sock.close.call_count, failures + 1)
+                self.assertEqual(sleeps, [7] * failures)
+                self.assertEqual(len(logs), failures)
+
+    def test_exhaustion_preserves_last_error_and_timeout(self):
+        errors = [OSError("down"), OSError("still down"), OSError("last")]
+        sleeps = []
+        with patch.object(egress, "preflight", side_effect=errors) as check:
+            with self.assertRaises(OSError) as ctx:
+                egress.wait_for_proxy(attempts=3, interval=2, timeout=0.25, sleep=sleeps.append)
+        self.assertIs(ctx.exception, errors[-1])
+        self.assertEqual(check.call_count, 3)
+        self.assertEqual(check.call_args.kwargs, {"timeout": 0.25})
+        self.assertEqual(sleeps, [2, 2])
+
+    def test_configuration_errors_are_not_retried(self):
+        for raw in ("", "garbage", "socks5h://8.8.8.8:1080"):
+            sleeps = []
+            with self.subTest(raw=raw), patch.dict(os.environ, {egress.ENV_PROXY: raw}):
+                with patch.object(egress, "preflight", wraps=egress.preflight) as check:
+                    with self.assertRaises(egress.ProxyConfigError):
+                        egress.wait_for_proxy(attempts=5, sleep=sleeps.append)
+                self.assertEqual(check.call_count, 1)
+                self.assertEqual(sleeps, [])
+
+    def test_environment_parsing_and_attempt_minimum(self):
+        cases = [
+            ({}, 10, 60),
+            ({"PITCHBOARD_PROXY_WAIT_ATTEMPTS": "3", "PITCHBOARD_PROXY_WAIT_INTERVAL_S": "0.5"}, 3, 0.5),
+            ({"PITCHBOARD_PROXY_WAIT_ATTEMPTS": "0", "PITCHBOARD_PROXY_WAIT_INTERVAL_S": "0"}, 1, 0),
+        ]
+        for invalid in ("bad", "", "-1", "nan", "inf", "-inf"):
+            cases.append(({"PITCHBOARD_PROXY_WAIT_ATTEMPTS": invalid,
+                           "PITCHBOARD_PROXY_WAIT_INTERVAL_S": invalid}, 10, 60))
+        for env, attempts, interval in cases:
+            with self.subTest(env=env), patch.dict(os.environ, env, clear=True):
+                sleeps = []
+                with patch.object(egress, "preflight", side_effect=OSError("down")) as check:
+                    with self.assertRaises(OSError):
+                        egress.wait_for_proxy(sleep=sleeps.append)
+                self.assertEqual(check.call_count, attempts)
+                self.assertEqual(sleeps, [interval] * (attempts - 1))
+        with patch.object(egress, "preflight", return_value=("127.0.0.1", 1080)) as check:
+            egress.wait_for_proxy(attempts=-2, sleep=lambda _: self.fail("unexpected sleep"))
+            self.assertEqual(check.call_count, 1)
+
+
 class HandshakeAndFetchTests(unittest.TestCase):
     def setUp(self):
         self.tmp = TemporaryDirectory()
