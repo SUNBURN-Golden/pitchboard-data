@@ -6,6 +6,9 @@ import json
 from typing import Dict, List
 
 
+Q1_REQUIRED = ("deadline.closes_on", "fee.submission")
+
+
 def _rows(svc) -> List[dict]:
     return [json.loads(r[0]) for r in svc.execute("SELECT payload FROM pb_search_projection ORDER BY call_id")]
 
@@ -32,7 +35,7 @@ def answer_all(svc) -> Dict[str, object]:
         d = {"call": p["call_id"], "owner": p["owner"]["name"], "status": p["status"], "closes_on": p["closes_on"], "applicable_now": p["applicable_now"]}
         d.update(extra or {})
         return d
-    q1 = [brief(p, {"bucket": bucket(p, ["deadline.closes_on"])}) for p in rows if p["applicable_now"] in ("yes", "maybe")]
+    q1 = [brief(p, {"bucket": bucket(p, Q1_REQUIRED)}) for p in rows if p["applicable_now"] in ("yes", "maybe")]
     def fee_answer(p):
         c = _cell(p, "fee.submission")
         if c["answer"] == "explicitly_none":
