@@ -49,6 +49,8 @@ Jobs live in the infra DB with an idempotency key (`kind|subject|run_tag`), 300 
 `priority = 0.30 novelty + 0.25 gap importance + 0.20 urgency(deadline) + 0.15 quality - 0.10 cost - 0.15 duplication - 0.20 min(1, failures/3)`.
 Checkpoints are written after every job. `PB_CRASH_AFTER_LEASE=n` kills the process while holding a lease (used for the resume proof).
 
+Refresh prioritizes sources backing live deadline/status facts that are stale or expire within 48 hours (including confirmations), soonest expiry first; past deadline dates are excluded. Configure the horizon with `PB_REFRESH_HORIZON_HOURS`. Canonical URLs with successful HTML/PDF/image fetches are preferred; remaining slots fill oldest-first within the same limit, without duplicate URLs. Compare top-40 coverage with `python scripts/eval_refresh_live_calls.py SERVICE_SQLITE [--now YYYY-MM-DDTHH:MM:SSZ]`; it queries a temporary read-only copy, defaults to the latest raw fetch time, and needs no infra DB.
+
 ## Alerts (extraction breakage)
 `extraction_breakage` (>=2 core fields before, 0 after on a changed page), `field_lost`, `segments_collapsed` (<30% of >=8), `page_gone`, `login_wall`, `challenge`, `denied_*`.
 Alerts do not delete or overwrite facts.
