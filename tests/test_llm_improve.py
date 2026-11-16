@@ -381,6 +381,30 @@ class ReportTests(Harness):
         self.assertEqual(report["field_coverage"]["deadline"]["accepted"], 1)
 
     @deserialize_required
+    def test_empty_object_record_zero_coverage_and_planner_done_parity(self):
+        from pbdata.collect.shadow.report import score_shadow
+        row = self.run_page(transport=lambda *_: completion({}))
+        self.assertEqual(row["outcome"], "ok")
+        self.assertEqual(row["fields"], dict.fromkeys(schema.FIELDS))
+        self.assertEqual(row["validation_reasons"], dict.fromkeys(schema.FIELDS, "missing_key"))
+        path = next(self.root.glob("data/shadow/llm_extract_*.jsonl"))
+        report = score_shadow([path], self.root, NOW, self.config, ledger_path=self.root / "budget.sqlite3")
+        self.assertEqual(report["counts"]["verified_unique_pages"], 1)
+        self.assertEqual(report["exclusions"], [])
+        for field in schema.FIELDS:
+            self.assertEqual(report["field_coverage"][field]["accepted"], 0)
+        # The done gate keys on outcome+hashes, not claims: a {} completion
+        # suppresses static retries exactly like an explicit all-null completion.
+        empty_plan = planner.plan(export(candidate()), history=state.read_history(self.root))
+        self.assertFalse(empty_plan["targets"])
+        self.assertEqual(empty_plan["reasons"]["skip_static_already_done"], 1)
+        self.root = self.base / "all_null"
+        nulls = self.run_page(transport=lambda *_: completion(dict.fromkeys(schema.FIELDS)))
+        self.assertEqual(nulls["outcome"], "ok")
+        self.assertEqual(nulls["validation_reasons"], {})
+        self.assertEqual(empty_plan, planner.plan(export(candidate()), history=state.read_history(self.root)))
+
+    @deserialize_required
     def test_offline_missing_gold_fee_denominators_cost_and_unfinished(self):
         row, path, score_shadow = self.inputs()
         self.run_page(url="https://example.org/failed", transport=lambda *_: (_ for _ in ()).throw(common.Stop("provider_error")))

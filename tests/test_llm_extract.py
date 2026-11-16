@@ -541,17 +541,38 @@ class SchemaShapeTests(unittest.TestCase):
                 self.assertIsNotNone(fields["deadline"])
                 self.assertEqual(reasons, {"pay": reason, "eligibility": "missing_key"})
 
+    def test_not_call_nulling_preserves_missing_key_on_absent_fields(self):
+        doc = Doc("html", segments=[Segment(0, "p", "Winners announced for the 2026 contest."),
+                                    Segment(1, "p", "We pay USD 100 per story.")])
+        raw = {**proposal(), "deadline": None, "eligibility": None}
+        raw["open_call"] = {"value": {"is_real_call": False, "status": "not_call"},
+                            "quote": "Winners announced for the 2026 contest."}
+        del raw["submission_fee"]
+        shape = {}
+        fields, reasons = schema.validate(raw, doc, "2026-11-05", schema_shape=shape)
+        self.assertIsNotNone(fields["open_call"])
+        for field in schema.FIELDS[1:]:
+            self.assertIsNone(fields[field])
+        # The nulling loop only touches present claims; absent keys keep missing_key.
+        self.assertEqual(reasons, {"pay": "not_call", "submission_fee": "missing_key"})
+        self.assertEqual(shape, shape_summary(missing=["submission_fee"]))
+
     def test_extra_wrapper_and_non_dict_shapes_fail_closed(self):
         cases = [
             ({**proposal(), "extra": "value_sentinel"}, shape_summary(extra=["extra"])),
             ({"extra": "value_sentinel"}, shape_summary(missing=schema.FIELDS, extra=["extra"])),
             ({"result": proposal()}, shape_summary(missing=schema.FIELDS, extra=["result"])),
+            # Unsafe-only extras: nothing echoable, so extra stays empty and the
+            # invalid-charset names are counted, never stringified.
+            ({**proposal(), "Pay": "value_sentinel"}, shape_summary(redacted=1)),
+            ({**proposal(), "Pay": "value_sentinel", "대상": "value_sentinel"}, shape_summary(redacted=2)),
         ]
         cases += [(raw, shape_summary(top_type=label)) for raw, label in
                   [([], "list"), ("value_sentinel", "str"), (1, "int"), (1.5, "float"),
                    (True, "bool"), (False, "bool"), (None, "null"), (object(), "other")]]
         for raw, expected in cases:
-            with self.subTest(top_type=expected["top_type"], extra=expected["extra"]):
+            with self.subTest(top_type=expected["top_type"], extra=expected["extra"],
+                              redacted=expected["extra_redacted_count"]):
                 shape = {"stale": True}
                 with self.assertRaisesRegex(Stop, "^invalid_schema$"):
                     schema.validate(raw, page().doc(), "2026-11-05", schema_shape=shape)
