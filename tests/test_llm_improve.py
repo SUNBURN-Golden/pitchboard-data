@@ -367,6 +367,20 @@ class ReportTests(Harness):
         return row, next(self.root.glob("data/shadow/llm_extract_*.jsonl")), score_shadow
 
     @deserialize_required
+    def test_missing_key_record_stays_scoreable(self):
+        from pbdata.collect.shadow.report import score_shadow
+        raw = proposal()
+        del raw["pay"]
+        row = self.run_page(transport=lambda *_: completion(raw))
+        self.assertEqual(row["validation_reasons"], {"pay": "missing_key"})
+        path = next(self.root.glob("data/shadow/llm_extract_*.jsonl"))
+        report = score_shadow([path], self.root, NOW, self.config, ledger_path=self.root / "budget.sqlite3")
+        self.assertEqual(report["counts"]["verified_unique_pages"], 1)
+        self.assertEqual(report["exclusions"], [])
+        self.assertEqual(report["field_coverage"]["pay"]["accepted"], 0)
+        self.assertEqual(report["field_coverage"]["deadline"]["accepted"], 1)
+
+    @deserialize_required
     def test_offline_missing_gold_fee_denominators_cost_and_unfinished(self):
         row, path, score_shadow = self.inputs()
         self.run_page(url="https://example.org/failed", transport=lambda *_: (_ for _ in ()).throw(common.Stop("provider_error")))

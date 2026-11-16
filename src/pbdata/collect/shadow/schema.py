@@ -50,8 +50,10 @@ dates forbid current-open even when the deadline proposal is null.
 Example JSON: {"open_call":null,"deadline":null,"pay":null,"eligibility":null,"submission_fee":null}
 """
 SCHEMA_HASH = digest(dumps({"version": VERSION, "evidence_version": "verbatim-2.1",
+                            "shape_version": "missing-null-1",
                             "value_keys": {k: sorted(v) for k, v in VALUE_KEYS.items()}}))
 PROMPT_HASH = digest(PROMPT)
+_SAFE_NAME = re.compile(r"[a-z_]{1,40}")
 
 
 def _string(value, nullable=False):
@@ -92,12 +94,39 @@ def valid_value(field, value):
                for v in value["constraints"])
 
 
-def validate(raw, doc, as_of):
-    if not isinstance(raw, dict) or set(raw) != set(FIELDS):
+def _shape_summary(raw, out):
+    """Describe mismatched top-level keys without inspecting any values."""
+    out.clear()
+    out.update(top_type={dict: "dict", list: "list", str: "str", bool: "bool",
+                         int: "int", float: "float", type(None): "null"}.get(type(raw), "other"),
+               missing=[], extra=[], extra_redacted_count=0, extra_omitted_count=0)
+    if not isinstance(raw, dict):
+        return
+    keys = set(raw)
+    missing = [f for f in FIELDS if f not in keys]
+    extras = keys - set(FIELDS)
+    if not missing and not extras:
+        out.clear()
+        return
+    safe = sorted(k for k in extras if isinstance(k, str) and _SAFE_NAME.fullmatch(k))
+    out["missing"] = missing
+    out["extra"] = safe[:10 - len(missing)]
+    out["extra_redacted_count"] = len(extras) - len(safe)
+    out["extra_omitted_count"] = len(safe) - len(out["extra"])
+
+
+def validate(raw, doc, as_of, *, schema_shape=None):
+    if schema_shape is not None:
+        _shape_summary(raw, schema_shape)
+    if not isinstance(raw, dict) or set(raw) - set(FIELDS):
         raise Stop("invalid_schema")
     result, reasons = {}, {}
     for field in FIELDS:
-        proposal, result[field] = raw[field], None
+        result[field] = None
+        if field not in raw:
+            reasons[field] = "missing_key"
+            continue
+        proposal = raw[field]
         if proposal is None:
             continue
         reason = None
@@ -273,7 +302,9 @@ def request_body(doc, as_of, config, provider="deepseek"):
     return body
 
 
-def response(raw, doc, as_of, config, provider="deepseek"):
+def response(raw, doc, as_of, config, provider="deepseek", *, schema_shape=None):
+    if schema_shape is not None:
+        schema_shape.clear()
     allowed = QWEN_MODELS if provider == "qwen" else DEEPSEEK_MODELS
     if not isinstance(raw, dict) or raw.get("model") not in allowed:
         raise Stop("model_mismatch")
@@ -296,5 +327,5 @@ def response(raw, doc, as_of, config, provider="deepseek"):
         content = loads(message["content"])
     except Exception:
         raise Stop("invalid_model_json") from None
-    fields, reasons = validate(content, doc, as_of)
+    fields, reasons = validate(content, doc, as_of, schema_shape=schema_shape)
     return fields, reasons, {k: usage[k] for k in ("prompt_tokens", "completion_tokens", "total_tokens")}

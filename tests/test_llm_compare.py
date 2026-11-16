@@ -126,6 +126,20 @@ class CompareTests(Harness):
         with self.assertRaisesRegex(common.Stop, "prediction_text_mismatch"):
             compare.score(items, {item.key: row})
 
+    def test_missing_key_record_stays_scoreable(self):
+        items, _, _ = compare.load_cohorts(self.eval)
+        item = items[0]
+        raw = proposal()
+        del raw["pay"]
+        fields, reasons = schema.validate(raw, item.page.doc(), item.as_of)
+        self.assertEqual(reasons, {"pay": "missing_key"})
+        row = {"schema": schema.VERSION, "fields": fields, "validation_reasons": reasons,
+               "text_sha256": item.text_hash}
+        report = compare.score(items, {item.key: row})
+        self.assertEqual(report["summaries"]["root"]["current_open_agreement"], 1)
+        self.assertEqual(report["summaries"]["root"]["field_coverage"]["pay"], 0)
+        self.assertEqual(report["summaries"]["root"]["field_coverage"]["deadline"], 1)
+
     def test_frozen_checksums_path_traversal_symlinks_and_input_changes_fail_closed(self):
         inputs = compare.Inputs(self.eval)
         inputs.read("split.json")

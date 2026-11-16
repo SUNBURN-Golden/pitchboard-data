@@ -179,7 +179,7 @@ class ShadowRunner:
                           "requested_model": config["model"], "returned_model": None,
                           "provider": "deepseek", "provider_calls": 1, "fallback_from": None,
                           "reserved_usd": cost, "charged_ceiling_usd": cost, "usage": None,
-                          "fields": None, "validation_reasons": {}, "outcome": "unknown"}
+                          "fields": None, "validation_reasons": {}, "schema_shape": {}, "outcome": "unknown"}
                 start = time.monotonic()
                 primary = transport or provider
                 # Custom transports stay primary-only unless a fallback is injected.
@@ -194,7 +194,8 @@ class ShadowRunner:
                     raw = primary(body, key, config["timeout_seconds"])
                     if key in dumps(raw):
                         raise Stop("credential_in_response")
-                    fields, reasons, usage = response(raw, doc, as_of, config)
+                    fields, reasons, usage = response(raw, doc, as_of, config,
+                                                     schema_shape=record["schema_shape"])
                     record.update(fields=fields, validation_reasons=reasons, usage=usage,
                                   returned_model=raw["model"], outcome="ok", provider="deepseek")
                 except Stop as exc:
@@ -226,7 +227,8 @@ class ShadowRunner:
                             raw = fb_transport(qwen_body, fb_key, config["timeout_seconds"])
                             if any(s in dumps(raw) for s in secrets):
                                 raise Stop("credential_in_response")
-                            fields, reasons, usage = response(raw, doc, as_of, config, provider="qwen")
+                            fields, reasons, usage = response(raw, doc, as_of, config, provider="qwen",
+                                                             schema_shape=record["schema_shape"])
                             record.update(fields=fields, validation_reasons=reasons, usage=usage,
                                           returned_model=raw["model"], outcome="ok")
                         except Stop as exc:

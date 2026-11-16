@@ -5,7 +5,7 @@ from unittest.mock import patch
 from pbdata.collect.shadow import common, runner, schema
 from pbdata.collect.shadow.common import Stop, dumps
 
-from test_llm_extract import URL, Harness, completion
+from test_llm_extract import URL, Harness, completion, shape_cases
 
 
 QWEN_KEY = "qwen-secret-never-log"
@@ -99,6 +99,41 @@ class QwenFallbackTests(Harness):
         self.assertEqual(result["provider"], "qwen")
         self.assertEqual(result["returned_model"], "qwen4.0-max-preview")
 
+    def test_fallback_shapes_reach_jsonl_and_ledger_with_call_accounting(self):
+        for i, (raw, outcome, shape, reasons) in enumerate(shape_cases()):
+            with self.subTest(case=i):
+                self.root = self.base / ("shape" + str(i))
+                result = self.fallback(qwen=lambda *_: qwen_completion(raw))
+                self.assertEqual(result["outcome"], outcome)
+                self.assertEqual(result["schema_shape"], shape)
+                self.assertEqual(result["validation_reasons"], reasons)
+                self.assertEqual(result["provider"], "qwen")
+                self.assertEqual(result["fallback_from"], "provider_error")
+                self.assertEqual(result["provider_calls"], 2)
+                self.assertEqual(result["reserved_usd"], "0.6049152")
+                self.assertEqual(result["charged_ceiling_usd"], "0.6049152")
+                self.assertEqual(result["schema_sha256"], schema.SCHEMA_HASH)
+                self.assertEqual(result["parser_version"], "parse-1")
+                if outcome == "invalid_schema":
+                    self.assertIsNone(result["fields"])
+                else:
+                    self.assertEqual(set(result["fields"]), set(schema.FIELDS))
+                    for field in reasons:
+                        self.assertIsNone(result["fields"][field])
+                self.assert_persisted_record(result)
+
+    def test_fallback_credential_in_permitted_key_precedes_shape_logging(self):
+        secret = "sk_sentinel_never_log"
+        raw = qwen_completion({secret: "value"})
+        with patch.object(schema, "validate", side_effect=AssertionError("validation reached")):
+            result = self.fallback(qwen=lambda *_: raw, fallback_key_loader=lambda: secret)
+        self.assertEqual(result["outcome"], "credential_in_response")
+        self.assertEqual(result["schema_shape"], {})
+        self.assertEqual(result["provider_calls"], 2)
+        self.assertNotIn(secret, dumps(result))
+        self.assertNotIn(secret.encode(), self.artifacts())
+        self.assert_persisted_record(result)
+
     def test_validation_failure_does_not_fall_back(self):
         raw = completion()
         raw["model"] = "other-model"
@@ -125,6 +160,7 @@ class QwenFallbackTests(Harness):
         self.assertEqual(first["provider"], "qwen")
         self.assertEqual(first["provider_calls"], 2)
         self.assertEqual(first["fallback_from"], "provider_error")
+        self.assertEqual(first["schema_shape"], {})
         # A later page can still run; the failed fallback consumed two call units.
         self.config["daily_call_cap"] = 3
         self.write_config()
