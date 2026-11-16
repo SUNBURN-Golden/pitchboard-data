@@ -10,7 +10,7 @@ import sqlite3
 from typing import Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
-from .. import timeutil
+from .. import facts, timeutil
 from ..db import transaction
 from ..profiles import pitchboard as prof
 from . import discover, evaluate, executor, gaps, names, parse, promote, resolve, scheduler, store
@@ -302,19 +302,63 @@ HANDLERS = {"discover": h_discover, "evaluate": h_evaluate, "fetch_page": h_fetc
 
 
 # ------------------------------------------------------------------ freshness
-def enqueue_refresh(ctx: Ctx, limit: int = 30) -> int:
+def refresh_candidates(svc: sqlite3.Connection, now: str, horizon_hours: float = 48) -> List[dict]:
+    """Latest ok raw per URL, live-call expiry first, then oldest fetch (no infra needed).
+
+    refresh_fresh_until is the soonest effective expiry requiring a refresh, or None
+    for ordinary round-robin candidates. Prefer a fact source's canonical URL;
+    when it has no ok raw, use that source's other ok raw URLs.
+    """
+    if horizon_hours < 0:
+        raise ValueError("refresh horizon must be nonnegative")
+    horizon = timeutil.iso(timeutil.parse_iso(now) + dt.timedelta(hours=horizon_hours))
+    rows = [dict(r, refresh_fresh_until=None) for r in svc.execute(
+        "SELECT url, source_id, depth, fetched_at AS last FROM ("
+        "SELECT r.*, row_number() OVER (PARTITION BY url ORDER BY fetched_at DESC, raw_id DESC) AS rn "
+        "FROM pb_raw_ref r WHERE outcome='ok' AND kind IN ('html','pdf','image')) "
+        "WHERE rn=1 ORDER BY last, url")]
+    by_source = {}
+    for r in rows:
+        by_source.setdefault(r["source_id"], []).append(r)
+    live = svc.execute(
+        "SELECT f.fact_id, f.source_id, s.canonical_url FROM pb_fact f "
+        "JOIN pb_call_edition c ON f.subject_type='call' AND c.call_id=f.subject_id "
+        "JOIN pb_source s ON s.source_id=f.source_id "
+        "WHERE f.superseded_at IS NULL AND c.status IN ('announced','open','extended','standing') "
+        "AND (f.predicate='status.declared' OR (f.predicate='deadline.closes_on' "
+        "AND json_extract(f.value_json,'$.date')>=?))", (now[:10],)).fetchall()
+    for f in live:
+        fresh_until = facts.effective_fresh_until(svc, f["fact_id"])
+        if fresh_until is None or fresh_until > horizon:
+            continue
+        source_rows = by_source.get(f["source_id"], [])
+        preferred = [r for r in source_rows if r["url"] == f["canonical_url"]] or source_rows
+        for r in preferred:
+            if r["refresh_fresh_until"] is None or fresh_until < r["refresh_fresh_until"]:
+                r["refresh_fresh_until"] = fresh_until
+    return sorted(rows, key=lambda r: (0, r["refresh_fresh_until"], r["url"])
+                  if r["refresh_fresh_until"] is not None else (1, r["last"], r["url"]))
+
+
+def enqueue_refresh(ctx: Ctx, limit: int = 30, horizon_hours: Optional[float] = None) -> int:
+    if limit <= 0:
+        return 0
+    if horizon_hours is None:
+        horizon_hours = float(os.environ.get("PB_REFRESH_HORIZON_HOURS", "48"))
     now = ctx.clock()
     n = 0
-    rows = ctx.svc.execute("SELECT r.url, r.source_id, r.depth, max(r.fetched_at) AS last FROM pb_raw_ref r WHERE r.outcome='ok' AND r.kind IN ('html','pdf','image') GROUP BY r.url ORDER BY last LIMIT ?", (limit,)).fetchall()
-    for r in rows:
-        owner = ctx.svc.execute("SELECT ss.source_id FROM pb_source s JOIN pb_source_site ss ON ss.outlet_id=s.owner_outlet_id WHERE s.source_id=?", (r["source_id"],)).fetchone()
+    for r in refresh_candidates(ctx.svc, now, horizon_hours):
+        owner = ctx.svc.execute("SELECT ss.source_id FROM pb_source s JOIN pb_source_site ss ON ss.outlet_id=s.owner_outlet_id WHERE s.source_id=? ORDER BY ss.source_id LIMIT 1", (r["source_id"],)).fetchone()
         if not owner:
             continue
         closes = ctx.svc.execute("SELECT min(json_extract(value_json,'$.date')) d FROM pb_fact WHERE predicate='deadline.closes_on' AND superseded_at IS NULL AND subject_id IN "
                                  "(SELECT call_id FROM pb_call_edition WHERE outlet_id=(SELECT owner_outlet_id FROM pb_source WHERE source_id=?)) AND json_extract(value_json,'$.date')>=?", (r["source_id"], now[:10])).fetchone()["d"]
+        urgency = 1.0 if r["refresh_fresh_until"] is not None else scheduler.urgency_from_deadline(closes, now[:10])
         if scheduler.enqueue(ctx.infra, "fetch_page", "freshness", {"url": r["url"], "site_source_id": owner["source_id"], "depth": r["depth"], "via": "refresh"},
-                             "fetch|%s|%s" % (r["url"], ctx.run_tag), scheduler.priority(novelty=0.1, urgency=scheduler.urgency_from_deadline(closes, now[:10]), quality=0.5, cost=0.2), now, depth=r["depth"]):
+                             "fetch|%s|%s" % (r["url"], ctx.run_tag), scheduler.priority(novelty=0.1, urgency=urgency, quality=0.5, cost=0.2), now, depth=r["depth"]):
             n += 1
+            if n >= limit:
+                break
     return n
 
 
