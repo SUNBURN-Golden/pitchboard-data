@@ -5,7 +5,7 @@ on:
     branches: [main]
 jobs:
   unittest:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       matrix:
         python-version: ["3.9", "3.13"]
