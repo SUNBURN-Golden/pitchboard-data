@@ -1,5 +1,6 @@
 """Qwen is used only after a DeepSeek provider failure. All HTTP is injected; no live calls or secrets."""
 import json
+import socket
 import unittest
 from unittest.mock import patch
 from pbdata.collect.shadow import common, runner, schema
@@ -103,7 +104,8 @@ class QwenFallbackTests(Harness):
         for i, (raw, outcome, shape, reasons) in enumerate(shape_cases()):
             with self.subTest(case=i):
                 self.root = self.base / ("shape" + str(i))
-                result = self.fallback(qwen=lambda *_: qwen_completion(raw))
+                with patch.object(socket.socket, "connect", side_effect=AssertionError("network")):
+                    result = self.fallback(qwen=lambda *_: qwen_completion(raw))
                 self.assertEqual(result["outcome"], outcome)
                 self.assertEqual(result["schema_shape"], shape)
                 self.assertEqual(result["validation_reasons"], reasons)
@@ -121,18 +123,23 @@ class QwenFallbackTests(Harness):
                     for field in reasons:
                         self.assertIsNone(result["fields"][field])
                 self.assert_persisted_record(result)
+                self.assertNotIn(QWEN_KEY.encode(), self.artifacts())
 
     def test_fallback_credential_in_permitted_key_precedes_shape_logging(self):
         secret = "sk_sentinel_never_log"
-        raw = qwen_completion({secret: "value"})
-        with patch.object(schema, "validate", side_effect=AssertionError("validation reached")):
-            result = self.fallback(qwen=lambda *_: raw, fallback_key_loader=lambda: secret)
-        self.assertEqual(result["outcome"], "credential_in_response")
-        self.assertEqual(result["schema_shape"], {})
-        self.assertEqual(result["provider_calls"], 2)
-        self.assertNotIn(secret, dumps(result))
-        self.assertNotIn(secret.encode(), self.artifacts())
-        self.assert_persisted_record(result)
+        for wrapped in (False, True):
+            with self.subTest(wrapped=wrapped):
+                self.root = self.base / str(wrapped)
+                fields = {secret: "value"}
+                raw = qwen_completion([fields] if wrapped else fields)
+                with patch.object(schema, "validate", side_effect=AssertionError("validation reached")):
+                    result = self.fallback(qwen=lambda *_: raw, fallback_key_loader=lambda: secret)
+                self.assertEqual(result["outcome"], "credential_in_response")
+                self.assertEqual(result["schema_shape"], {})
+                self.assertEqual(result["provider_calls"], 2)
+                self.assertNotIn(secret, dumps(result))
+                self.assertNotIn(secret.encode(), self.artifacts())
+                self.assert_persisted_record(result)
 
     def test_validation_failure_does_not_fall_back(self):
         raw = completion()
