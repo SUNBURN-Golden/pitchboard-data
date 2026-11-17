@@ -52,7 +52,9 @@ def compute_gaps(svc: sqlite3.Connection, outlet_id: str, target_id: str, now: s
                                     (good[0]["fact_id"], good[0]["evidence_id"], now, gap["gap_id"]))
                 counts["filled"] += 1 if gap and gap["state"] != "filled" else 0
                 continue
-            if any(f["conflict_group_id"] for f in live):
+            if any(f["conflict_group_id"] and svc.execute(
+                    "SELECT 1 FROM pb_conflict_group WHERE group_id=? AND resolved_at IS NULL",
+                    (f["conflict_group_id"],)).fetchone() for f in live):
                 cls = "conflict"
             else:
                 raw_ids = [p["raw_id"] for p in relevant_ok]

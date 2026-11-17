@@ -33,6 +33,8 @@ L4 pb_fact / pb_call_edition / pb_status_event   (append-only, evidence-backed, 
 gap finder: not_extracted | absent_in_source | inaccessible | conflict   (never AI-filled)  -> gap_fill: same-site reverse search by field hints
 ```
 
+For `policy.ai`, `mentioned_unclassified` is a non-committal mention and cannot contradict another source's stated policy for the same dimension; same-source edits still supersede, and classified disagreements still open conflicts. Before the daily service projection and quality check, the daemon resolves groups with no remaining active cross-source contradiction and records an automatic review decision. Facts and their historical conflict links stay intact, with resolved groups ignored by current projections and gap checks; affected calls are marked dirty. Run `python scripts/eval_conflict_resolution.py SERVICE_SQLITE` to report the effect and verify fact integrity on a temporary copy without writing the original database.
+
 ## Safety rules enforced in code
 * robots.txt is checked per hop and cached 24 h; 401/403/5xx on robots = deny; unreachable robots = nothing fetched (class `error`, retry later).
 * 429 halts the host for 6 h; repeated 5xx for 1 h; min 2 s between requests per host; max 4 redirects, each re-checked; SSRF guard.

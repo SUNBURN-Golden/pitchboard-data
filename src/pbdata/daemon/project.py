@@ -19,6 +19,9 @@ DROP_STATUSES = ("superseded", "archived")
 
 
 def _fact_view(svc, f) -> dict:
+    group_id = f["conflict_group_id"]
+    if group_id and not svc.execute("SELECT 1 FROM pb_conflict_group WHERE group_id=? AND resolved_at IS NULL", (group_id,)).fetchone():
+        group_id = None  # immutable links to resolved groups are history, not current conflicts
     ev = svc.execute("SELECT e.excerpt, e.heading, e.paragraph_index, e.char_start, e.char_end, s.canonical_url FROM pb_evidence e "
                      "JOIN pb_source s ON s.source_id=e.source_id WHERE e.evidence_id=?", (f["evidence_id"],)).fetchone() if f["evidence_id"] else None
     src = svc.execute("SELECT canonical_url, source_type FROM pb_source WHERE source_id=?", (f["source_id"],)).fetchone()
@@ -27,7 +30,7 @@ def _fact_view(svc, f) -> dict:
     stale = bool(fresh_until and fresh_until < now)
     return {"fact_id": f["fact_id"], "value": json.loads(f["value_json"]) if f["value_json"] else None, "value_state": f["value_state"],
             "epistemic": f["epistemic"], "stale": stale, "collected_at": f["collected_at"], "effective_from": f["effective_from"],
-            "effective_to": f["effective_to"], "fresh_until": fresh_until, "conflict_group_id": f["conflict_group_id"],
+            "effective_to": f["effective_to"], "fresh_until": fresh_until, "conflict_group_id": group_id,
             "source": {"url": src["canonical_url"], "type": src["source_type"]},
             "evidence": None if ev is None else {"url": ev["canonical_url"], "excerpt": ev["excerpt"], "heading": ev["heading"],
                                                  "paragraph": ev["paragraph_index"], "chars": [ev["char_start"], ev["char_end"]]}}

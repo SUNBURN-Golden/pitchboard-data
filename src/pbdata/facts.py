@@ -5,11 +5,11 @@ import dataclasses
 import datetime as dt
 import json
 import sqlite3
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from . import timeutil
 from .db import transaction
-from .ids import new_id, sha256_hex
+from .ids import new_id, sha256_hex, stable_id
 from .model import (EPISTEMIC_RANK, FactInput, ValidationError, Violation, dumps, freshness_days)
 from .rules import check_excerpt, sanitize_excerpt, validate_fact
 
@@ -50,6 +50,36 @@ def add_evidence(conn: sqlite3.Connection, revision_id: str, source_id: str, exc
 
 def _same_value(a: sqlite3.Row, f: FactInput) -> bool:
     return a["value_state"] == f.value_state and (a["value_json"] or None) == dumps(f.value)
+
+
+def _non_committal(row_or_input: Union[sqlite3.Row, FactInput]) -> bool:
+    """An AI mention alone makes no assertion about the outlet's policy."""
+    if isinstance(row_or_input, FactInput):
+        predicate, value = row_or_input.predicate, row_or_input.value
+    else:
+        predicate = row_or_input["predicate"]
+        value = json.loads(row_or_input["value_json"]) if row_or_input["value_json"] else None
+    return predicate == "policy.ai" and isinstance(value, dict) and value.get("state") == "mentioned_unclassified"
+
+
+def _contradicts(a: sqlite3.Row, b: Union[sqlite3.Row, FactInput]) -> bool:
+    """Compare cross-source assertions using the same rule for append and repair."""
+    if isinstance(b, FactInput):
+        source, state, value_json, predicate = b.source_id, b.value_state, dumps(b.value), b.predicate
+    else:
+        source, state, value_json, predicate = b["source_id"], b["value_state"], b["value_json"], b["predicate"]
+    if a["source_id"] == source:
+        return False
+    if a["value_state"] == state and (a["value_json"] or None) == (value_json or None):
+        return False
+    if a["value_state"] in UNSTATED or state in UNSTATED:
+        return False  # absence on one page never contradicts another source
+    if a["predicate"] == predicate == "policy.ai" and (_non_committal(a) or _non_committal(b)):
+        av = json.loads(a["value_json"]) if a["value_json"] else None
+        bv = json.loads(value_json) if value_json else None
+        if isinstance(av, dict) and isinstance(bv, dict) and av.get("dimension") is not None and av["dimension"] == bv.get("dimension"):
+            return False
+    return True
 
 
 def _insert(conn: sqlite3.Connection, f: FactInput, now: str, conflict_group_id: Optional[str]) -> str:
@@ -113,8 +143,8 @@ def append(conn: sqlite3.Connection, f: FactInput, now: str, historic: bool = Fa
                 if a["source_id"] == f.source_id:
                     supersede.append(a)
                     action = "superseded_prior"
-                elif f.value_state in UNSTATED or a["value_state"] in UNSTATED:
-                    continue  # absence on one page never contradicts another source
+                elif not _contradicts(a, f):
+                    continue
                 else:
                     conflicting.append(a)
         group_id = None
@@ -206,6 +236,41 @@ def resolve_conflict(conn: sqlite3.Connection, group_id: str, decision_id: str, 
         conn.execute("UPDATE pb_conflict_group SET resolved_at=?, resolution_decision_id=? WHERE group_id=?", (now, decision_id, group_id))
         sub = conn.execute("SELECT subject_id FROM pb_conflict_group WHERE group_id=?", (group_id,)).fetchone()
         conn.execute("UPDATE pb_call_edition SET dirty_seq=dirty_seq+1 WHERE call_id=?", (sub["subject_id"],))
+
+
+def resolve_noncontradicting_conflicts(conn: sqlite3.Connection, now: str) -> List[str]:
+    """Close obsolete groups with an audited decision; never rewrite or promote facts.
+
+    Historical fact links remain immutable. Readers must consult the group's
+    resolved_at rather than treating every retained link as an open conflict.
+    """
+    resolved = []
+    with transaction(conn):
+        groups = conn.execute("SELECT * FROM pb_conflict_group WHERE resolved_at IS NULL ORDER BY group_id").fetchall()
+        for group in groups:
+            members = conn.execute("SELECT * FROM pb_fact WHERE conflict_group_id=? AND superseded_at IS NULL ORDER BY fact_id",
+                                   (group["group_id"],)).fetchall()
+            # A fact already linked to an older group cannot be relinked by append
+            # (V-08). Include those active assertions so a later real disagreement
+            # cannot be mistaken for a singleton group and auto-closed.
+            active = conn.execute("SELECT * FROM pb_fact WHERE subject_id=? AND predicate=? AND scope_ref=? "
+                                  "AND superseded_at IS NULL ORDER BY fact_id",
+                                  (group["subject_id"], group["predicate"], group["scope_ref"])).fetchall()
+            if any(_contradicts(a, b) for i, a in enumerate(active) for b in active[i + 1:]):
+                continue
+            reason = ("auto: non-committal mention does not contradict" if any(_non_committal(m) for m in members)
+                      else "auto: no active cross-source contradiction")
+            decision_id = stable_id("rd", "noncontradicting_conflict", group["group_id"])
+            conn.execute("INSERT INTO pb_review_decision(decision_id,kind,actor,rationale,created_at,data) VALUES(?,?,?,?,?,?)",
+                         (decision_id, "resolve_conflict", "system", reason, now,
+                          dumps({"group_id": group["group_id"], "active_fact_ids": [m["fact_id"] for m in members]})))
+            resolve_conflict(conn, group["group_id"], decision_id, None, now)
+            if group["subject_type"] == "outlet":
+                conn.execute("UPDATE pb_call_edition SET dirty_seq=dirty_seq+1 WHERE outlet_id=?", (group["subject_id"],))
+            elif group["subject_type"] == "organizer":
+                conn.execute("UPDATE pb_call_edition SET dirty_seq=dirty_seq+1 WHERE organizer_id=?", (group["subject_id"],))
+            resolved.append(group["group_id"])
+    return resolved
 
 
 def effective_fresh_until(conn: sqlite3.Connection, fact_id: str) -> Optional[str]:
