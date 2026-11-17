@@ -223,7 +223,9 @@ def s_state_update(c: RunContext) -> dict:
 # 8 ---------------------------------------------------------------- service recompute
 def s_service_recompute(c: RunContext) -> dict:
     now = c.clock()
+    resolved = facts.resolve_noncontradicting_conflicts(c.svc, now)
     res = project.recompute(c.svc, now)
+    res["conflicts_resolved"] = len(resolved)
     rows = [json.loads(r[0]) for r in c.svc.execute("SELECT payload FROM pb_search_projection ORDER BY call_id")]
     exp = os.path.join(c.root, "exports")
     os.makedirs(exp, exist_ok=True)
