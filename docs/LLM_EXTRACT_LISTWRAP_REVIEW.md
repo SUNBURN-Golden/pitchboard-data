@@ -120,3 +120,36 @@ live DB, or crawler code touched.
    and the environment note about the bare pytest invocation.
 
 VERDICT: APPROVE
+
+## Re-review
+
+Stage: **RE-REVIEW**, 2026-11-18. Full diff vs `origin/main` re-examined
+(`schema.py` +14/-3, `tests/test_llm_extract.py`, `tests/test_qwen_fallback.py`,
+two docs; no site files, runtime config, live DB, or crawler changes).
+
+- `PYTHONPATH=src:tests python3 -m pytest -q` from the repo root:
+  **329 passed, 391 subtests passed** (12.7 s), nothing skipped, no external
+  network (new runner/fallback cases patch `socket.socket.connect`).
+- Unwrap rule confirmed exact: `response()` (schema.py:333-335) unwraps only a
+  one-element list whose element is a dict, one level, by rebinding; the inner
+  dict reaches the unchanged `validate()`. Direct `validate()` still rejects
+  every list, including `[dict]` (tested).
+- Rejected lists (`[]`, `>=2` elements, singleton non-dict) produce exactly
+  `{"top_type":"list","list_len":N}`; `_shape_summary()` returns before any
+  element inspection, so no keys, values, or quotes can leak. `list_len` is
+  asserted `int`.
+- `unwrapped_list` flag: set only on actual unwrap, in a `finally` after
+  `validate()`, literal `True`, absent otherwise, cleared by response-entry
+  `schema_shape.clear()` on reuse — all tested.
+- No validation relaxed: `validate()`, verbatim-evidence/support checks,
+  `FIELDS`, missing/extra-key handling, model allowlists, usage invariants,
+  finish/message guards, and strict `loads()` are unchanged; guard tests patch
+  `validate` to prove wrapped content cannot bypass them, and credential guards
+  still precede shape logging on both providers.
+- `SCHEMA_HASH` bump (`missing-null-listwrap-2`) and prompt deferral remain
+  correct, documented, and pinned by regression tests; `PROMPT`/`PROMPT_HASH`
+  and request bodies unchanged.
+- Prior non-blocking notes stand (unreachable `list` entry in the type map;
+  bare `pytest` needs `pbdata` importable per README/CI). No new findings.
+
+FINAL: APPROVE
