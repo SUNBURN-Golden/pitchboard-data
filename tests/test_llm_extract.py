@@ -57,14 +57,23 @@ def shape_summary(*, missing=(), extra=(), top_type="dict", redacted=0, omitted=
 def shape_cases():
     missing = proposal()
     del missing["pay"]
-    return [
+    nonverbatim = proposal()
+    nonverbatim["pay"]["value"]["text"] = "value_sentinel"
+    cases = [
         (proposal(), "ok", {}, {}),
+        (dict.fromkeys(schema.FIELDS), "ok", {}, {}),
+        (nonverbatim, "ok", {}, {"pay": "value_not_verbatim"}),
         (missing, "ok", shape_summary(missing=["pay"]), {"pay": "missing_key"}),
         ({}, "ok", shape_summary(missing=schema.FIELDS), dict.fromkeys(schema.FIELDS, "missing_key")),
         ({**proposal(), "extra": "value_sentinel"}, "invalid_schema", shape_summary(extra=["extra"]), {}),
         ({"result": proposal()}, "invalid_schema", shape_summary(missing=schema.FIELDS, extra=["result"]), {}),
-        ([], "invalid_schema", shape_summary(top_type="list"), {}),
     ]
+    cases += [([raw], outcome, {**shape, "unwrapped_list": True}, reasons)
+              for raw, outcome, shape, reasons in cases]
+    cases += [(raw, "invalid_schema", {"top_type": "list", "list_len": len(raw)}, {})
+              for raw in ([], [proposal(), proposal()], [proposal(), "value_sentinel"],
+                          ["value_sentinel"], [42], [1.5], [True], [False], [None], [[proposal()]])]
+    return cases
 
 
 class Harness(unittest.TestCase):
@@ -568,7 +577,7 @@ class SchemaShapeTests(unittest.TestCase):
             ({**proposal(), "Pay": "value_sentinel", "대상": "value_sentinel"}, shape_summary(redacted=2)),
         ]
         cases += [(raw, shape_summary(top_type=label)) for raw, label in
-                  [([], "list"), ("value_sentinel", "str"), (1, "int"), (1.5, "float"),
+                  [("value_sentinel", "str"), (1, "int"), (1.5, "float"),
                    (True, "bool"), (False, "bool"), (None, "null"), (object(), "other")]]
         for raw, expected in cases:
             with self.subTest(top_type=expected["top_type"], extra=expected["extra"],
@@ -579,6 +588,102 @@ class SchemaShapeTests(unittest.TestCase):
                 self.assertEqual(shape, expected)
                 self.assertNotIn("value_sentinel", dumps(shape))
                 self.assertNotIn(QUOTE, dumps(shape))
+
+    def test_response_object_and_wrapped_object_keep_identical_validation(self):
+        config = json.loads(common.CONFIG.read_text())
+        doc = page().doc()
+        for raw, outcome, expected_shape, expected_reasons in shape_cases():
+            if not isinstance(raw, dict):
+                continue
+            with self.subTest(shape=expected_shape, reasons=expected_reasons):
+                results = []
+                for wrapped in (False, True):
+                    response = completion([raw] if wrapped else raw)
+                    before = copy.deepcopy(response)
+                    shape = {"stale": True}
+                    if outcome == "invalid_schema":
+                        with self.assertRaisesRegex(Stop, "^invalid_schema$"):
+                            schema.response(response, doc, "2026-11-05", config, schema_shape=shape)
+                    else:
+                        result = schema.response(response, doc, "2026-11-05", config, schema_shape=shape)
+                        self.assertEqual(result[1], expected_reasons)
+                        self.assertEqual(result[2], response["usage"])
+                        for field in expected_reasons:
+                            self.assertIsNone(result[0][field])
+                        if raw == proposal():
+                            self.assertTrue(all(result[0][f] is not None for f in schema.FIELDS[:-1]))
+                        results.append(result)
+                        self.assertEqual(schema.response(response, doc, "2026-11-05", config), result)
+                    self.assertEqual(shape, {**expected_shape, **({"unwrapped_list": True} if wrapped else {})})
+                    self.assertEqual(response, before)
+                if results:
+                    self.assertEqual(results[0], results[1])
+
+    def test_rejected_lists_report_only_type_and_integer_length(self):
+        config = json.loads(common.CONFIG.read_text())
+        lists = [raw for raw, outcome, _, _ in shape_cases()
+                 if isinstance(raw, list) and outcome == "invalid_schema"]
+        # Direct validate() must reject even a singleton dictionary.
+        lists += [[proposal()], [{"private_key_sentinel": "private_value_sentinel"}]]
+        for raw in lists:
+            for direct in (False, True):
+                if not direct and len(raw) == 1 and isinstance(raw[0], dict):
+                    continue
+                with self.subTest(length=len(raw), direct=direct):
+                    before = copy.deepcopy(raw)
+                    shape = {"stale": True}
+                    with self.assertRaisesRegex(Stop, "^invalid_schema$"):
+                        if direct:
+                            schema.validate(raw, page().doc(), "2026-11-05", schema_shape=shape)
+                        else:
+                            schema.response(completion(raw), page().doc(), "2026-11-05", config, schema_shape=shape)
+                    self.assertEqual(shape, {"top_type": "list", "list_len": len(raw)})
+                    self.assertIs(type(shape["list_len"]), int)
+                    self.assertEqual(raw, before)
+
+    def test_unwrap_flag_clears_on_later_response(self):
+        config = json.loads(common.CONFIG.read_text())
+        shape = {}
+        for content, expected in [([proposal()], {"unwrapped_list": True}), (proposal(), {}),
+                                  ([proposal()], {"unwrapped_list": True}),
+                                  ([], {"top_type": "list", "list_len": 0})]:
+            with self.subTest(expected=expected):
+                if content == []:
+                    with self.assertRaisesRegex(Stop, "^invalid_schema$"):
+                        schema.response(completion(content), page().doc(), "2026-11-05", config, schema_shape=shape)
+                else:
+                    schema.response(completion(content), page().doc(), "2026-11-05", config, schema_shape=shape)
+                self.assertEqual(shape, expected)
+
+    def test_wrapped_content_does_not_bypass_response_guards(self):
+        config = json.loads(common.CONFIG.read_text())
+        cases = []
+        for key, value, code in [
+                ("model", "other", "model_mismatch"), ("usage", {}, "invalid_usage"),
+                ("usage", {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 1}, "usage_invariant")]:
+            cases.append(({**completion([proposal()]), key: value}, code))
+        for finish in ("length", "tool_calls", "content_filter"):
+            raw = completion([proposal()])
+            raw["choices"][0]["finish_reason"] = finish
+            cases.append((raw, "invalid_completion"))
+        for key, value in (("refusal", "no"), ("tool_calls", [{}]), ("reasoning_content", "thinking")):
+            raw = completion([proposal()])
+            raw["choices"][0]["message"][key] = value
+            cases.append((raw, "invalid_completion"))
+        raw = completion([proposal()])
+        raw["usage"]["completion_tokens_details"] = {"reasoning_tokens": 1}
+        cases.append((raw, "usage_invariant"))
+        for provider in ("deepseek", "qwen"):
+            for raw, code in cases:
+                with self.subTest(provider=provider, code=code):
+                    raw = copy.deepcopy(raw)
+                    if provider == "qwen" and code != "model_mismatch":
+                        raw["model"] = schema.QWEN_MODEL
+                    shape = {"unwrapped_list": True}
+                    with self.assertRaisesRegex(Stop, "^" + code + "$"), \
+                         patch.object(schema, "validate", side_effect=AssertionError("validation reached")):
+                        schema.response(raw, page().doc(), "2026-11-05", config, provider, schema_shape=shape)
+                    self.assertEqual(shape, {})
 
     def test_names_are_filtered_before_sorting_and_bounded_without_values(self):
         safe = ["name_" + c for c in "abcdefghijklm"] + ["x" * 40, "zeta"]
@@ -628,19 +733,29 @@ class SchemaShapeTests(unittest.TestCase):
         self.assertEqual(schema.PROMPT_HASH, "c82237cc2dafc1ba7c05826f2d9fd78e172f7bf185f05aaecbc82045a4f31331")
         self.assertEqual(schema.VERSION, "pb-shadow-2")
 
+    def test_hash_distinguishes_list_unwrapping_from_previous_shape_version(self):
+        old_hash = digest(dumps({"version": schema.VERSION, "evidence_version": "verbatim-2.1",
+                                 "shape_version": "missing-null-1",
+                                 "value_keys": {k: sorted(v) for k, v in schema.VALUE_KEYS.items()}}))
+        self.assertEqual(old_hash, "9c9d1f4c8e8759ef64e6a3060234d5978d8bcc553d9bd93b9f3b9e530661b7d3")
+        self.assertNotEqual(schema.SCHEMA_HASH, old_hash)
+
 
 class SchemaShapeRunnerTests(Harness):
     def test_primary_shapes_reach_jsonl_and_ledger_without_fallback(self):
         for i, (raw, outcome, shape, reasons) in enumerate(shape_cases()):
             with self.subTest(case=i):
                 self.root = self.base / ("shape" + str(i))
-                result = self.run_page(transport=lambda *_: completion(raw),
-                                       fallback_transport=lambda *_: self.fail("unexpected fallback"),
-                                       fallback_key_loader=lambda: self.fail("unexpected fallback key lookup"))
+                with patch.object(socket.socket, "connect", side_effect=AssertionError("network")):
+                    result = self.run_page(transport=lambda *_: completion(raw),
+                                           fallback_transport=lambda *_: self.fail("unexpected fallback"),
+                                           fallback_key_loader=lambda: self.fail("unexpected fallback key lookup"))
                 self.assertEqual(result["outcome"], outcome)
                 self.assertEqual(result["schema_shape"], shape)
                 self.assertEqual(result["validation_reasons"], reasons)
                 self.assertEqual(result["provider_calls"], 1)
+                self.assertEqual(result["reserved_usd"], "0.3024576")
+                self.assertEqual(result["charged_ceiling_usd"], "0.3024576")
                 self.assertEqual(result["provider"], "deepseek")
                 self.assertIsNone(result["fallback_from"])
                 self.assertEqual(result["schema_sha256"], schema.SCHEMA_HASH)
@@ -652,17 +767,22 @@ class SchemaShapeRunnerTests(Harness):
                     for field in reasons:
                         self.assertIsNone(result["fields"][field])
                 self.assert_persisted_record(result)
+                self.assertNotIn(KEY.encode(), self.artifacts())
 
     def test_credential_in_permitted_key_is_rejected_before_shape_logging(self):
         secret = "sk_sentinel_never_log"
-        raw = completion({**proposal(), secret: "value"})
-        with patch.object(schema, "validate", side_effect=AssertionError("validation reached")):
-            result = self.run_page(transport=lambda *_: raw, key_loader=lambda: secret)
-        self.assertEqual(result["outcome"], "credential_in_response")
-        self.assertEqual(result["schema_shape"], {})
-        self.assertNotIn(secret, dumps(result))
-        self.assertNotIn(secret.encode(), self.artifacts())
-        self.assert_persisted_record(result)
+        fields = {**proposal(), secret: "value"}
+        for wrapped in (False, True):
+            with self.subTest(wrapped=wrapped):
+                self.root = self.base / str(wrapped)
+                raw = completion([fields] if wrapped else fields)
+                with patch.object(schema, "validate", side_effect=AssertionError("validation reached")):
+                    result = self.run_page(transport=lambda *_: raw, key_loader=lambda: secret)
+                self.assertEqual(result["outcome"], "credential_in_response")
+                self.assertEqual(result["schema_shape"], {})
+                self.assertNotIn(secret, dumps(result))
+                self.assertNotIn(secret.encode(), self.artifacts())
+                self.assert_persisted_record(result)
 
     def test_credential_matching_generated_metadata_discards_record(self):
         secret = "extra_omitted_count"

@@ -50,7 +50,7 @@ dates forbid current-open even when the deadline proposal is null.
 Example JSON: {"open_call":null,"deadline":null,"pay":null,"eligibility":null,"submission_fee":null}
 """
 SCHEMA_HASH = digest(dumps({"version": VERSION, "evidence_version": "verbatim-2.1",
-                            "shape_version": "missing-null-1",
+                            "shape_version": "missing-null-listwrap-2",
                             "value_keys": {k: sorted(v) for k, v in VALUE_KEYS.items()}}))
 PROMPT_HASH = digest(PROMPT)
 _SAFE_NAME = re.compile(r"[a-z_]{1,40}")
@@ -97,6 +97,9 @@ def valid_value(field, value):
 def _shape_summary(raw, out):
     """Describe mismatched top-level keys without inspecting any values."""
     out.clear()
+    if isinstance(raw, list):
+        out.update(top_type="list", list_len=len(raw))
+        return
     out.update(top_type={dict: "dict", list: "list", str: "str", bool: "bool",
                          int: "int", float: "float", type(None): "null"}.get(type(raw), "other"),
                missing=[], extra=[], extra_redacted_count=0, extra_omitted_count=0)
@@ -327,5 +330,12 @@ def response(raw, doc, as_of, config, provider="deepseek", *, schema_shape=None)
         content = loads(message["content"])
     except Exception:
         raise Stop("invalid_model_json") from None
-    fields, reasons = validate(content, doc, as_of, schema_shape=schema_shape)
+    unwrapped_list = isinstance(content, list) and len(content) == 1 and isinstance(content[0], dict)
+    if unwrapped_list:
+        content = content[0]
+    try:
+        fields, reasons = validate(content, doc, as_of, schema_shape=schema_shape)
+    finally:
+        if unwrapped_list and schema_shape is not None:
+            schema_shape["unwrapped_list"] = True
     return fields, reasons, {k: usage[k] for k in ("prompt_tokens", "completion_tokens", "total_tokens")}
