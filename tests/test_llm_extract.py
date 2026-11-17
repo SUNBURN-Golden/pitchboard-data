@@ -1,5 +1,6 @@
 """Shadow safety regressions: temporary state and fake transports only."""
 import contextlib
+import copy
 from concurrent.futures import ThreadPoolExecutor
 import datetime as dt
 from decimal import Decimal
@@ -48,6 +49,24 @@ def completion(fields=None):
         "usage": {"prompt_tokens": 123, "completion_tokens": 100, "total_tokens": 223}}
 
 
+def shape_summary(*, missing=(), extra=(), top_type="dict", redacted=0, omitted=0):
+    return {"top_type": top_type, "missing": list(missing), "extra": list(extra),
+            "extra_redacted_count": redacted, "extra_omitted_count": omitted}
+
+
+def shape_cases():
+    missing = proposal()
+    del missing["pay"]
+    return [
+        (proposal(), "ok", {}, {}),
+        (missing, "ok", shape_summary(missing=["pay"]), {"pay": "missing_key"}),
+        ({}, "ok", shape_summary(missing=schema.FIELDS), dict.fromkeys(schema.FIELDS, "missing_key")),
+        ({**proposal(), "extra": "value_sentinel"}, "invalid_schema", shape_summary(extra=["extra"]), {}),
+        ({"result": proposal()}, "invalid_schema", shape_summary(missing=schema.FIELDS, extra=["result"]), {}),
+        ([], "invalid_schema", shape_summary(top_type="list"), {}),
+    ]
+
+
 class Harness(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -82,6 +101,13 @@ class Harness(unittest.TestCase):
 
     def artifacts(self):
         return b"".join(p.read_bytes() for p in self.root.rglob("*") if p.is_file())
+
+    def assert_persisted_record(self, result):
+        path = next(self.root.glob("data/shadow/llm_extract_*.jsonl"))
+        self.assertEqual([json.loads(line) for line in path.read_text().splitlines()], [result])
+        with state.State(self.root).locked() as conn:
+            rows = [json.loads(r[0]) for r in conn.execute("SELECT result FROM attempts")]
+        self.assertEqual(rows, [result])
 
 
 class ConfigTests(Harness):
@@ -361,6 +387,7 @@ class SecretAndIsolationTests(Harness):
         self.assertNotIn(KEY, dumps(result) + log.getvalue())
         self.assertNotIn(KEY.encode(), self.artifacts())
         self.assertEqual(result["outcome"], "provider_error")
+        self.assertEqual(result["schema_shape"], {})
 
     def test_key_echo_in_response_is_rejected(self):
         response = completion()
@@ -455,8 +482,6 @@ class EvidenceTests(unittest.TestCase):
         raw["pay"]["value"]["amount_min"] = "200"
         self.assertIsNone(schema.validate(raw, page().doc(), "2026-11-05")[0]["pay"])
         with self.assertRaises(Stop):
-            schema.validate({"open_call": None}, page().doc(), "2026-11-05")
-        with self.assertRaises(Stop):
             common.loads('{"deadline":null,"deadline":null}')
 
     def test_not_call_truth_table_closed_and_deadline_conflict(self):
@@ -472,6 +497,183 @@ class EvidenceTests(unittest.TestCase):
         result, reasons = schema.validate(raw, page().doc(), "2026-12-02")
         self.assertIsNone(result["open_call"])
         self.assertEqual(reasons["open_call"], "past_deadline_conflict")
+
+
+class SchemaShapeTests(unittest.TestCase):
+    def test_missing_keys_become_null_without_mutating_valid_neighbors(self):
+        doc = page().doc()
+        expected, _ = schema.validate(proposal(), doc, "2026-11-05")
+        cases = [(f,) for f in schema.FIELDS] + [("open_call", "pay", "eligibility"), schema.FIELDS]
+        for missing in cases:
+            with self.subTest(missing=missing):
+                raw = {f: v for f, v in proposal().items() if f not in missing}
+                before = copy.deepcopy(raw)
+                shape = {"stale": True}
+                fields, reasons = schema.validate(raw, doc, "2026-11-05", schema_shape=shape)
+                self.assertEqual(raw, before)
+                self.assertEqual(fields, {f: None if f in missing else expected[f] for f in schema.FIELDS})
+                self.assertEqual(reasons, dict.fromkeys(missing, "missing_key"))
+                self.assertEqual(shape, shape_summary(missing=[f for f in schema.FIELDS if f in missing]))
+        shape = {"stale": True}
+        fields, reasons = schema.validate(dict.fromkeys(schema.FIELDS), doc, "2026-11-05", schema_shape=shape)
+        self.assertEqual(fields, dict.fromkeys(schema.FIELDS))
+        self.assertEqual(reasons, {})
+        self.assertEqual(shape, {})
+
+    def test_missing_keys_preserve_checks_on_remaining_claims(self):
+        cases = [
+            ({"value": {}, "quote": QUOTE}, "invalid_value"),
+            ({**proposal()["pay"], "quote": ""}, "invalid_quote"),
+            ({**proposal()["pay"], "quote": "invented"}, "quote_not_found"),
+            ({**proposal()["pay"], "quote": "editor@example.org"}, "evidence_contact_details"),
+            ({"value": {**proposal()["pay"]["value"], "amount_min": "99"},
+              "quote": proposal()["pay"]["quote"]}, "unsupported_amount"),
+            ({"value": {**proposal()["pay"]["value"], "text": "invented"},
+              "quote": proposal()["pay"]["quote"]}, "value_not_verbatim"),
+        ]
+        for claim, reason in cases:
+            with self.subTest(reason=reason):
+                raw = proposal()
+                del raw["eligibility"]
+                raw["pay"] = claim
+                fields, reasons = schema.validate(raw, page().doc(), "2026-11-05")
+                self.assertIsNone(fields["pay"])
+                self.assertIsNotNone(fields["deadline"])
+                self.assertEqual(reasons, {"pay": reason, "eligibility": "missing_key"})
+
+    def test_not_call_nulling_preserves_missing_key_on_absent_fields(self):
+        doc = Doc("html", segments=[Segment(0, "p", "Winners announced for the 2026 contest."),
+                                    Segment(1, "p", "We pay USD 100 per story.")])
+        raw = {**proposal(), "deadline": None, "eligibility": None}
+        raw["open_call"] = {"value": {"is_real_call": False, "status": "not_call"},
+                            "quote": "Winners announced for the 2026 contest."}
+        del raw["submission_fee"]
+        shape = {}
+        fields, reasons = schema.validate(raw, doc, "2026-11-05", schema_shape=shape)
+        self.assertIsNotNone(fields["open_call"])
+        for field in schema.FIELDS[1:]:
+            self.assertIsNone(fields[field])
+        # The nulling loop only touches present claims; absent keys keep missing_key.
+        self.assertEqual(reasons, {"pay": "not_call", "submission_fee": "missing_key"})
+        self.assertEqual(shape, shape_summary(missing=["submission_fee"]))
+
+    def test_extra_wrapper_and_non_dict_shapes_fail_closed(self):
+        cases = [
+            ({**proposal(), "extra": "value_sentinel"}, shape_summary(extra=["extra"])),
+            ({"extra": "value_sentinel"}, shape_summary(missing=schema.FIELDS, extra=["extra"])),
+            ({"result": proposal()}, shape_summary(missing=schema.FIELDS, extra=["result"])),
+            # Unsafe-only extras: nothing echoable, so extra stays empty and the
+            # invalid-charset names are counted, never stringified.
+            ({**proposal(), "Pay": "value_sentinel"}, shape_summary(redacted=1)),
+            ({**proposal(), "Pay": "value_sentinel", "대상": "value_sentinel"}, shape_summary(redacted=2)),
+        ]
+        cases += [(raw, shape_summary(top_type=label)) for raw, label in
+                  [([], "list"), ("value_sentinel", "str"), (1, "int"), (1.5, "float"),
+                   (True, "bool"), (False, "bool"), (None, "null"), (object(), "other")]]
+        for raw, expected in cases:
+            with self.subTest(top_type=expected["top_type"], extra=expected["extra"],
+                              redacted=expected["extra_redacted_count"]):
+                shape = {"stale": True}
+                with self.assertRaisesRegex(Stop, "^invalid_schema$"):
+                    schema.validate(raw, page().doc(), "2026-11-05", schema_shape=shape)
+                self.assertEqual(shape, expected)
+                self.assertNotIn("value_sentinel", dumps(shape))
+                self.assertNotIn(QUOTE, dumps(shape))
+
+    def test_names_are_filtered_before_sorting_and_bounded_without_values(self):
+        safe = ["name_" + c for c in "abcdefghijklm"] + ["x" * 40, "zeta"]
+        unsafe = ["editor@example.org", "+82 10 1234 5678", "punctuation-key", "대상", "name\n",
+                  "", "x" * 41, 17, None]
+        raw = dict.fromkeys(reversed(safe + unsafe), {"nested": QUOTE, "value": "looks_like_key"})
+        before = copy.deepcopy(raw)
+        shape = {}
+        with self.assertRaisesRegex(Stop, "^invalid_schema$"):
+            schema.validate(raw, page().doc(), "2026-11-05", schema_shape=shape)
+        self.assertEqual(raw, before)
+        self.assertEqual(shape, shape_summary(missing=schema.FIELDS, extra=safe[:5], redacted=9, omitted=10))
+        self.assertLessEqual(len(shape["missing"]) + len(shape["extra"]), 10)
+        for value in (QUOTE, "nested", "looks_like_key"):
+            self.assertNotIn(value, dumps(shape))
+        # The 40-character boundary is accepted; 41 characters and a trailing newline are counted only.
+        raw = {**dict.fromkeys(schema.FIELDS), "x" * 40: "value", "x" * 41: "value", "name\n": "value"}
+        with self.assertRaisesRegex(Stop, "^invalid_schema$"):
+            schema.validate(raw, page().doc(), "2026-11-05", schema_shape=shape)
+        self.assertEqual(shape, shape_summary(extra=["x" * 40], redacted=2))
+        raw = {**dict.fromkeys(schema.FIELDS), **dict.fromkeys(reversed(safe), "value")}
+        with self.assertRaisesRegex(Stop, "^invalid_schema$"):
+            schema.validate(raw, page().doc(), "2026-11-05", schema_shape=shape)
+        self.assertEqual(shape, shape_summary(extra=safe[:10], omitted=5))
+
+    def test_response_clears_reused_shape_before_prevalidation_failures(self):
+        config = json.loads(common.CONFIG.read_text())
+        cases = [(None, "model_mismatch")]
+        for change, code in [({"model": "other"}, "model_mismatch"), ({"usage": {}}, "invalid_usage"),
+                             ({"usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 1}}, "usage_invariant"),
+                             ({"choices": []}, "invalid_completion")]:
+            cases.append(({**completion(), **change}, code))
+        raw = completion()
+        raw["choices"][0]["message"]["content"] = "invalid JSON"
+        cases.append((raw, "invalid_model_json"))
+        for raw, code in cases:
+            with self.subTest(code=code):
+                shape = {"stale": True}
+                with self.assertRaisesRegex(Stop, "^" + code + "$"):
+                    schema.response(raw, page().doc(), "2026-11-05", config, schema_shape=shape)
+                self.assertEqual(shape, {})
+
+    def test_hash_distinguishes_shape_behavior_without_changing_prompt(self):
+        old_hash = digest(dumps({"version": schema.VERSION, "evidence_version": "verbatim-2.1",
+                                 "value_keys": {k: sorted(v) for k, v in schema.VALUE_KEYS.items()}}))
+        self.assertNotEqual(schema.SCHEMA_HASH, old_hash)
+        self.assertEqual(schema.PROMPT_HASH, "c82237cc2dafc1ba7c05826f2d9fd78e172f7bf185f05aaecbc82045a4f31331")
+        self.assertEqual(schema.VERSION, "pb-shadow-2")
+
+
+class SchemaShapeRunnerTests(Harness):
+    def test_primary_shapes_reach_jsonl_and_ledger_without_fallback(self):
+        for i, (raw, outcome, shape, reasons) in enumerate(shape_cases()):
+            with self.subTest(case=i):
+                self.root = self.base / ("shape" + str(i))
+                result = self.run_page(transport=lambda *_: completion(raw),
+                                       fallback_transport=lambda *_: self.fail("unexpected fallback"),
+                                       fallback_key_loader=lambda: self.fail("unexpected fallback key lookup"))
+                self.assertEqual(result["outcome"], outcome)
+                self.assertEqual(result["schema_shape"], shape)
+                self.assertEqual(result["validation_reasons"], reasons)
+                self.assertEqual(result["provider_calls"], 1)
+                self.assertEqual(result["provider"], "deepseek")
+                self.assertIsNone(result["fallback_from"])
+                self.assertEqual(result["schema_sha256"], schema.SCHEMA_HASH)
+                self.assertEqual(result["parser_version"], "parse-1")
+                if outcome == "invalid_schema":
+                    self.assertIsNone(result["fields"])
+                else:
+                    self.assertEqual(set(result["fields"]), set(schema.FIELDS))
+                    for field in reasons:
+                        self.assertIsNone(result["fields"][field])
+                self.assert_persisted_record(result)
+
+    def test_credential_in_permitted_key_is_rejected_before_shape_logging(self):
+        secret = "sk_sentinel_never_log"
+        raw = completion({**proposal(), secret: "value"})
+        with patch.object(schema, "validate", side_effect=AssertionError("validation reached")):
+            result = self.run_page(transport=lambda *_: raw, key_loader=lambda: secret)
+        self.assertEqual(result["outcome"], "credential_in_response")
+        self.assertEqual(result["schema_shape"], {})
+        self.assertNotIn(secret, dumps(result))
+        self.assertNotIn(secret.encode(), self.artifacts())
+        self.assert_persisted_record(result)
+
+    def test_credential_matching_generated_metadata_discards_record(self):
+        secret = "extra_omitted_count"
+        raw = proposal()
+        del raw["pay"]
+        result = self.run_page(transport=lambda *_: completion(raw), key_loader=lambda: secret)
+        self.assertEqual(result, {"outcome": "skipped", "reason": "credential_in_record"})
+        self.assertNotIn(secret.encode(), self.artifacts())
+        self.assertFalse(any(p.read_text() for p in self.root.glob("data/shadow/llm_extract_*.jsonl")))
+        with state.State(self.root).locked() as conn:
+            self.assertEqual([r[0] for r in conn.execute("SELECT result FROM attempts")], [None])
 
 
 class ProviderFailures(Harness):
