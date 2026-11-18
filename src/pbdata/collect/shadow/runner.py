@@ -13,7 +13,7 @@ from urllib.parse import urlsplit
 
 from .common import CONFIG, Stop, digest, dumps, load_config, load_key, load_qwen_key, loads, utcnow
 from .policy import PolicyFetcher, canonical_url
-from .schema import VERSION, PROMPT_HASH, SCHEMA_HASH, request_body, response
+from .schema import VERSION, PROMPT_HASH, SCHEMA_HASH, SchemaRepairCandidate, repair_body, request_body, response
 from .state import State
 from . import source_cache
 from ..net import NoRedirect
@@ -25,6 +25,7 @@ ENDPOINT = "https://api.deepseek.com/chat/completions"
 QWEN_ENDPOINT = "https://token-plan.maas.qwencloudapi.com/compatible-mode/v1/chat/completions"
 ALLOWED_PROVIDER_HOSTS = frozenset({"api.deepseek.com", "token-plan.maas.qwencloudapi.com"})
 FALLBACK_CODES = frozenset({"provider_error", "provider_http_error"})
+REPAIR_SCHEMA_CODES = frozenset({"invalid_schema", "invalid_model_json", "duplicate_json_key", "invalid_json_number"})
 RECORD_STOPS = frozenset({
     "provider_http_error", "provider_too_large", "provider_error", "duplicate_json_key",
     "invalid_json_number", "model_mismatch", "invalid_usage", "usage_invariant",
@@ -98,6 +99,14 @@ def _stop_code(exc):
 class ShadowRunner:
     def __init__(self, config=CONFIG, clock=utcnow):
         self.config_path, self.clock = config, clock
+
+    def _dispatch_time(self, config, day, reserved_at):
+        dispatch = self.clock()
+        if load_config(self.config_path, dispatch) != config:
+            raise Stop("config_changed")
+        if dispatch.date().isoformat() != day or dispatch < reserved_at:
+            raise Stop("dispatch_clock_changed")
+        return dispatch
 
     def run(self, *, shadow_root, url=None, page=None, as_of=None, fetcher=None,
             transport=None, key_loader=None, fallback_transport=None, fallback_key_loader=None,
@@ -178,6 +187,7 @@ class ShadowRunner:
                           "baseline": rules, "gap_target": target,
                           "requested_model": config["model"], "returned_model": None,
                           "provider": "deepseek", "provider_calls": 1, "fallback_from": None,
+                          "repair_attempted": False, "repair_outcome": None,
                           "reserved_usd": cost, "charged_ceiling_usd": cost, "usage": None,
                           "fields": None, "validation_reasons": {}, "schema_shape": {}, "outcome": "unknown"}
                 start = time.monotonic()
@@ -185,12 +195,9 @@ class ShadowRunner:
                 # Custom transports stay primary-only unless a fallback is injected.
                 fb_transport = fallback_transport or (qwen_provider if transport is None else None)
                 secrets = [key]
+                repair = None
                 try:
-                    dispatch = self.clock()
-                    if load_config(self.config_path, dispatch) != config:
-                        raise Stop("config_changed")
-                    if dispatch.date().isoformat() != day or dispatch < now:
-                        raise Stop("dispatch_clock_changed")
+                    self._dispatch_time(config, day, now)
                     raw = primary(body, key, config["timeout_seconds"])
                     if key in dumps(raw):
                         raise Stop("credential_in_response")
@@ -201,6 +208,8 @@ class ShadowRunner:
                 except Stop as exc:
                     # Only local fixed reasons; an injected transport cannot leak text.
                     record["outcome"] = _stop_code(exc)
+                    if isinstance(exc, SchemaRepairCandidate):
+                        repair = (exc.prior, primary, key, body)
                 except Exception:
                     record["outcome"] = "provider_error"
                 if record["outcome"] in FALLBACK_CODES and fb_transport is not None:
@@ -213,12 +222,8 @@ class ShadowRunner:
                     if fb_key and fb_key not in dumps(qwen_body) and fb_key not in dumps(target) and fb_key not in requested:
                         secrets.append(fb_key)
                         try:
-                            dispatch = self.clock()
-                            if load_config(self.config_path, dispatch) != config:
-                                raise Stop("config_changed")
-                            if dispatch.date().isoformat() != day or dispatch < now:
-                                raise Stop("dispatch_clock_changed")
-                            new_cost = state.reserve_fallback(conn, config, dispatch, attempt)
+                            dispatch = self._dispatch_time(config, day, now)
+                            new_cost = state.reserve_extra_call(conn, config, dispatch, attempt)
                             record["reserved_usd"] = new_cost
                             record["charged_ceiling_usd"] = new_cost
                             record["provider_calls"] = 2
@@ -239,9 +244,61 @@ class ShadowRunner:
                             else:
                                 record["outcome"] = _stop_code(exc)
                                 record["provider"] = "qwen"
+                                if isinstance(exc, SchemaRepairCandidate):
+                                    repair = (exc.prior, fb_transport, fb_key, qwen_body)
                         except Exception:
                             record["outcome"] = "provider_error"
                             record["provider"] = "qwen"
+                # Repair runs strictly after the fallback block, so a provider_error
+                # outcome here can never re-trigger the fallback.
+                if repair is not None:
+                    prior, repair_transport, repair_key, original_body = repair
+                    try:
+                        # The provider envelope may hide credentials behind JSON escapes.
+                        prior_json = dumps(prior)
+                        if any(s in prior_json for s in secrets):
+                            raise Stop("credential_in_response")
+                        correction = repair_body(original_body, prior)
+                        if any(s in dumps(correction) for s in secrets):
+                            raise Stop("credential_in_response")
+                        dispatch = self._dispatch_time(config, day, now)
+                    except Stop as exc:
+                        if str(exc) == "credential_in_response":
+                            record["outcome"] = "credential_in_response"
+                    except (ValueError, RecursionError):
+                        # Fail closed if the parsed JSON cannot be serialized for repair.
+                        pass
+                    else:
+                        try:
+                            new_cost = state.reserve_extra_call(conn, config, dispatch, attempt)
+                        except Stop as exc:
+                            # Only the cap maps to skipped_cap; other guard stops
+                            # (halt/clock/config/state) keep invalid_schema with
+                            # repair_attempted=false, like the fallback's uncharged guard.
+                            if str(exc) == "budget_exhausted":
+                                record["repair_outcome"] = "skipped_cap"
+                        else:
+                            record.update(reserved_usd=new_cost, charged_ceiling_usd=new_cost,
+                                          provider_calls=record["provider_calls"] + 1,
+                                          repair_attempted=True, repair_outcome="provider_error")
+                if record["repair_attempted"]:
+                    try:
+                        raw = repair_transport(correction, repair_key, config["timeout_seconds"])
+                        if any(s in dumps(raw) for s in secrets):
+                            raise Stop("credential_in_response")
+                        try:
+                            fields, reasons, usage = response(raw, doc, as_of, config,
+                                                              provider=record["provider"], strict_repair=True)
+                        except Stop as exc:
+                            if str(exc) in REPAIR_SCHEMA_CODES:
+                                record["repair_outcome"] = "invalid_schema"
+                            raise
+                        record.update(fields=fields, validation_reasons=reasons, usage=usage,
+                                      returned_model=raw["model"], outcome="ok", repair_outcome="ok")
+                    except Stop as exc:
+                        record["outcome"] = _stop_code(exc)
+                    except Exception:
+                        record["outcome"] = "provider_error"
                 from .review import reviews
                 record["reviews"] = reviews(record)
                 from .digest import drafts
