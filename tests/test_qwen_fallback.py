@@ -2,11 +2,11 @@
 import json
 import socket
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from pbdata.collect.shadow import common, runner, schema
 from pbdata.collect.shadow.common import Stop, dumps
 
-from test_llm_extract import URL, Harness, completion, shape_cases
+from test_llm_extract import KEY, QUOTE, URL, Harness, completion, proposal, shape_cases, shape_summary
 
 
 QWEN_KEY = "qwen-secret-never-log"
@@ -104,16 +104,22 @@ class QwenFallbackTests(Harness):
         for i, (raw, outcome, shape, reasons) in enumerate(shape_cases()):
             with self.subTest(case=i):
                 self.root = self.base / ("shape" + str(i))
+                qwen = Mock(return_value=qwen_completion(raw))
                 with patch.object(socket.socket, "connect", side_effect=AssertionError("network")):
-                    result = self.fallback(qwen=lambda *_: qwen_completion(raw))
+                    result = self.fallback(qwen=qwen)
+                repaired = outcome == "invalid_schema" and (bool(shape.get("missing")) or shape.get("list_len", 1) != 1)
+                cost = "0.9073728" if repaired else "0.6049152"
                 self.assertEqual(result["outcome"], outcome)
                 self.assertEqual(result["schema_shape"], shape)
                 self.assertEqual(result["validation_reasons"], reasons)
                 self.assertEqual(result["provider"], "qwen")
                 self.assertEqual(result["fallback_from"], "provider_error")
-                self.assertEqual(result["provider_calls"], 2)
-                self.assertEqual(result["reserved_usd"], "0.6049152")
-                self.assertEqual(result["charged_ceiling_usd"], "0.6049152")
+                self.assertEqual(result["provider_calls"], 2 + repaired)
+                self.assertEqual(qwen.call_count, 1 + repaired)
+                self.assertIs(result["repair_attempted"], repaired)
+                self.assertEqual(result["repair_outcome"], "invalid_schema" if repaired else None)
+                self.assertEqual(result["reserved_usd"], cost)
+                self.assertEqual(result["charged_ceiling_usd"], cost)
                 self.assertEqual(result["schema_sha256"], schema.SCHEMA_HASH)
                 self.assertEqual(result["parser_version"], "parse-1")
                 if outcome == "invalid_schema":
@@ -124,6 +130,77 @@ class QwenFallbackTests(Harness):
                         self.assertIsNone(result["fields"][field])
                 self.assert_persisted_record(result)
                 self.assertNotIn(QWEN_KEY.encode(), self.artifacts())
+
+    def test_repair_reuses_qwen_request_and_reserves_third_call(self):
+        self.config["daily_call_cap"] = 3
+        self.write_config()
+        repaired = proposal()
+        repaired["pay"]["value"].update(amount_min=None, currency=None)
+        repaired["deadline"]["quote"] = "Submissions are open until December 2, 2026."
+        deepseek = Mock(side_effect=Stop("provider_error"))
+        qwen = Mock(side_effect=[qwen_completion({"fee_krw": 100}), qwen_completion(repaired)])
+        result = self.fallback(deepseek=deepseek, qwen=qwen)
+
+        self.assertEqual(result["outcome"], "ok")
+        self.assertEqual(result["provider"], "qwen")
+        self.assertEqual(result["returned_model"], QWEN)
+        self.assertEqual(result["fallback_from"], "provider_error")
+        self.assertEqual(result["provider_calls"], 3)
+        self.assertIs(result["repair_attempted"], True)
+        self.assertEqual(result["repair_outcome"], "ok")
+        self.assertEqual(result["reserved_usd"], "0.9073728")
+        self.assertEqual(result["charged_ceiling_usd"], "0.9073728")
+        self.assertEqual(result["schema_shape"], shape_summary(missing=schema.FIELDS, extra=["fee_krw"]))
+        self.assertEqual(result["fields"]["open_call"]["quote"], QUOTE)
+        self.assertIsNone(result["fields"]["deadline"])
+        self.assertEqual(result["validation_reasons"], {"deadline": "quote_not_found"})
+        self.assertIn(("compensation.rate", ["partial_value"]),
+                      [(row["predicate"], row["reasons"]) for row in result["reviews"]])
+        self.assertEqual(deepseek.call_count, 1)
+        self.assertEqual(qwen.call_count, 2)
+        first, key, timeout = qwen.call_args_list[0].args
+        repair, repair_key, repair_timeout = qwen.call_args_list[1].args
+        self.assertEqual((repair_key, repair_timeout), (QWEN_KEY, timeout))
+        self.assertEqual(key, QWEN_KEY)
+        self.assertEqual(repair["model"], QWEN)
+        self.assertIs(repair["enable_thinking"], False)
+        self.assertEqual({**repair, "messages": repair["messages"][:-1]}, first)
+        self.assert_persisted_record(result)
+        self.assertEqual(self.run_page(URL + "-next")["reason"], "budget_exhausted")
+
+    def test_caps_skip_repair_after_two_reserved_calls(self):
+        for cap, value in (("daily_call_cap", 2), ("daily_cost_cap_usd", "0.6049152")):
+            with self.subTest(cap=cap), patch.dict(self.config, {cap: value}):
+                self.root = self.base / cap
+                self.write_config()
+                qwen = Mock(return_value=qwen_completion({"fee_krw": 100}))
+                result = self.fallback(qwen=qwen)
+                self.assertEqual(result["outcome"], "invalid_schema")
+                self.assertEqual(result["provider"], "qwen")
+                self.assertEqual(result["fallback_from"], "provider_error")
+                self.assertIs(result["repair_attempted"], False)
+                self.assertEqual(result["repair_outcome"], "skipped_cap")
+                self.assertEqual(result["provider_calls"], 2)
+                self.assertEqual(qwen.call_count, 1)
+                self.assertEqual(result["reserved_usd"], "0.6049152")
+                self.assertEqual(result["charged_ceiling_usd"], "0.6049152")
+                self.assert_persisted_record(result)
+
+    def test_escaped_primary_key_in_qwen_response_prevents_repair(self):
+        raw = qwen_completion({"invented": KEY})
+        raw["choices"][0]["message"]["content"] = dumps({"invented": KEY}).replace(KEY, r"\u0073" + KEY[1:])
+        self.assertNotIn(KEY, dumps(raw))
+        qwen = Mock(return_value=raw)
+        result = self.fallback(qwen=qwen)
+        self.assertEqual(result["outcome"], "credential_in_response")
+        self.assertEqual(result["provider"], "qwen")
+        self.assertIs(result["repair_attempted"], False)
+        self.assertIsNone(result["repair_outcome"])
+        self.assertEqual(result["provider_calls"], 2)
+        self.assertEqual(qwen.call_count, 1)
+        self.assertEqual(result["reserved_usd"], "0.6049152")
+        self.assert_persisted_record(result)
+        self.assertNotIn(KEY.encode(), self.artifacts())
 
     def test_fallback_credential_in_permitted_key_precedes_shape_logging(self):
         secret = "sk_sentinel_never_log"
@@ -194,6 +271,8 @@ class QwenFallbackTests(Harness):
         self.assertEqual(result["outcome"], "provider_error")
         self.assertEqual(result["provider"], "deepseek")
         self.assertEqual(result["provider_calls"], 1)
+        self.assertIs(result["repair_attempted"], False)
+        self.assertIsNone(result["repair_outcome"])
         self.assertIsNone(result["fallback_from"])
         self.assertEqual(qcalls, [])
         self.assertEqual(result["charged_ceiling_usd"], "0.3024576")

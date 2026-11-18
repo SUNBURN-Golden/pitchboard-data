@@ -278,8 +278,8 @@ class State:
         conn.commit()
         return attempt_id, day, str(charge)
 
-    def reserve_fallback(self, conn, config, now, attempt_id):
-        """Charge one extra call on an in-flight attempt before a Qwen retry."""
+    def reserve_extra_call(self, conn, config, now, attempt_id):
+        """Charge one extra call on an in-flight attempt before fallback or repair."""
         if conn.execute("SELECT value FROM meta WHERE key='halted'").fetchone()[0]:
             raise Stop("experiment_halted")
         time = now.isoformat()

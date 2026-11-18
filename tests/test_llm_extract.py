@@ -11,7 +11,7 @@ from pathlib import Path
 import socket
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import urllib.error
 import urllib.request
 
@@ -73,6 +73,7 @@ def shape_cases():
     cases += [(raw, "invalid_schema", {"top_type": "list", "list_len": len(raw)}, {})
               for raw in ([], [proposal(), proposal()], [proposal(), "value_sentinel"],
                           ["value_sentinel"], [42], [1.5], [True], [False], [None], [[proposal()]])]
+    cases.append(("value_sentinel", "invalid_schema", shape_summary(top_type="str"), {}))
     return cases
 
 
@@ -746,16 +747,22 @@ class SchemaShapeRunnerTests(Harness):
         for i, (raw, outcome, shape, reasons) in enumerate(shape_cases()):
             with self.subTest(case=i):
                 self.root = self.base / ("shape" + str(i))
+                transport = Mock(return_value=completion(raw))
                 with patch.object(socket.socket, "connect", side_effect=AssertionError("network")):
-                    result = self.run_page(transport=lambda *_: completion(raw),
+                    result = self.run_page(transport=transport,
                                            fallback_transport=lambda *_: self.fail("unexpected fallback"),
                                            fallback_key_loader=lambda: self.fail("unexpected fallback key lookup"))
+                repaired = outcome == "invalid_schema" and (bool(shape.get("missing")) or shape.get("list_len", 1) != 1)
+                cost = "0.6049152" if repaired else "0.3024576"
                 self.assertEqual(result["outcome"], outcome)
                 self.assertEqual(result["schema_shape"], shape)
                 self.assertEqual(result["validation_reasons"], reasons)
-                self.assertEqual(result["provider_calls"], 1)
-                self.assertEqual(result["reserved_usd"], "0.3024576")
-                self.assertEqual(result["charged_ceiling_usd"], "0.3024576")
+                self.assertEqual(result["provider_calls"], 1 + repaired)
+                self.assertEqual(transport.call_count, 1 + repaired)
+                self.assertIs(result["repair_attempted"], repaired)
+                self.assertEqual(result["repair_outcome"], "invalid_schema" if repaired else None)
+                self.assertEqual(result["reserved_usd"], cost)
+                self.assertEqual(result["charged_ceiling_usd"], cost)
                 self.assertEqual(result["provider"], "deepseek")
                 self.assertIsNone(result["fallback_from"])
                 self.assertEqual(result["schema_sha256"], schema.SCHEMA_HASH)
@@ -780,6 +787,8 @@ class SchemaShapeRunnerTests(Harness):
                     result = self.run_page(transport=lambda *_: raw, key_loader=lambda: secret)
                 self.assertEqual(result["outcome"], "credential_in_response")
                 self.assertEqual(result["schema_shape"], {})
+                self.assertIs(result["repair_attempted"], False)
+                self.assertIsNone(result["repair_outcome"])
                 self.assertNotIn(secret, dumps(result))
                 self.assertNotIn(secret.encode(), self.artifacts())
                 self.assert_persisted_record(result)
@@ -794,6 +803,198 @@ class SchemaShapeRunnerTests(Harness):
         self.assertFalse(any(p.read_text() for p in self.root.glob("data/shadow/llm_extract_*.jsonl")))
         with state.State(self.root).locked() as conn:
             self.assertEqual([r[0] for r in conn.execute("SELECT result FROM attempts")], [None])
+
+
+class SchemaRepairTests(Harness):
+    def test_primary_repair_validates_evidence_and_publishes_once(self):
+        self.config["daily_call_cap"] = 2
+        self.write_config()
+        prior = [{"result": "previous_value_sentinel"}]
+        repaired = proposal()
+        repaired["eligibility"]["quote"] = "All writers anywhere may apply."
+        final = completion([repaired])
+        final["model"] = "DeepSeek-V4.1-Flash-1017"
+        final["usage"].update(prompt_tokens=200, total_tokens=300)
+        source = page(body=HTML.replace(b"</html>", b"<p>We pay USD 200 per story.</p></html>"))
+        transport = Mock(side_effect=[completion(prior), final])
+        fallback = Mock()
+        fallback_key = Mock(return_value="qwen-test-key")
+        result = self.run_page(page=source, transport=transport, fallback_transport=fallback,
+                               fallback_key_loader=fallback_key)
+
+        self.assertEqual(result["outcome"], "ok")
+        self.assertIs(result["repair_attempted"], True)
+        self.assertEqual(result["repair_outcome"], "ok")
+        self.assertEqual(result["provider_calls"], 2)
+        self.assertEqual(result["provider"], "deepseek")
+        self.assertIsNone(result["fallback_from"])
+        self.assertEqual(result["returned_model"], final["model"])
+        self.assertEqual(result["usage"], final["usage"])
+        self.assertEqual(result["reserved_usd"], "0.6049152")
+        self.assertEqual(result["charged_ceiling_usd"], "0.6049152")
+        self.assertEqual(result["schema_shape"], {**shape_summary(missing=schema.FIELDS, extra=["result"]),
+                                                  "unwrapped_list": True})
+        self.assertEqual(result["fields"]["open_call"]["quote"], QUOTE)
+        self.assertEqual(result["fields"]["pay"]["value"], repaired["pay"]["value"])
+        self.assertEqual(result["validation_reasons"], {"eligibility": "quote_not_found"})
+        self.assertIsNone(result["fields"]["eligibility"])
+        self.assertIn(("compensation.rate", ["ambiguous_rules"]),
+                      [(row["predicate"], row["reasons"]) for row in result["reviews"]])
+        self.assertEqual(transport.call_count, 2)
+        fallback.assert_not_called()
+        fallback_key.assert_not_called()
+        first_body, key, timeout = transport.call_args_list[0].args
+        repair_request, repair_key, repair_timeout = transport.call_args_list[1].args
+        self.assertEqual((repair_key, repair_timeout), (key, timeout))
+        self.assertEqual({**repair_request, "messages": repair_request["messages"][:-1]}, first_body)
+        self.assertEqual(repair_request["messages"][-1]["role"], "user")
+        self.assertEqual(repair_request["messages"][-1]["content"].splitlines()[-1], dumps(prior))
+        self.assert_persisted_record(result)
+        self.assertNotIn(b"previous_value_sentinel", self.artifacts())
+        self.assertEqual(self.run_page(URL + "-next")["reason"], "budget_exhausted")
+
+    def test_repair_requires_all_keys_and_never_retries_again(self):
+        transport = Mock(side_effect=[completion({"extra": 1}), completion({"open_call": None})])
+        result = self.run_page(transport=transport)
+        self.assertEqual(result["outcome"], "invalid_schema")
+        self.assertIs(result["repair_attempted"], True)
+        self.assertEqual(result["repair_outcome"], "invalid_schema")
+        self.assertEqual(result["schema_shape"], shape_summary(missing=schema.FIELDS, extra=["extra"]))
+        self.assertEqual(result["provider_calls"], 2)
+        self.assertEqual(transport.call_count, 2)
+        self.assertEqual(result["charged_ceiling_usd"], "0.6049152")
+        self.assertIsNone(result["fields"])
+        self.assert_persisted_record(result)
+
+    def test_repair_keeps_safe_failure_codes_and_never_falls_back(self):
+        cases = [(TimeoutError("private transport detail"), "provider_error", "provider_error"),
+                 (Stop("duplicate_json_key"), "duplicate_json_key", "provider_error"),
+                 ({**completion(), "model": "wrong-model"}, "model_mismatch", "provider_error"),
+                 ({**completion(), "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 3}},
+                  "usage_invariant", "provider_error"),
+                 (completion({"note": KEY}), "credential_in_response", "provider_error")]
+        for content, code in (("not JSON", "invalid_model_json"), ('{"a":null,"a":null}', "duplicate_json_key"),
+                              ('{"a":NaN}', "invalid_json_number")):
+            raw = completion()
+            raw["choices"][0]["message"]["content"] = content
+            cases.append((raw, code, "invalid_schema"))
+        for i, (raw, outcome, repair_outcome) in enumerate(cases):
+            with self.subTest(case=i):
+                self.root = self.base / str(i)
+                transport = Mock(side_effect=[completion({"extra": 1}), raw])
+                fallback = Mock()
+                fallback_key = Mock(return_value="qwen-test-key")
+                result = self.run_page(transport=transport, fallback_transport=fallback,
+                                       fallback_key_loader=fallback_key)
+                self.assertEqual(result["outcome"], outcome)
+                self.assertIs(result["repair_attempted"], True)
+                self.assertEqual(result["repair_outcome"], repair_outcome)
+                self.assertEqual(result["provider_calls"], 2)
+                self.assertEqual(transport.call_count, 2)
+                fallback.assert_not_called()
+                fallback_key.assert_not_called()
+                self.assertIsNone(result["fallback_from"])
+                self.assert_persisted_record(result)
+                self.assertNotIn(b"private transport detail", self.artifacts())
+                self.assertNotIn(KEY.encode(), self.artifacts())
+                if outcome in {"model_mismatch", "usage_invariant"}:
+                    self.assertEqual(self.run_page(URL + "-next")["reason"], "experiment_halted")
+
+    def test_call_and_cost_caps_skip_repair_without_charging(self):
+        for cap, value in (("daily_call_cap", 1), ("daily_cost_cap_usd", "0.3024576")):
+            with self.subTest(cap=cap), patch.dict(self.config, {cap: value}):
+                self.root = self.base / cap
+                self.write_config()
+                transport = Mock(return_value=completion({"extra": 1}))
+                result = self.run_page(transport=transport)
+                self.assertEqual(result["outcome"], "invalid_schema")
+                self.assertIs(result["repair_attempted"], False)
+                self.assertEqual(result["repair_outcome"], "skipped_cap")
+                self.assertEqual(result["provider_calls"], 1)
+                self.assertEqual(transport.call_count, 1)
+                self.assertEqual(result["reserved_usd"], "0.3024576")
+                self.assertEqual(result["charged_ceiling_usd"], "0.3024576")
+                self.assert_persisted_record(result)
+
+    def test_guards_recheck_config_and_dispatch_day_before_charging(self):
+        def disable():
+            self.config["enabled"] = False
+            self.write_config()
+
+        def next_day():
+            self.clock += dt.timedelta(days=1)
+
+        for guard in (disable, next_day):
+            with self.subTest(guard=guard.__name__):
+                self.root = self.base / guard.__name__
+                self.config["enabled"] = True
+                self.write_config()
+
+                def transport(*args):
+                    self.calls.append(args)
+                    guard()
+                    return completion({"extra": 1})
+
+                self.calls.clear()
+                result = self.run_page(transport=transport)
+                self.assertEqual(result["outcome"], "invalid_schema")
+                self.assertIs(result["repair_attempted"], False)
+                self.assertIsNone(result["repair_outcome"])
+                self.assertEqual(result["provider_calls"], 1)
+                self.assertEqual(len(self.calls), 1)
+                self.assertEqual(result["reserved_usd"], "0.3024576")
+                self.assert_persisted_record(result)
+
+    def test_escaped_credential_is_rejected_before_building_correction(self):
+        raw = completion({"invented": KEY})
+        raw["choices"][0]["message"]["content"] = dumps({"invented": KEY}).replace(KEY, r"\u0073" + KEY[1:])
+        self.assertNotIn(KEY, dumps(raw))
+        transport = Mock(return_value=raw)
+        with patch.object(runner, "repair_body", wraps=schema.repair_body) as repair_body:
+            result = self.run_page(transport=transport)
+        repair_body.assert_not_called()
+        self.assertEqual(result["outcome"], "credential_in_response")
+        self.assertIs(result["repair_attempted"], False)
+        self.assertIsNone(result["repair_outcome"])
+        self.assertEqual(result["provider_calls"], 1)
+        self.assertEqual(transport.call_count, 1)
+        self.assertEqual(result["reserved_usd"], "0.3024576")
+        self.assert_persisted_record(result)
+        self.assertNotIn(KEY.encode(), self.artifacts())
+
+    def test_generated_correction_is_checked_for_credentials(self):
+        key = "skeleton"
+        transport = Mock(return_value=completion({"extra": 1}))
+        result = self.run_page(transport=transport, key_loader=lambda: key)
+        self.assertEqual(result["outcome"], "credential_in_response")
+        self.assertIs(result["repair_attempted"], False)
+        self.assertIsNone(result["repair_outcome"])
+        self.assertEqual(result["provider_calls"], 1)
+        self.assertEqual(transport.call_count, 1)
+        self.assert_persisted_record(result)
+        self.assertNotIn(key.encode(), self.artifacts())
+
+    def test_listing_repair_requires_one_object_and_bounds_utf8_excerpt(self):
+        prior = [{"listing": "가" * 1000}] * 14
+        transport = Mock(side_effect=[completion(prior), completion(dict.fromkeys(schema.FIELDS))])
+        result = self.run_page(transport=transport)
+        self.assertEqual(result["schema_shape"], {"top_type": "list", "list_len": 14})
+        self.assertEqual(result["repair_outcome"], "ok")
+        self.assertIsNone(result["fields"]["open_call"])
+        self.assertEqual(transport.call_count, 2)
+        correction = transport.call_args.args[0]["messages"][-1]["content"]
+        self.assertIn("a single JSON object only", correction)
+        self.assertIn("a single object describing the page's one call", correction)
+        self.assertIn("If the page lists several calls, set open_call and all other call-specific fields to null", correction)
+        self.assertIn("Required top-level keys: " + ", ".join(schema.FIELDS), correction)
+        self.assertIn("JSON skeleton: " + dumps(dict.fromkeys(schema.FIELDS)), correction)
+        self.assertIn("untrusted data", correction)
+        excerpt, marker = correction.splitlines()[-2:]
+        excerpt_bytes = excerpt.encode("utf-8")
+        self.assertTrue(2045 < len(excerpt_bytes) <= 2048)
+        self.assertTrue(dumps(prior).encode("utf-8").startswith(excerpt_bytes))
+        self.assertEqual(marker, "[previous JSON truncated]")
+        self.assert_persisted_record(result)
 
 
 class ProviderFailures(Harness):
@@ -812,9 +1013,15 @@ class ProviderFailures(Harness):
         for i, raw in enumerate(cases):
             with self.subTest(i=i):
                 self.root = self.base / ("failure" + str(i))
-                result = self.run_page(transport=lambda *_: raw)
+                transport = Mock(return_value=raw)
+                result = self.run_page(transport=transport)
+                repaired = bool(raw["choices"] and raw["choices"][0]["message"]["content"] in ('{"extra":1}', '[]'))
                 self.assertNotEqual(result["outcome"], "ok")
-                self.assertEqual(result["charged_ceiling_usd"], "0.3024576")
+                self.assertEqual(result["charged_ceiling_usd"], "0.6049152" if repaired else "0.3024576")
+                self.assertEqual(result["provider_calls"], 1 + repaired)
+                self.assertEqual(transport.call_count, 1 + repaired)
+                self.assertIs(result["repair_attempted"], repaired)
+                self.assertEqual(result["repair_outcome"], "invalid_schema" if repaired else None)
                 self.assertIsNone(result["fields"])
                 self.assertEqual(self.run_page()["reason"], "experiment_halted" if result["outcome"] in ("model_mismatch", "usage_invariant") else "duplicate_page")
 
