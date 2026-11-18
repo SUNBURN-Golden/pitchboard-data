@@ -33,6 +33,8 @@ L4 pb_fact / pb_call_edition / pb_status_event   (append-only, evidence-backed, 
 gap finder: not_extracted | absent_in_source | inaccessible | conflict   (never AI-filled)  -> gap_fill: same-site reverse search by field hints
 ```
 
+Before queueing or registering discovered pages, the collector strips share and tracking parameters, preserves functional query parameters, and skips binary assets by extension. Guideline documents such as PDF, DOCX, and HWP remain eligible. The daemon records how many old junk sources it retires before fetching, keeping all rows and protecting site roots, manual clips, and sources with successful fetches, facts, or evidence. Both metrics exports report `sources_retired_junk` and `sources_never_fetched`. The latter counts active sources with neither a success timestamp nor a successful raw reference. Run `python scripts/eval_junk_sources.py SERVICE_SQLITE` to evaluate retirement and check protected sources on a temporary database copy.
+
 For `policy.ai`, `mentioned_unclassified` is a non-committal mention and cannot contradict another source's stated policy for the same dimension; same-source edits still supersede, and classified disagreements still open conflicts. Before the daily service projection and quality check, the daemon resolves groups with no remaining active cross-source contradiction and records an automatic review decision. Facts and their historical conflict links stay intact, with resolved groups ignored by current projections and gap checks; affected calls are marked dirty. Run `python scripts/eval_conflict_resolution.py SERVICE_SQLITE` to report the effect and verify fact integrity on a temporary copy without writing the original database.
 
 ## Safety rules enforced in code

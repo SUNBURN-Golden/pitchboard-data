@@ -14,7 +14,7 @@ from ..db import transaction
 from ..ids import sha256_hex
 from ..profiles import pitchboard as prof
 from . import parse, render, store
-from .net import FetchResult, Fetcher, normalize_url
+from .net import FetchResult, Fetcher, normalize_url, page_url
 
 PDF_MAX = 15_000_000
 IMG_MAX = 8_000_000
@@ -24,7 +24,7 @@ EXECUTOR_VERSION = "exec-1+" + prof.EXTRACTOR_VERSION + "+" + parse.PARSER_VERSI
 @dataclasses.dataclass
 class PageResult:
     url: str
-    raw_id: str
+    raw_id: Optional[str]
     outcome: str
     change_state: str
     kind: str
@@ -36,6 +36,7 @@ class PageResult:
     revision_id: Optional[str] = None
     reextracted: bool = False
     ocr: bool = False
+    skip_reason: Optional[str] = None
 
 
 def kind_for(url: str, ctype: str) -> str:
@@ -58,10 +59,26 @@ def _accept(url: str) -> str:
 
 
 def fetch_page(svc: sqlite3.Connection, fetcher: Fetcher, url: str, site_source_id: str, now: str, *, run_id: str = "",
-               parent_raw_id: Optional[str] = None, depth: int = 0, force_reextract: bool = False, infra=None, prefetched: Optional[FetchResult] = None) -> PageResult:
+               parent_raw_id: Optional[str] = None, depth: int = 0, force_reextract: bool = False, infra=None,
+               prefetched: Optional[FetchResult] = None, refresh: bool = False) -> PageResult:
     url = normalize_url(url)
-    page_source = store.ensure_page_source(svc, url, site_source_id, now)
-    prev = store.last_raw(svc, url, ok_only=True)
+    if svc.execute("SELECT 1 FROM pb_source WHERE canonical_url=? AND retired_reason IS NOT NULL", (url,)).fetchone():
+        return PageResult(url, None, "skipped", "", "", skip_reason="retired_source")
+    if refresh:
+        # Refresh the previously successful source, including historical image and share URLs.
+        prev = store.last_raw(svc, url, active_source=True)
+        if prev is None:
+            return PageResult(url, None, "skipped", "", "", skip_reason="no_active_successful_source")
+        page_source = prev["source_id"]
+    else:
+        clean_url = page_url(url)
+        if clean_url is None:
+            return PageResult(url, None, "skipped", "", "", skip_reason="binary_asset")
+        url = clean_url
+        page_source = store.ensure_page_source(svc, url, site_source_id, now)
+        if page_source is None:
+            return PageResult(url, None, "skipped", "", "", skip_reason="retired_source")
+        prev = store.last_raw(svc, url)
     max_bytes = PDF_MAX if kind_for(url, "") == "pdf" else IMG_MAX if kind_for(url, "") == "image" else 4_000_000
     res: FetchResult = prefetched if prefetched is not None else fetcher.fetch(url, accept=_accept(url), max_bytes=max_bytes, now_iso=now)
     kind = kind_for(res.final_url, res.content_type)

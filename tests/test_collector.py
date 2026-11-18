@@ -2,7 +2,7 @@ import datetime as dt
 import os
 import unittest
 
-from helpers import NOW
+from helpers import NOW, add_source
 import fixture_site as fx
 from pbdata import db
 from pbdata.collect import collector, goldeval, parse, scheduler, store
@@ -134,17 +134,14 @@ class E2E(unittest.TestCase):
     def test_full_flow(self):
         self.crawl("a")
         kinds = {r["kind"] for r in self.q("SELECT kind FROM pb_raw_ref WHERE outcome='ok'")}
-        self.assertTrue({"html", "pdf", "image"} <= kinds)
+        self.assertTrue({"html", "pdf"} <= kinds)
         urls = {r["url"] for r in self.q("SELECT url FROM pb_raw_ref")}
         self.assertIn(self.origin + "/calls/page/2/", urls)                     # list pagination followed
-        # PDF + OCR'd image collected with evidence, extractor versions stored
+        self.assertNotIn(self.origin + "/files/notice.png", urls)               # discovered binary link skipped
+        # PDF collected with evidence, extractor version stored
         exts = self.q("SELECT r.kind, e.field, e.extractor FROM pb_extraction e JOIN pb_raw_ref r USING(raw_id)")
-        self.assertTrue(any(r["kind"] == "image" and r["field"] == "deadline.closes_on" and r["extractor"].startswith("ocr") for r in exts))
         self.assertTrue(any(r["kind"] == "pdf" and r["field"] == "fee.submission" for r in exts))
         self.assertTrue(all(r["extractor_version"] for r in self.q("SELECT extractor_version FROM pb_raw_ref WHERE outcome='ok'")))
-        # OCR facts are never verified
-        for r in self.q("SELECT f.epistemic FROM pb_fact f JOIN pb_evidence ev USING(evidence_id) JOIN pb_source s ON s.source_id=f.source_id WHERE s.canonical_url LIKE '%notice.png'"):
-            self.assertNotEqual(r["epistemic"], "verified_fact")
         # prior-year call page did not become an open call
         self.assertEqual(self.q("SELECT count(*) c FROM pb_call_edition WHERE edition_key LIKE '2024%'")[0]["c"], 0)
         # SNS is a manual lead and was never fetched
@@ -156,6 +153,19 @@ class E2E(unittest.TestCase):
         self.assertTrue(all(x["filled_fact_id"] for x in g))
         # fee conflict (payments page: none; PDF: $15) is kept as an explicit conflict, not overwritten
         self.assertTrue(self.q("SELECT 1 FROM pb_conflict_group WHERE predicate='fee.submission'"))
+
+    def test_refresh_existing_image_notice_with_ocr(self):
+        url = self.origin + "/files/notice.png"
+        outlet = store.site_row(self.svc, self.sid)["site_outlet"]
+        sid = add_source(self.svc, url, outlet=outlet)
+        store.insert_raw(self.svc, NOW, source_id=sid, url=url, kind="image", fetch_method="ocr", outcome="ok",
+                         fetched_at=NOW, change_state="new")
+        c = self.ctx("refresh-image", minutes=10)
+        self.assertEqual(collector.enqueue_refresh(c), 1)
+        collector.run(c, max_jobs=1, log=None)
+        self.assertTrue(self.q("SELECT 1 FROM pb_extraction JOIN pb_raw_ref USING(raw_id) WHERE source_id=? "
+                               "AND field='deadline.closes_on' AND extractor LIKE 'ocr%'", sid))
+        self.assertFalse(self.q("SELECT 1 FROM pb_fact WHERE source_id=? AND epistemic='verified_fact'", sid))
 
     def test_idempotent_rerun(self):
         self.crawl("a")

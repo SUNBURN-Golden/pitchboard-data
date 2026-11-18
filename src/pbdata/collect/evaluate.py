@@ -9,11 +9,10 @@ import sqlite3
 from typing import Dict, List, Optional
 from urllib.parse import urlparse
 
-from .. import timeutil
 from ..db import transaction
 from ..profiles import pitchboard as prof
 from . import parse, store
-from .net import FetchResult, Fetcher, normalize_url, origin_of, registered_domain
+from .net import FetchResult, Fetcher, page_url, registered_domain
 
 TRIAL_PAGES = 4
 MIN_RELEVANCE = 0.4
@@ -57,7 +56,9 @@ def trial_crawl(svc: sqlite3.Connection, fetcher: Fetcher, cand: sqlite3.Row, ta
     if svc.execute("SELECT 1 FROM pb_source_site WHERE registered_domain=?", (rd,)).fetchone():
         scores.update(novelty=0.0, duplicate="registered_domain")
         return done("registered_existing", "domain_already_registered")
-    entry = normalize_url(cand["url"])
+    entry = page_url(cand["url"])
+    if entry is None:
+        return done("rejected", "binary_asset")
     if entry.startswith("http://"):                                        # prefer https; fall back to the given http URL only if https is unusable
         up = "https://" + entry[len("http://"):]
         first = fetcher.fetch(up, now_iso=now)
@@ -85,10 +86,11 @@ def trial_crawl(svc: sqlite3.Connection, fetcher: Fetcher, cand: sqlite3.Row, ta
     # follow the most call-like same-site links
     ranked = sorted({l.href: l for l in doc.links if _same_site(l.href, first.final_url) and l.href.startswith("http")}.values(),
                     key=lambda l: -prof.link_priority(l))
-    follow = [l for l in ranked if prof.link_priority(l) >= 0.5 and not prof.ATTACH_RE.search(l.href)][:TRIAL_PAGES - 1]
-    for l in follow:
-        u = normalize_url(l.href)
-        if u in pages:
+    for l in ranked:
+        if len(pages) >= TRIAL_PAGES or prof.link_priority(l) < 0.5:
+            break
+        u = page_url(l.href)
+        if u is None or u in pages or prof.ATTACH_RE.search(u):
             continue
         r = fetcher.fetch(u, now_iso=now)
         pages[u] = r

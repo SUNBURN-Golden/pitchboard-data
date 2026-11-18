@@ -17,7 +17,7 @@ from ..db import transaction
 from ..ids import new_id
 from ..profiles import pitchboard as prof
 from . import names, store
-from .net import normalize_url, origin_of, registered_domain
+from .net import page_url
 from .wiki import Api
 
 EXCLUDE_HOSTS = ("wikipedia.org", "wikimedia.org", "wikidata.org", "archive.org", "web.archive.org", "doi.org", "books.google", "amazon.", "worldcat.org",
@@ -153,13 +153,16 @@ def add_candidates(svc: sqlite3.Connection, cands: Iterable[Cand], target_id: st
             per[c.strategy] = svc.execute("SELECT count(*) FROM pb_discovery_candidate WHERE target_id=? AND strategy=?", (target_id, c.strategy)).fetchone()[0]
         if per[c.strategy] >= budget.max_candidates or c.prior < budget.min_prior or depth > budget.max_depth:
             break
-        host = urlparse(c.url).netloc.lower()
+        url = page_url(c.url)
+        if url is None:
+            continue
+        host = urlparse(url).netloc.lower()
         if not host or store.is_blocked(host):
             continue
         cid = new_id("cand", ms)
         with transaction(svc):
             cur = svc.execute("INSERT OR IGNORE INTO pb_discovery_candidate(cand_id,url,host,label,target_id,strategy,origin_ref,parent_cand_id,depth,prior_relevance,state,discovered_at)"
-                              " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (cid, c.url, host, c.label[:120], target_id, c.strategy, c.origin_ref, parent, depth, c.prior, "new", now))
+                              " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (cid, url, host, c.label[:120], target_id, c.strategy, c.origin_ref, parent, depth, c.prior, "new", now))
         if cur.rowcount:
             new_ids.append(cid)
             per[c.strategy] += 1
