@@ -13,10 +13,19 @@ def _scoped(svc, target_ids):
     return ",".join("'%s'" % t for t in target_ids)
 
 
+def source_fetch_counts(svc: sqlite3.Connection) -> dict:
+    return dict(svc.execute(
+        "SELECT count(CASE WHEN s.retired_reason IS NULL AND s.last_success_at IS NULL "
+        "AND NOT EXISTS (SELECT 1 FROM pb_raw_ref r WHERE r.source_id=s.source_id AND r.outcome='ok') "
+        "THEN 1 END) AS sources_never_fetched, count(s.retired_reason) AS sources_retired_junk "
+        "FROM pb_source s"
+    ).fetchone())
+
+
 def compute(svc: sqlite3.Connection, infra: sqlite3.Connection, targets: dict, gold: Optional[dict] = None) -> Dict:
     tids = [t["id"] for t in targets["targets"]]
     q = _scoped(svc, tids)
-    out: Dict = {"target_lists": tids}
+    out: Dict = {"target_lists": tids, **source_fetch_counts(svc)}
     # 1. new valid sources: registered, NOT in the seed list, and at least one non-stale call/rules page with extracted required fields
     per: Dict[str, Dict] = {}
     for t in tids:
@@ -25,7 +34,8 @@ def compute(svc: sqlite3.Connection, infra: sqlite3.Connection, targets: dict, g
             "SELECT count(DISTINCT ss.source_id) FROM pb_source_site ss JOIN pb_source s ON s.owner_outlet_id=ss.outlet_id "
             "JOIN pb_raw_ref r ON r.source_id=s.source_id AND r.outcome='ok' JOIN pb_label l ON l.raw_id=r.raw_id "
             "AND ((l.label='rules') OR (l.label='recruitment' AND l.status NOT IN ('stale_prior_year','results_not_call','past_deadline','not_writing_call'))) "
-            "WHERE ss.target_id=? AND ss.in_seed_list=0 AND EXISTS (SELECT 1 FROM pb_extraction e WHERE e.raw_id=r.raw_id AND e.field IN (%s))" %
+            "WHERE ss.target_id=? AND ss.in_seed_list=0 AND s.retired_reason IS NULL "
+            "AND EXISTS (SELECT 1 FROM pb_extraction e WHERE e.raw_id=r.raw_id AND e.field IN (%s))" %
             ",".join("'%s'" % k for k in prof.REQUIRED), (t,)).fetchone()[0]
         cand = dict(svc.execute("SELECT state, count(*) FROM pb_discovery_candidate WHERE target_id=? GROUP BY state", (t,)).fetchall())
         per[t] = {"candidates": sum(cand.values()), "by_state": cand, "new_sources_registered": reg_new, "new_valid_sources": valid}

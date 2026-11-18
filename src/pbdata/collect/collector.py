@@ -14,7 +14,7 @@ from .. import facts, timeutil
 from ..db import transaction
 from ..profiles import pitchboard as prof
 from . import discover, evaluate, executor, gaps, names, parse, promote, resolve, scheduler, store
-from .net import Fetcher, FetchResult, normalize_url, origin_of, registered_domain
+from .net import Fetcher, FetchResult, normalize_url, origin_of, page_url, registered_domain
 from .wiki import Api
 
 MAX_DEPTH = 3
@@ -115,10 +115,11 @@ def h_evaluate(ctx: Ctx, p: dict, job) -> dict:
                         (ev.state, ev.reason, json.dumps(ev.scores, sort_keys=True), source_id, now, cand["cand_id"]))
     if source_id:
         for u, r in ev.pages.items():
-            if r.outcome == "ok":
-                ctx.trial_cache[normalize_url(u)] = r
+            u = page_url(u)
+            if r.outcome == "ok" and u is not None:
+                ctx.trial_cache[u] = r
                 scheduler.enqueue(ctx.infra, "fetch_page", "discovery", {"url": u, "site_source_id": source_id, "depth": 1, "via": "trial"},
-                                  "fetch|%s|%s" % (normalize_url(u), ctx.run_tag), scheduler.priority(novelty=1.0, quality=0.7, urgency=0.5), now, depth=1)
+                                  "fetch|%s|%s" % (u, ctx.run_tag), scheduler.priority(novelty=1.0, quality=0.7, urgency=0.5), now, depth=1)
         scheduler.enqueue(ctx.infra, "expand_site", "backfill", {"site_source_id": source_id, "feeds": ev.feeds}, "expand|%s|%s" % (source_id, ctx.run_tag),
                           scheduler.priority(novelty=0.9, quality=ev.scores.get("relevance", 0.5), cost=0.5), now, depth=1)
     ctx.bump("evaluated")
@@ -143,7 +144,9 @@ def h_fetch_page(ctx: Ctx, p: dict, job) -> dict:
         return {"skipped": "permission"}
     pf = ctx.trial_cache.pop(url, None)
     r = executor.fetch_page(ctx.svc, ctx.fetcher, url, site_id, now, run_id=ctx.run_id, depth=depth, infra=ctx.infra, prefetched=pf,
-                            force_reextract=bool(p.get("force_reextract")))
+                            force_reextract=bool(p.get("force_reextract")), refresh=p.get("via") == "refresh")
+    if r.skip_reason:
+        return {"skipped": r.skip_reason}
     out = {"outcome": r.outcome, "change": r.change_state, "kind": r.kind, "requests": 0 if pf else r.requests}
     ctx.bump("pages_" + r.outcome)
     if r.outcome != "ok":
@@ -162,7 +165,7 @@ def h_fetch_page(ctx: Ctx, p: dict, job) -> dict:
     out["gaps_open"] = gp["open"]
     _enqueue_gap_jobs(ctx, site, now)
     if r.doc is not None and r.kind == "html" and (r.change_state != "unchanged" or r.reextracted or True) and depth < MAX_DEPTH:
-        _follow(ctx, r, site, site_id, url, depth, now, p.get("hop", 0))
+        _follow(ctx, r, site, site_id, r.url, depth, now, p.get("hop", 0))
     return out
 
 
@@ -171,30 +174,39 @@ def _same_site(a: str, b: str) -> bool:
 
 
 def _follow(ctx: Ctx, r, site, site_id: str, url: str, depth: int, now: str, hop: int = 0) -> None:
-    """Chain: list pagination, submission/guideline pages, attachments (pdf/image), apply form, SNS leads, entity follow-ups."""
+    """Chain: list pagination, guidelines, document attachments, apply forms, SNS leads, entity follow-ups."""
     doc = r.doc
     n = 0
+    seen_urls = {url}
     for nxt in doc.next_pages[:2]:       # list pagination stays at the same depth; bounded by hop count (<=5) and the per-site page cap
-        if _same_site(nxt, url) and hop < 5:
+        nxt = page_url(nxt)
+        if nxt is not None and nxt not in seen_urls and _same_site(nxt, url) and hop < 5:
             scheduler.enqueue(ctx.infra, "fetch_page", "backfill", {"url": nxt, "site_source_id": site_id, "depth": depth, "via": "pagination", "hop": hop + 1},
-                              "fetch|%s|%s" % (normalize_url(nxt), ctx.run_tag), scheduler.priority(novelty=0.6, quality=0.5, cost=0.3), now, depth=depth)
+                              "fetch|%s|%s" % (nxt, ctx.run_tag), scheduler.priority(novelty=0.6, quality=0.5, cost=0.3), now, depth=depth)
+            seen_urls.add(nxt)
     for l in sorted(doc.links, key=lambda x: -prof.link_priority(x)):
-        if not l.href.startswith("http") or n >= 8 or prof.cycle_score(l.href + " " + (l.text or "")) < 0:
+        if n >= 8:
+            break
+        href = page_url(l.href)
+        if href is None or href in seen_urls or not href.startswith("http") or prof.cycle_score(href + " " + (l.text or "")) < 0:
             continue
-        host = urlparse(l.href).netloc.lower()
+        host = urlparse(href).netloc.lower()
         if store.is_blocked(host):
             if prof.SNS_HOST.search(l.href):
                 _sns_lead(ctx, l.href, site, now)
             continue
-        pr = prof.link_priority(l)
-        if prof.ATTACH_RE.search(l.href) and _same_site(l.href, url) and (pr > 0 or re.search(r"guideline|rules|요강|공고|공모|submission|notice|poster|announce|call|공지|포스터", l.href + l.text, re.I)):
-            scheduler.enqueue(ctx.infra, "fetch_page", "backfill", {"url": l.href, "site_source_id": site_id, "depth": depth + 1, "via": "attachment"},
-                              "fetch|%s|%s" % (normalize_url(l.href), ctx.run_tag), scheduler.priority(novelty=0.8, quality=0.8, urgency=0.5, cost=0.4), now, depth=depth + 1)
+        pr = prof.link_priority(dataclasses.replace(l, href=href))
+        attachment = prof.ATTACH_RE.search(href)
+        if attachment and _same_site(href, url) and (pr > 0 or re.search(r"guideline|rules|요강|공고|공모|submission|notice|poster|announce|call|공지|포스터", href + l.text, re.I)):
+            scheduler.enqueue(ctx.infra, "fetch_page", "backfill", {"url": href, "site_source_id": site_id, "depth": depth + 1, "via": "attachment"},
+                              "fetch|%s|%s" % (href, ctx.run_tag), scheduler.priority(novelty=0.8, quality=0.8, urgency=0.5, cost=0.4), now, depth=depth + 1)
             n += 1
-        elif pr >= 0.5 and _same_site(l.href, url) and not prof.ATTACH_RE.search(l.href) and not re.search(r"/(20(0\d|1\d))/", l.href):
-            scheduler.enqueue(ctx.infra, "fetch_page", "backfill", {"url": l.href, "site_source_id": site_id, "depth": depth + 1, "via": "link"},
-                              "fetch|%s|%s" % (normalize_url(l.href), ctx.run_tag), scheduler.priority(novelty=0.7, quality=min(1, pr), cost=0.3), now, depth=depth + 1)
+            seen_urls.add(href)
+        elif pr >= 0.5 and _same_site(href, url) and not attachment and not re.search(r"/(20(0\d|1\d))/", href):
+            scheduler.enqueue(ctx.infra, "fetch_page", "backfill", {"url": href, "site_source_id": site_id, "depth": depth + 1, "via": "link"},
+                              "fetch|%s|%s" % (href, ctx.run_tag), scheduler.priority(novelty=0.7, quality=min(1, pr), cost=0.3), now, depth=depth + 1)
             n += 1
+            seen_urls.add(href)
         elif prof.SNS_HOST.search(l.href):
             _sns_lead(ctx, l.href, site, now)
     # entity follow-ups from text (organisers / sponsors named on the page)
@@ -257,15 +269,15 @@ def h_expand_site(ctx: Ctx, p: dict, job) -> dict:
         if res.outcome == "ok":
             urls += [it["link"] for it in parse.parse_feed(res.body)[:40] if it["link"]]
     picked = []
-    for u in dict.fromkeys(urls):
-        if not (prof.HIGH_VALUE_PATH.search(u) or (prof.NEWS_PATH.search(u) and prof.cycle_score(u) > 0)) or prof.cycle_score(u) < 0 \
-                or re.search(r"/tag/|/category/|/author/|\.(jpg|png|gif|css|js)$", u):
+    for u in dict.fromkeys(map(page_url, urls)):
+        if u is None or not (prof.HIGH_VALUE_PATH.search(u) or (prof.NEWS_PATH.search(u) and prof.cycle_score(u) > 0)) or prof.cycle_score(u) < 0 \
+                or re.search(r"/tag/|/category/|/author/", u):
             continue
         picked.append(u)
     picked = sorted(picked, key=lambda u: -prof.cycle_score(u))[:8]
     for u in picked:
         scheduler.enqueue(ctx.infra, "fetch_page", "backfill", {"url": u, "site_source_id": p["site_source_id"], "depth": 2, "via": "sitemap"},
-                          "fetch|%s|%s" % (normalize_url(u), ctx.run_tag), scheduler.priority(novelty=0.8, quality=0.6, urgency=0.4, cost=0.3), now, depth=2)
+                          "fetch|%s|%s" % (u, ctx.run_tag), scheduler.priority(novelty=0.8, quality=0.6, urgency=0.4, cost=0.3), now, depth=2)
     return {"sitemap_urls": len(urls), "enqueued": len(picked), "requests": 0}
 
 
@@ -280,7 +292,8 @@ def h_gap_fill(ctx: Ctx, p: dict, job) -> dict:
     hints = [h.lower() for h in prof.FIELD_HINTS.get(g["predicate"], [])]
     urls = _sitemap_urls(ctx, site["origin"])
     fetched = {r[0] for r in ctx.svc.execute("SELECT DISTINCT url FROM pb_raw_ref r JOIN pb_source s USING(source_id) WHERE s.owner_outlet_id=?", (site["site_outlet"],))}
-    scored = sorted(((sum(1 for h in hints if h in u.lower()), u) for u in urls if normalize_url(u) not in fetched and not re.search(r"/(19|20(0\d|1\d))/|/tag/|/category/|\.(jpg|png|gif)$", u)), reverse=True)
+    scored = sorted(((sum(1 for h in hints if h in u.lower()), u) for u in dict.fromkeys(map(page_url, urls))
+                     if u is not None and u not in fetched and not re.search(r"/(19|20(0\d|1\d))/|/tag/|/category/", u)), reverse=True)
     pick = [u for s, u in scored if s > 0][:2]
     filled_before = g["state"]
     before_facts = ctx.svc.execute("SELECT count(*) FROM pb_fact").fetchone()[0]
@@ -314,8 +327,10 @@ def refresh_candidates(svc: sqlite3.Connection, now: str, horizon_hours: float =
     horizon = timeutil.iso(timeutil.parse_iso(now) + dt.timedelta(hours=horizon_hours))
     rows = [dict(r, refresh_fresh_until=None) for r in svc.execute(
         "SELECT url, source_id, depth, fetched_at AS last FROM ("
-        "SELECT r.*, row_number() OVER (PARTITION BY url ORDER BY fetched_at DESC, raw_id DESC) AS rn "
-        "FROM pb_raw_ref r WHERE outcome='ok' AND kind IN ('html','pdf','image')) "
+        "SELECT r.*, row_number() OVER (PARTITION BY r.url ORDER BY r.fetched_at DESC, r.raw_id DESC) AS rn "
+        "FROM pb_raw_ref r JOIN pb_source s USING(source_id) WHERE s.retired_reason IS NULL "
+        "AND NOT EXISTS (SELECT 1 FROM pb_source retired WHERE retired.canonical_url=r.url AND retired.retired_reason IS NOT NULL) "
+        "AND r.outcome='ok' AND r.kind IN ('html','pdf','image')) "
         "WHERE rn=1 ORDER BY last, url")]
     by_source = {}
     for r in rows:
@@ -324,7 +339,7 @@ def refresh_candidates(svc: sqlite3.Connection, now: str, horizon_hours: float =
         "SELECT f.fact_id, f.source_id, s.canonical_url FROM pb_fact f "
         "JOIN pb_call_edition c ON f.subject_type='call' AND c.call_id=f.subject_id "
         "JOIN pb_source s ON s.source_id=f.source_id "
-        "WHERE f.superseded_at IS NULL AND c.status IN ('announced','open','extended','standing') "
+        "WHERE s.retired_reason IS NULL AND f.superseded_at IS NULL AND c.status IN ('announced','open','extended','standing') "
         "AND (f.predicate='status.declared' OR (f.predicate='deadline.closes_on' "
         "AND json_extract(f.value_json,'$.date')>=?))", (now[:10],)).fetchall()
     for f in live:

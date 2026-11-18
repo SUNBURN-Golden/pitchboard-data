@@ -13,7 +13,7 @@ import urllib.error
 import urllib.request
 import urllib.robotparser
 from typing import Dict, Optional, Tuple
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import unquote, unquote_plus, urljoin, urlparse, urlunparse
 
 from ..ids import sha256_hex
 from . import egress
@@ -26,6 +26,10 @@ MIN_INTERVAL = 2.0
 LOGIN_RE = re.compile(r"(log ?in|sign ?in|로그인|member only|회원 전용|subscribe to (read|continue)|paywall)", re.I)
 CHALLENGE_RE = re.compile(r"(cf-challenge|just a moment\.\.\.|g-recaptcha|hcaptcha|are you (a )?human|verify you are human|access denied|captcha)", re.I)
 PASSWORD_RE = re.compile(r"<input[^>]+type=[\"']?password", re.I)
+TRACKING_PARAMS = {"share", "amp-share", "replytocom", "fbclid", "gclid"}
+BINARY_PAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg", ".ico", ".bmp", ".tif", ".tiff",
+                          ".mp4", ".mov", ".webm", ".mp3", ".wav", ".zip", ".gz", ".rar", ".7z",
+                          ".woff", ".woff2", ".ttf", ".css", ".js")
 
 
 @dataclasses.dataclass
@@ -71,6 +75,41 @@ def normalize_url(url: str) -> str:
     p = urlparse(url.strip())
     path = p.path or "/"
     return urlunparse((p.scheme.lower(), p.netloc.lower(), path, "", p.query, ""))
+
+
+def _is_tracking_param(field: str) -> bool:
+    key = unquote_plus(field.partition("=")[0]).lower()
+    return key in TRACKING_PARAMS or key.startswith("utm_")
+
+
+def strip_tracking_params(url: str) -> str:
+    """Remove share/tracking parameters while keeping the other query fields verbatim."""
+    base, fragment_sep, fragment = url.partition("#")
+    path, _, query = base.partition("?")
+    fields = query.split("&")
+    kept = [field for field in fields if not _is_tracking_param(field)]
+    if len(fields) == len(kept):
+        return url
+    return path + ("?" + "&".join(kept) if any(kept) else "") + fragment_sep + fragment
+
+
+def junk_page_url(url: str) -> Optional[str]:
+    """Classify a stored or discovered page URL without changing it."""
+    try:
+        p = urlparse(url.strip())
+    except ValueError:
+        return None
+    if any(_is_tracking_param(field) for field in p.query.split("&")):
+        return "share_variant"
+    if unquote(p.path).lower().endswith(BINARY_PAGE_EXTENSIONS):
+        return "binary_asset"
+    return None
+
+
+def page_url(url: str) -> Optional[str]:
+    """Canonical URL for a new page, or None for a binary asset."""
+    url = normalize_url(strip_tracking_params(url.strip()))
+    return None if junk_page_url(url) else url
 
 
 class Fetcher:

@@ -14,7 +14,7 @@ from ..db import transaction
 from ..ids import new_id, sha256_hex, stable_id
 from ..rules import sanitize_excerpt
 from . import names
-from .net import normalize_url, origin_of, registered_domain
+from .net import junk_page_url, normalize_url, page_url, registered_domain
 
 CONFIG = Path(__file__).resolve().parents[3] / "config"
 
@@ -77,21 +77,47 @@ def site_row(svc: sqlite3.Connection, source_id: str) -> Optional[sqlite3.Row]:
     return svc.execute("SELECT s.*, ss.outlet_id AS site_outlet, ss.origin, ss.target_id FROM pb_source s JOIN pb_source_site ss USING(source_id) WHERE s.source_id=?", (source_id,)).fetchone()
 
 
-def ensure_page_source(svc: sqlite3.Connection, url: str, site_source_id: str, now: str) -> str:
-    url = normalize_url(url)
+def ensure_page_source(svc: sqlite3.Connection, url: str, site_source_id: str, now: str) -> Optional[str]:
+    url = page_url(url)
+    if url is None:
+        return None
     sid = stable_id("src", url)
-    if svc.execute("SELECT 1 FROM pb_source WHERE source_id=?", (sid,)).fetchone():
-        return sid
-    site = site_row(svc, site_source_id)
-    svc.execute("INSERT INTO pb_source(source_id,canonical_url,host,source_type,authority,owner_outlet_id,owner_name,permission,permission_basis,"
-                "permission_checked_on,max_epistemic,refresh_hours) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (sid, url, urlparse(url).netloc.lower(), "official_guidelines", site["authority"], site["owner_outlet_id"], site["owner_name"],
-                 site["permission"], "inherits_site:" + site_source_id, now[:10], site["max_epistemic"], 24))
+    with transaction(svc):
+        existing = svc.execute("SELECT source_id, retired_reason FROM pb_source WHERE canonical_url=?", (url,)).fetchone()
+        if existing is not None:
+            return existing["source_id"] if existing["retired_reason"] is None else None
+        site = site_row(svc, site_source_id)
+        svc.execute("INSERT INTO pb_source(source_id,canonical_url,host,source_type,authority,owner_outlet_id,owner_name,permission,permission_basis,"
+                    "permission_checked_on,max_epistemic,refresh_hours) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (sid, url, urlparse(url).netloc.lower(), "official_guidelines", site["authority"], site["owner_outlet_id"], site["owner_name"],
+                     site["permission"], "inherits_site:" + site_source_id, now[:10], site["max_epistemic"], 24))
     return sid
 
 
-def last_raw(svc: sqlite3.Connection, url: str, ok_only: bool = True) -> Optional[sqlite3.Row]:
-    q = "SELECT * FROM pb_raw_ref WHERE url=?" + (" AND outcome='ok'" if ok_only else "") + " ORDER BY rowid DESC LIMIT 1"
+def retire_junk_sources(svc: sqlite3.Connection) -> int:
+    """Retire junk URLs with no successful fetch, fact, evidence, or site registration."""
+    with transaction(svc):
+        rows = svc.execute(
+            "SELECT s.source_id, s.canonical_url FROM pb_source s "
+            "WHERE s.retired_reason IS NULL AND s.last_success_at IS NULL AND s.source_type<>'manual_clip' "
+            "AND NOT EXISTS (SELECT 1 FROM pb_source_site ss WHERE ss.source_id=s.source_id) "
+            "AND NOT EXISTS (SELECT 1 FROM pb_fact f WHERE f.source_id=s.source_id) "
+            "AND NOT EXISTS (SELECT 1 FROM pb_evidence e WHERE e.source_id=s.source_id) "
+            "AND NOT EXISTS (SELECT 1 FROM pb_raw_ref r WHERE r.source_id=s.source_id AND r.outcome='ok') "
+            "ORDER BY s.source_id"
+        )
+        updates = [(reason, r["source_id"]) for r in rows if (reason := junk_page_url(r["canonical_url"]))]
+        svc.executemany("UPDATE pb_source SET retired_reason=? WHERE source_id=?", updates)
+    return len(updates)
+
+
+def last_raw(svc: sqlite3.Connection, url: str, ok_only: bool = True, *, active_source: bool = False) -> Optional[sqlite3.Row]:
+    q = "SELECT r.* FROM pb_raw_ref r WHERE r.url=?" + (" AND r.outcome='ok'" if ok_only else "")
+    if active_source:
+        q += " AND EXISTS (SELECT 1 FROM pb_source s WHERE s.source_id=r.source_id AND s.retired_reason IS NULL)"
+        q += " ORDER BY r.fetched_at DESC, r.raw_id DESC LIMIT 1"
+    else:
+        q += " ORDER BY r.rowid DESC LIMIT 1"
     return svc.execute(q, (normalize_url(url),)).fetchone()
 
 
