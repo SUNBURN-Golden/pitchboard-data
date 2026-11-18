@@ -11,7 +11,7 @@ mapfile -t lanes < <(python3 -c 'import json,sys;print("\n".join(json.load(open(
 run_one() {
   local kind="${1%%:*}" model="${1#*:}"
   case "$kind" in
-    codex)    printf "%s\n" "$prompt" | codex exec --dangerously-bypass-approvals-and-sandbox -m "$model" -c model_reasoning_effort='"high"' - ;;
+    codex)    printf "%s\n" "$prompt" | codex exec --dangerously-bypass-approvals-and-sandbox -m "$model" -c model_reasoning_effort='"xhigh"' - ;;
     deepseek) [ -n "${DEEPSEEK_API_KEY:-}" ] || { echo "DEEPSEEK_API_KEY not set"; return 77; }
               mkdir -p "$HOME/.claude-deepseek"
               printf "%s\n" "$prompt" | env -u CLAUDE_CONFIG_DIR CLAUDE_CONFIG_DIR="$HOME/.claude-deepseek" \
