@@ -249,6 +249,8 @@ class ShadowRunner:
                         except Exception:
                             record["outcome"] = "provider_error"
                             record["provider"] = "qwen"
+                # Repair runs strictly after the fallback block, so a provider_error
+                # outcome here can never re-trigger the fallback.
                 if repair is not None:
                     prior, repair_transport, repair_key, original_body = repair
                     try:
@@ -270,6 +272,9 @@ class ShadowRunner:
                         try:
                             new_cost = state.reserve_extra_call(conn, config, dispatch, attempt)
                         except Stop as exc:
+                            # Only the cap maps to skipped_cap; other guard stops
+                            # (halt/clock/config/state) keep invalid_schema with
+                            # repair_attempted=false, like the fallback's uncharged guard.
                             if str(exc) == "budget_exhausted":
                                 record["repair_outcome"] = "skipped_cap"
                         else:

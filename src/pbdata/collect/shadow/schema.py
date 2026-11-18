@@ -322,6 +322,8 @@ def repair_body(body, prior):
         correction += ("Return a single object describing the page's one call if it has one. "
                        "If the page lists several calls, set open_call and all other call-specific fields to null.\n")
     prior_bytes = dumps(prior).encode("utf-8", errors="backslashreplace")
+    # errors="ignore" drops a partial trailing codepoint, so the excerpt ends on a
+    # codepoint boundary (never a split multibyte character) and stays <=2048 bytes.
     excerpt = prior_bytes[:2048].decode("utf-8", errors="ignore")
     if len(prior_bytes) > 2048:
         excerpt += "\n[previous JSON truncated]"

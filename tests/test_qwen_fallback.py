@@ -101,13 +101,12 @@ class QwenFallbackTests(Harness):
         self.assertEqual(result["returned_model"], "qwen4.0-max-preview")
 
     def test_fallback_shapes_reach_jsonl_and_ledger_with_call_accounting(self):
-        for i, (raw, outcome, shape, reasons) in enumerate(shape_cases()):
+        for i, (raw, outcome, shape, reasons, repaired) in enumerate(shape_cases()):
             with self.subTest(case=i):
                 self.root = self.base / ("shape" + str(i))
                 qwen = Mock(return_value=qwen_completion(raw))
                 with patch.object(socket.socket, "connect", side_effect=AssertionError("network")):
                     result = self.fallback(qwen=qwen)
-                repaired = outcome == "invalid_schema" and (bool(shape.get("missing")) or shape.get("list_len", 1) != 1)
                 cost = "0.9073728" if repaired else "0.6049152"
                 self.assertEqual(result["outcome"], outcome)
                 self.assertEqual(result["schema_shape"], shape)

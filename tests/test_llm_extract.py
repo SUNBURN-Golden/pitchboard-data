@@ -59,21 +59,25 @@ def shape_cases():
     del missing["pay"]
     nonverbatim = proposal()
     nonverbatim["pay"]["value"]["text"] = "value_sentinel"
+    # The last element is the hand-enumerated repair expectation per case, independent
+    # of the recorded schema_shape and of the runner's eligibility rule.
     cases = [
-        (proposal(), "ok", {}, {}),
-        (dict.fromkeys(schema.FIELDS), "ok", {}, {}),
-        (nonverbatim, "ok", {}, {"pay": "value_not_verbatim"}),
-        (missing, "ok", shape_summary(missing=["pay"]), {"pay": "missing_key"}),
-        ({}, "ok", shape_summary(missing=schema.FIELDS), dict.fromkeys(schema.FIELDS, "missing_key")),
-        ({**proposal(), "extra": "value_sentinel"}, "invalid_schema", shape_summary(extra=["extra"]), {}),
-        ({"result": proposal()}, "invalid_schema", shape_summary(missing=schema.FIELDS, extra=["result"]), {}),
+        (proposal(), "ok", {}, {}, False),
+        (dict.fromkeys(schema.FIELDS), "ok", {}, {}, False),
+        (nonverbatim, "ok", {}, {"pay": "value_not_verbatim"}, False),
+        (missing, "ok", shape_summary(missing=["pay"]), {"pay": "missing_key"}, False),
+        ({}, "ok", shape_summary(missing=schema.FIELDS), dict.fromkeys(schema.FIELDS, "missing_key"), False),
+        ({**proposal(), "extra": "value_sentinel"}, "invalid_schema", shape_summary(extra=["extra"]), {}, False),
+        ({"result": proposal()}, "invalid_schema", shape_summary(missing=schema.FIELDS, extra=["result"]), {}, True),
     ]
-    cases += [([raw], outcome, {**shape, "unwrapped_list": True}, reasons)
-              for raw, outcome, shape, reasons in cases]
-    cases += [(raw, "invalid_schema", {"top_type": "list", "list_len": len(raw)}, {})
-              for raw in ([], [proposal(), proposal()], [proposal(), "value_sentinel"],
-                          ["value_sentinel"], [42], [1.5], [True], [False], [None], [[proposal()]])]
-    cases.append(("value_sentinel", "invalid_schema", shape_summary(top_type="str"), {}))
+    cases += [([raw], outcome, {**shape, "unwrapped_list": True}, reasons, repaired)
+              for raw, outcome, shape, reasons, repaired in cases]
+    cases += [(raw, "invalid_schema", {"top_type": "list", "list_len": len(raw)}, {}, repaired)
+              for raw, repaired in (([], True), ([proposal(), proposal()], True),
+                                    ([proposal(), "value_sentinel"], True), (["value_sentinel"], False),
+                                    ([42], False), ([1.5], False), ([True], False), ([False], False),
+                                    ([None], False), ([[proposal()]], False))]
+    cases.append(("value_sentinel", "invalid_schema", shape_summary(top_type="str"), {}, False))
     return cases
 
 
@@ -593,7 +597,7 @@ class SchemaShapeTests(unittest.TestCase):
     def test_response_object_and_wrapped_object_keep_identical_validation(self):
         config = json.loads(common.CONFIG.read_text())
         doc = page().doc()
-        for raw, outcome, expected_shape, expected_reasons in shape_cases():
+        for raw, outcome, expected_shape, expected_reasons, _ in shape_cases():
             if not isinstance(raw, dict):
                 continue
             with self.subTest(shape=expected_shape, reasons=expected_reasons):
@@ -622,7 +626,7 @@ class SchemaShapeTests(unittest.TestCase):
 
     def test_rejected_lists_report_only_type_and_integer_length(self):
         config = json.loads(common.CONFIG.read_text())
-        lists = [raw for raw, outcome, _, _ in shape_cases()
+        lists = [raw for raw, outcome, *_ in shape_cases()
                  if isinstance(raw, list) and outcome == "invalid_schema"]
         # Direct validate() must reject even a singleton dictionary.
         lists += [[proposal()], [{"private_key_sentinel": "private_value_sentinel"}]]
@@ -744,7 +748,7 @@ class SchemaShapeTests(unittest.TestCase):
 
 class SchemaShapeRunnerTests(Harness):
     def test_primary_shapes_reach_jsonl_and_ledger_without_fallback(self):
-        for i, (raw, outcome, shape, reasons) in enumerate(shape_cases()):
+        for i, (raw, outcome, shape, reasons, repaired) in enumerate(shape_cases()):
             with self.subTest(case=i):
                 self.root = self.base / ("shape" + str(i))
                 transport = Mock(return_value=completion(raw))
@@ -752,7 +756,6 @@ class SchemaShapeRunnerTests(Harness):
                     result = self.run_page(transport=transport,
                                            fallback_transport=lambda *_: self.fail("unexpected fallback"),
                                            fallback_key_loader=lambda: self.fail("unexpected fallback key lookup"))
-                repaired = outcome == "invalid_schema" and (bool(shape.get("missing")) or shape.get("list_len", 1) != 1)
                 cost = "0.6049152" if repaired else "0.3024576"
                 self.assertEqual(result["outcome"], outcome)
                 self.assertEqual(result["schema_shape"], shape)
