@@ -27,6 +27,7 @@ class PromoteStats:
     skipped_label: str = ""
     superseded: int = 0
     conflicts: int = 0
+    withdrawn: int = 0
     fact_ids: List[str] = dataclasses.field(default_factory=list)
 
     def reject(self, code: str) -> None:
@@ -79,15 +80,18 @@ def promote_raw(svc: sqlite3.Connection, raw_id: str, now: str) -> PromoteStats:
     has_rules = any(l["label"] == "rules" for l in labels)
     if rec is not None and rec["status"] in SKIP_LABEL_STATUS and not has_rules:
         stats.skipped_label = rec["status"]            # last year's call / results announcement: never an open call
+        stats.withdrawn = withdraw_unstated_deadlines(svc, raw_id, set(), now)
         return stats
     if rec is None and not has_rules:
         stats.skipped_label = "not_call_or_rules"
+        stats.withdrawn = withdraw_unstated_deadlines(svc, raw_id, set(), now)
         return stats
     if rec is not None and rec["status"] in SKIP_LABEL_STATUS:
         stats.skipped_label = rec["status"]            # rules page with stale call markers: keep only generic rules, no calls
     exts = svc.execute("SELECT * FROM pb_extraction WHERE raw_id=? AND extractor_version=? AND field NOT LIKE 'signal.%'", (raw_id, prof.EXTRACTOR_VERSION)).fetchall()
     rev = svc.execute("SELECT revision_id FROM pb_source_revision WHERE source_id=? AND content_hash=?", (raw["source_id"], raw["text_hash"])).fetchone()
     if rev is None or not exts:
+        stats.withdrawn = withdraw_unstated_deadlines(svc, raw_id, set(), now)
         return stats
     ocr = exts[0]["extractor"].startswith("ocr:")
     outlet = src["owner_outlet_id"]
@@ -168,7 +172,44 @@ def promote_raw(svc: sqlite3.Connection, raw_id: str, now: str) -> PromoteStats:
     # --- state derivation (evidence-backed only)
     for key, cid in calls.items():
         _derive_status(svc, cid, key, exts, declared, now, raw, rev["revision_id"])
+    stats.withdrawn = withdraw_unstated_deadlines(svc, raw_id, {d for d in calls if d != "standing"}, now)
     return stats
+
+
+WITHDRAW_REASON = "no_longer_stated_by_source"
+
+
+def withdraw_unstated_deadlines(svc: sqlite3.Connection, raw_id: str, kept_dates, now: str) -> int:
+    """A source's newest rules inspection is what that source states now. A live future call deadline the same source
+    stated earlier but no longer yields (the page was edited, or current rules read it as a non-writing notice such as a
+    membership drive) is withdrawn: superseded by a not_stated_in_inspected_scope fact for the inspected revision, with
+    history kept. Deadlines from other sources are never touched; a later re-extraction that states it again restores it.
+    Rules only: runs only when this raw was inspected by the current extractor/labeler, never on fetch errors."""
+    raw = svc.execute("SELECT * FROM pb_raw_ref WHERE raw_id=?", (raw_id,)).fetchone()
+    if raw is None or raw["outcome"] != "ok" or raw["kind"] not in ("html", "pdf", "image"):
+        return 0
+    inspected = svc.execute("SELECT 1 FROM pb_extraction WHERE raw_id=? AND extractor_version=? LIMIT 1", (raw_id, prof.EXTRACTOR_VERSION)).fetchone() \
+        or svc.execute("SELECT 1 FROM pb_label WHERE raw_id=? AND labeler_version=? LIMIT 1", (raw_id, prof.LABELER_VERSION)).fetchone()
+    rev = svc.execute("SELECT revision_id FROM pb_source_revision WHERE source_id=? AND content_hash=?", (raw["source_id"], raw["text_hash"])).fetchone()
+    if not inspected or rev is None:
+        return 0
+    src = svc.execute("SELECT authority FROM pb_source WHERE source_id=?", (raw["source_id"],)).fetchone()
+    rows = svc.execute("SELECT * FROM pb_fact WHERE source_id=? AND predicate='deadline.closes_on' AND subject_type='call' AND superseded_at IS NULL "
+                       "AND value_state='stated' AND json_extract(value_json,'$.date')>=? AND collected_at<=?",
+                       (raw["source_id"], now[:10], raw["fetched_at"])).fetchall()
+    n = 0
+    for f in rows:
+        if json.loads(f["value_json"])["date"] in kept_dates:
+            continue
+        new = FactInput("call", f["subject_id"], "deadline.closes_on", raw["source_id"], "not_stated_in_inspected_scope", "source_claim", now,
+                        "rules", prof.EXTRACTOR_VERSION, scope_ref=f["scope_ref"], inspected_revision_id=rev["revision_id"],
+                        source_authority=src["authority"] if src else "unknown")
+        try:
+            facts.correct_fact(svc, f["fact_id"], new, WITHDRAW_REASON, now)
+            n += 1
+        except ValidationError:
+            continue
+    return n
 
 
 def _later_than_prior(svc, fact_id: str) -> bool:
