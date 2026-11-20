@@ -118,6 +118,22 @@ class HandoffTest(unittest.TestCase):
         self.assertIsNone(result["backup_path"])
         build.assert_called_once()
 
+    def test_daemon_logs_only_exception_classes_for_unexpected_phase_failures(self):
+        build = Mock(side_effect=ValueError(SECRET))
+        alerts = Mock(return_value=None)
+        with patch.object(daemon, "database_phase", side_effect=sqlite3.OperationalError(SECRET)):
+            with redirect_stdout(io.StringIO()) as logged:
+                record = self.run_daemon(build_site=build, alerts=alerts, cards_mode="none")
+
+        self.assertEqual([
+            "handoff db phase failed (OperationalError)",
+            "handoff site phase failed (ValueError)",
+            "handoff daemon site_phase_error",
+        ], logged.getvalue().splitlines())
+        self.assertEqual("db_phase_error", record["db_error"])
+        self.assertEqual("site_phase_error", record["site"]["error_code"])
+        alerts.assert_called_once()
+
     def test_daemon_idempotency_and_review_only_values(self):
         item = self.item(qwen={"deadline": {"value": {"date": "2026-12-22", "timezone": None, "text": "December 22, 2026"},
                                              "quote": "December 22, 2026"}})

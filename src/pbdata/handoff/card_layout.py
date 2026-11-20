@@ -3,6 +3,7 @@
 from decimal import Decimal
 from html import escape
 import re
+from typing import Optional
 
 # Ported from VIRAL's brand-cards-1120/SPEC.md §C2 and generate_assets.py.
 BG = "#faf8f4"
@@ -62,7 +63,7 @@ def svg_end() -> str:
     return "</svg>\n"
 
 
-def card_header(w: int, title: str, kicker: str, subtitle: str | None, header_bottom: int) -> str:
+def card_header(w: int, title: str, kicker: str, subtitle: Optional[str], header_bottom: int) -> str:
     # pin + kicker on one line, title below, optional subtitle, then a rule
     parts = [
         f'<rect width="{w}" height="100%" fill="{BG}"/>',

@@ -43,7 +43,8 @@ def run(root, site_repo, *, max_batches=MAX_BATCHES, no_deploy=False, clock=time
                   deploy_success=False, deployment_id=None, url=None), alerts_status=None)
     try:
         database_phase(root, record, max_batches, clock)
-    except Exception:
+    except Exception as exc:
+        print(f"handoff db phase failed ({type(exc).__name__})", flush=True)
         record.setdefault("db_error", "db_phase_error")
 
     as_of = clock()
@@ -66,7 +67,8 @@ def run(root, site_repo, *, max_batches=MAX_BATCHES, no_deploy=False, clock=time
         build_site(root, site_repo, today, record["site"], no_deploy=no_deploy, **options)
     except (site.BuildError, deploy.DeployError) as exc:
         record["site"]["error_code"] = str(exc)
-    except Exception:
+    except Exception as exc:
+        print(f"handoff site phase failed ({type(exc).__name__})", flush=True)
         record["site"]["error_code"] = "site_phase_error"
     try:
         record["alerts_status"] = alerts()
