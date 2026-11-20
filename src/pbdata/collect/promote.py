@@ -29,6 +29,7 @@ class PromoteStats:
     conflicts: int = 0
     withdrawn: int = 0
     fact_ids: List[str] = dataclasses.field(default_factory=list)
+    observed_fact_ids: List[str] = dataclasses.field(default_factory=list)
 
     def reject(self, code: str) -> None:
         self.rejected[code] = self.rejected.get(code, 0) + 1
@@ -65,7 +66,7 @@ def _continuing_call(svc, outlet_id: str, source_id: str, today: str):
     return live[0]["call_id"] if len(live) == 1 and len(rows) == 1 else None
 
 
-def promote_raw(svc: sqlite3.Connection, raw_id: str, now: str) -> PromoteStats:
+def promote_raw(svc: sqlite3.Connection, raw_id: str, now: str, *, verified_only=False, complete=True) -> PromoteStats:
     stats = PromoteStats()
     raw = svc.execute("SELECT * FROM pb_raw_ref WHERE raw_id=?", (raw_id,)).fetchone()
     if raw is None or raw["outcome"] != "ok" or raw["kind"] not in ("html", "pdf", "image"):
@@ -75,25 +76,42 @@ def promote_raw(svc: sqlite3.Connection, raw_id: str, now: str) -> PromoteStats:
     if src["permission"] not in ("allowed_public", "allowed_conditional") or not src["owner_outlet_id"]:
         stats.skipped_label = "permission"
         return stats
+    if verified_only and (src["authority"] != "official_primary" or src["max_epistemic"] != "verified_fact"):
+        stats.skipped_label = "source_ceiling"
+        return stats
+
+    def withdraw(kept_dates):
+        if complete:
+            stats.withdrawn = withdraw_unstated_deadlines(svc, raw_id, kept_dates, now)
+
     labels = svc.execute("SELECT * FROM pb_label WHERE raw_id=? AND labeler_version=?", (raw_id, prof.LABELER_VERSION)).fetchall()
     rec = next((l for l in labels if l["label"] == "recruitment"), None)
     has_rules = any(l["label"] == "rules" for l in labels)
     if rec is not None and rec["status"] in SKIP_LABEL_STATUS and not has_rules:
         stats.skipped_label = rec["status"]            # last year's call / results announcement: never an open call
-        stats.withdrawn = withdraw_unstated_deadlines(svc, raw_id, set(), now)
+        withdraw(set())
         return stats
     if rec is None and not has_rules:
         stats.skipped_label = "not_call_or_rules"
-        stats.withdrawn = withdraw_unstated_deadlines(svc, raw_id, set(), now)
+        withdraw(set())
         return stats
     if rec is not None and rec["status"] in SKIP_LABEL_STATUS:
         stats.skipped_label = rec["status"]            # rules page with stale call markers: keep only generic rules, no calls
     exts = svc.execute("SELECT * FROM pb_extraction WHERE raw_id=? AND extractor_version=? AND field NOT LIKE 'signal.%'", (raw_id, prof.EXTRACTOR_VERSION)).fetchall()
     rev = svc.execute("SELECT revision_id FROM pb_source_revision WHERE source_id=? AND content_hash=?", (raw["source_id"], raw["text_hash"])).fetchone()
     if rev is None or not exts:
-        stats.withdrawn = withdraw_unstated_deadlines(svc, raw_id, set(), now)
+        withdraw(set())
         return stats
     ocr = exts[0]["extractor"].startswith("ocr:")
+
+    def verifies(e):
+        return (e["confidence"] >= 0.8 and e["value_state"] in ("stated", "explicitly_none") and reparse_confirms(e, ocr)
+                and src["authority"] == "official_primary" and e["field"] != "policy.ai")
+
+    observed_closes = set()
+    if verified_only:
+        observed_closes = {json.loads(e["value_json"])["date"] for e in exts if e["field"] == "deadline.closes_on"}
+        exts = [e for e in exts if e["extractor"] == "rules" and verifies(e)]
     outlet = src["owner_outlet_id"]
     today = now[:10]
     title = svc.execute("SELECT value_json FROM pb_extraction WHERE raw_id=? AND field='signal.title'", (raw_id,)).fetchone()
@@ -119,8 +137,7 @@ def promote_raw(svc: sqlite3.Connection, raw_id: str, now: str) -> PromoteStats:
         ev = facts.add_evidence(svc, rev["revision_id"], raw["source_id"], e["excerpt"], json.loads(e["locator"]).get("heading", ""),
                                 int(json.loads(e["locator"]).get("seg", 0)) + 100000 * int(json.loads(e["locator"]).get("page", 0)), 0, now)
         value = json.loads(e["value_json"]) if e["value_json"] else None
-        verified = e["confidence"] >= 0.8 and e["value_state"] in ("stated", "explicitly_none") and reparse_confirms(e, ocr) \
-            and src["authority"] == "official_primary" and e["field"] != "policy.ai"
+        verified = verified_only or verifies(e)
         kw = {}
         if verified:
             kw = dict(verifier="rules:reparse-1", verified_at=now, fresh_until=timeutil.iso(timeutil.parse_iso(now) + dt.timedelta(days=freshness_days(e["field"]))))
@@ -158,6 +175,7 @@ def promote_raw(svc: sqlite3.Connection, raw_id: str, now: str) -> PromoteStats:
             for v in ex.violations:
                 stats.reject(v.code)
             continue
+        stats.observed_fact_ids.append(r.fact_id)
         if r.action != "unchanged":
             stats.facts += 1
             stats.fact_ids.append(r.fact_id)
@@ -172,7 +190,12 @@ def promote_raw(svc: sqlite3.Connection, raw_id: str, now: str) -> PromoteStats:
     # --- state derivation (evidence-backed only)
     for key, cid in calls.items():
         _derive_status(svc, cid, key, exts, declared, now, raw, rev["revision_id"])
-    stats.withdrawn = withdraw_unstated_deadlines(svc, raw_id, {d for d in calls if d != "standing"}, now)
+    kept_dates = {d for d in calls if d != "standing"}
+    if verified_only and not skip_calls:
+        # Evidence below the verification threshold is insufficient to replace
+        # an existing date, but it is still a statement of that date.
+        kept_dates.update(observed_closes)
+    withdraw(kept_dates)
     return stats
 
 
