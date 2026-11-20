@@ -9,7 +9,6 @@ from pbdata import db, timeutil
 
 from . import batch, cards, deploy, replay, site, status
 
-MAX_BATCHES = 10
 LOG = logging.getLogger(__name__)
 
 
@@ -34,7 +33,7 @@ def database_phase(root, record, max_batches, clock):
                 replay.export_projection(svc, root, timeutil.iso(clock()))
 
 
-def run(root, site_repo, *, max_batches=MAX_BATCHES, no_deploy=False, clock=timeutil.utcnow,
+def run(root, site_repo, *, max_batches=None, no_deploy=False, clock=timeutil.utcnow,
         build_site=site.build_site, alerts=deploy.dispatch_alerts, alerts_dry_run=False, cards_mode="auto",
         generate_card=cards.generate_card):
     started = clock()
@@ -94,7 +93,7 @@ def run(root, site_repo, *, max_batches=MAX_BATCHES, no_deploy=False, clock=time
     return record
 
 
-def dry_run(root, site_repo, max_batches):
+def dry_run(root, site_repo, max_batches=None):
     folder = root / "handoff/qwen"
     with replay.read_ledger(folder / "ledger.sqlite3") as ledger:
         planned = replay.pending(folder, ledger, max_batches)
@@ -110,12 +109,14 @@ def main(argv=None, *, lock_held=False):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--root", type=Path, default=db.data_root())
     parser.add_argument("--site-repo", type=Path, default=site.DEFAULT_REPO)
-    parser.add_argument("--max-batches", type=int, default=MAX_BATCHES, choices=range(MAX_BATCHES + 1))
+    parser.add_argument("--max-batches", type=int, help="maximum batches to apply (default: unlimited)")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-deploy", action="store_true")
     parser.add_argument("--alerts-dry-run", action="store_true")
     parser.add_argument("--cards", choices=("auto", *cards.KINDS, "both", "none"), default="auto")
     args = parser.parse_args(argv)
+    if args.max_batches is not None and args.max_batches < 0:
+        parser.error("--max-batches must be nonnegative")
     try:
         if args.dry_run:
             dry_run(args.root, args.site_repo, args.max_batches)

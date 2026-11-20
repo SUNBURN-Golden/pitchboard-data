@@ -240,7 +240,10 @@ class HandoffTest(unittest.TestCase):
             for suffix in ("/more", "/third", "/fourth"):
                 add_source(svc, "https://fixture.example" + suffix, outlet=self.outlet_id)
         caps = self.root / "caps.json"
-        status.atomic_json(caps, dict(self.caps, max_pages_per_run=3, max_llm_calls_per_run=2, max_page_utf8_bytes=400))
+        rates = {"input_usd_per_million_ceiling": "1", "output_usd_per_million_ceiling": "2",
+                 "verified_on": "2026-11-20", "valid_until_utc": "2026-11-21T00:00:00Z"}
+        status.atomic_json(caps, dict(self.caps, max_pages_per_run=3, max_llm_calls_per_run=2,
+                                      max_page_utf8_bytes=400, pricing=rates))
         fetcher = FakeFetcher()
         invalid = dict(dict.fromkeys(schema.FIELDS), unexpected="prior response")
         transport = Mock(side_effect=[provider_response(invalid), provider_response({"pay": None})])
@@ -260,6 +263,9 @@ class HandoffTest(unittest.TestCase):
         self.assertEqual("missing_key", item["validation_reasons"]["open_call"])
         manifest = status.read_json(path / "manifest.json", {})
         self.assertEqual((2, 1, 1), (manifest["llm_calls"], manifest["repair_attempted"], manifest["repair_ok"]))
+        self.assertEqual([call["estimated_cost_usd"] for call in item["calls"]], ["0.00003"] * 2)
+        self.assertEqual(manifest["estimated_cost_usd"], "0.00006")
+        self.assertEqual(json.loads((self.folder / "usage.jsonl").read_bytes())["estimated_cost_usd"], "0.00006")
         self.assertLessEqual(len(item["page_text"].encode()), 400)
         self.assertIn("[email]", item["page_text"])
         self.assertIn("[phone]", item["page_text"])
@@ -269,6 +275,29 @@ class HandoffTest(unittest.TestCase):
             targets = list(bot.select_targets(svc, NOW, {fetcher.urls[0]: timeutil.iso(NOW)}))
         self.assertNotIn(fetcher.urls[0], [url for url, _ in targets])
         self.assertEqual([(0,)], self.rows("SELECT count(*) FROM pb_raw_ref"))
+
+    def test_default_bot_exceeds_former_page_and_call_caps(self):
+        with closing(db.connect(self.live)) as svc:
+            for i in range(44):
+                add_source(svc, f"https://fixture.example/calls/extra-{i}", outlet=self.outlet_id)
+        fetcher = FakeFetcher()
+        transport = Mock(return_value=provider_response(dict.fromkeys(schema.FIELDS)))
+        result = bot.run(self.root, probe=lambda: True, fetcher_factory=Mock(return_value=fetcher),
+                         transport=transport, key_loader=lambda: SECRET, clock=lambda: NOW)
+        self.assertEqual((result["outcome"], result["pages_ok"], result["llm_calls"]), ("ok", 45, 45))
+        self.assertEqual((len(fetcher.urls), transport.call_count), (45, 45))
+        path, data = next(batch.ready_batches(self.inbox))
+        manifest = status.read_json(path / "manifest.json", {})
+        self.assertEqual((len(data.splitlines()), manifest["llm_calls"], manifest["total_tokens"]), (45, 45, 1125))
+        self.assertIsNone(manifest["estimated_cost_usd"])
+        self.assertEqual(json.loads((self.folder / "usage.jsonl").read_bytes()), result)
+
+    def test_default_daemon_consumes_more_than_ten_batches(self):
+        for i in range(12):
+            self.publish(seconds=i)
+        self.assertEqual(self.run_daemon(max_batches=1)["batches_consumed"], 1)
+        self.assertEqual(self.run_daemon()["batches_consumed"], 11)
+        self.assertFalse(list(batch.ready_batches(self.inbox)))
 
     def test_bot_records_failed_repair_and_cap_skip(self):
         invalid = provider_response({"unexpected": None})

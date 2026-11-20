@@ -1,6 +1,6 @@
 # Activate the DeepSeek shadow lane
 
-This lane fetches one public page, optionally calls DeepSeek, and writes a private JSONL file.
+This lane fetches eligible public pages for DeepSeek extraction with Qwen fallback and writes a private JSONL file.
 It does not update the live database, the daily collector, `scripts/daily.sh`, or cron.
 The checked-in `config/llm_extract.json` stays `enabled: false`. Use a private config file.
 
@@ -30,64 +30,53 @@ The pinned address is not resolved a second time.
 A result of `blocked_network` after this change means the host or the DNS answers were not an allowed route.
 `denied_robots`, `access_wall`, `denied_http`, and `empty_page` mean the fetch policy ran.
 
-## Caps and pricing
+## Caps removed 2026-11-20
 
-The shipped default is `monetary_cap: "enforced"` and `daily_cost_cap_usd: "5.00"`.
-That dollar stop is about 16 calls a day because each call records a permanent ceiling of USD 0.3024576 (1,000,000 input tokens at USD 0.30/M plus 2,048 output tokens at USD 1.20/M).
-The ceiling is an accounting reservation, not an invoice.
-
-The only way to turn the dollar stop off is both of these together:
-
-* `monetary_cap` is the string `none`
-* `daily_cost_cap_usd` is JSON `null`
-
-`unlimited`, a missing `monetary_cap`, or `none` next to a dollar amount is invalid.
-The call cap stays mandatory. The private example below keeps 50 calls a day.
-There is no unlimited call cap, no retry, and no window longer than seven days.
-Pricing must still be inside its verification window. `none` does not skip an expired price.
-
-Re-read of https://api-docs.deepseek.com/quick_start/pricing/ on 2026-11-07: `deepseek-flash` peak cache-miss input is USD 0.30 per million tokens and peak output is USD 1.20 per million.
-Off-peak and cache-hit prices on that page are lower. This lane keeps the peak ceilings and does not guess a lower rate.
-The page says prices may change and does not give an expiry date. If either published peak rate is higher than these ceilings, do not enable until the private ceilings are raised to the published numbers.
-The code rejects ceilings below USD 0.30 and USD 1.20.
+- `config/llm_extract.json` and `src/pbdata/collect/shadow/{common,state,runner}.py`
+  removed the 50-call daily cap, the enforced USD 5 default, and the
+  `budget_exhausted` stop. Private configs may still contain
+  `daily_call_cap`, `daily_cost_cap_usd`, and `monetary_cap`. The runner ignores them.
+- `scripts/llm_extract_shadow_batch.py` and `src/pbdata/collect/shadow/planner.py`
+  removed the 40-URL default and the 50-URL maximum for `--limit`. Omit the flag
+  to select all eligible URLs or pass a nonnegative integer. The held-out
+  generation command in `scripts/compare_llm_extract.py` uses the same
+  convention for `--sample-size`.
+- The shadow lane requires literal `enabled: true` and
+  `window_start_utc <= now < window_end_utc`. The UTC window can span at most
+  seven days. The shipped config stays disabled.
+- The attempts ledger (`budget.sqlite3`) and daily JSONL record provider calls,
+  per-call token counts, and estimated cost. Set optional `pricing` for DeepSeek
+  or `qwen_pricing` for Qwen with decimal-string rates in
+  `input_usd_per_million_ceiling` and `output_usd_per_million_ceiling`, a
+  `verified_on` UTC date, and a `valid_until_utc` timestamp. Missing, invalid,
+  or expired prices and missing usage produce a null estimate and processing
+  continues. The optional `input_token_reservation_ceiling` retains a
+  pre-dispatch ceiling estimate in the ledger for that provider.
 
 ## Private config
 
 Save this as `~/.config/pitchboard/llm_extract.json` with mode `0600`.
 Do not put it inside the shadow root. Do not edit the repo copy to enable the lane.
 
-The dates below are valid from 2026-11-07 until 2026-11-14T00:00:00Z.
-On a later day, set `verified_on` to that UTC date and set both end timestamps exactly seven days later, after checking the pricing page again.
-`verified_on` cannot be in the future.
+Set the example window timestamps to your intended UTC run window. If you configure pricing, use the date you verified the rates and their applicable expiry.
 
 ```json
 {
   "enabled": true,
   "mode": "shadow",
   "model": "deepseek-flash",
-  "daily_call_cap": 50,
-  "daily_cost_cap_usd": null,
-  "monetary_cap": "none",
   "egress": "sandbox",
   "max_page_utf8_bytes": 24000,
   "max_output_tokens": 2048,
   "timeout_seconds": 30,
-  "window_start_utc": "2026-11-07T00:00:00Z",
-  "window_end_utc": "2026-11-14T00:00:00Z",
-  "pricing": {
-    "input_usd_per_million_ceiling": "0.30",
-    "output_usd_per_million_ceiling": "1.20",
-    "input_token_reservation_ceiling": 1000000,
-    "verified_on": "2026-11-07",
-    "valid_until_utc": "2026-11-14T00:00:00Z"
-  }
+  "window_start_utc": "2026-11-20T00:00:00Z",
+  "window_end_utc": "2026-11-27T00:00:00Z"
 }
 ```
 
 ## Verify once
 
 Use the checkout that contains this change. Do not run it from a `main` checkout that does not have `EGRESS_GATEWAY` in `src/pbdata/collect/shadow/policy.py`.
-Do not pull `main` as part of this command. `scripts/daily.sh` is the collector and must stay as it is.
 
 ```sh
 set -euo pipefail
@@ -130,7 +119,7 @@ day = __import__("datetime").datetime.now(__import__("datetime").timezone.utc).s
 path = Path("/workspace/pitchboard-llm-shadow/data/shadow") / ("llm_extract_" + day + ".jsonl")
 for line in path.read_text().splitlines():
     row = json.loads(line)
-    print({k: row.get(k) for k in ("outcome", "final_url", "returned_model", "charged_ceiling_usd", "validation_reasons")})
+    print({k: row.get(k) for k in ("outcome", "final_url", "returned_model", "provider_calls", "estimated_cost_usd", "validation_reasons")})
 PY
 ```
 
@@ -142,29 +131,23 @@ The next UTC day is a new call. This three-page, hardcoded-URL invocation is
 
 ## Separate schedule
 
-> **Superseded for the 40-URL activation.** The cron example below is retained
-> only as a historical record of the original five/hardcoded-URL job. Do not use
-> it for the gap-targeted rollout. Replace only the isolated shadow job's
-> command with `scripts/llm_extract_shadow_batch.py ... --limit 40` as documented
-> in
-> [LLM_EXTRACT_IMPROVE_DESIGN.md](LLM_EXTRACT_IMPROVE_DESIGN.md#operator-handoff-after-implementation).
-> This document does not edit cron.
+Keep the isolated shadow job's lock and log directory separate from the daily
+collector. Use a fresh metadata-only gap export. Inspect it with `--plan-only`
+before running the batch.
 
-Install this only after the one-time check looks right.
-Do not add it to `scripts/daily.sh` and do not change the existing collector crontab lines.
-The command stops calling the provider after `window_end_utc` / `valid_until_utc`. Renew the private config by hand. Nothing turns the shipped flag on.
-
-```cron
-15 6 * * * flock -n "$HOME/.local/state/pitchboard-llm-shadow/cron.lock" bash -lc 'cd /absolute/path/to/this/checkout && PYTHONPATH=src python3 -B scripts/llm_extract_shadow.py --config "$HOME/.config/pitchboard/llm_extract.json" --shadow-root /workspace/pitchboard-llm-shadow --url "https://www.ltikorea.or.kr/kr/board/notice/boardList.do" >> "$HOME/.local/state/pitchboard-llm-shadow/cron.log" 2>&1; PYTHONPATH=src python3 -B scripts/llm_extract_shadow.py --config "$HOME/.config/pitchboard/llm_extract.json" --shadow-root /workspace/pitchboard-llm-shadow --url "https://munjang.or.kr/" >> "$HOME/.local/state/pitchboard-llm-shadow/cron.log" 2>&1; PYTHONPATH=src python3 -B scripts/llm_extract_shadow.py --config "$HOME/.config/pitchboard/llm_extract.json" --shadow-root /workspace/pitchboard-llm-shadow --url "https://www.arko.or.kr/board/list/4053" >> "$HOME/.local/state/pitchboard-llm-shadow/cron.log" 2>&1'
+```sh
+PYTHONPATH=src python3 -B scripts/llm_extract_shadow_batch.py \
+  --config /absolute/private/llm_extract.json \
+  --shadow-root /absolute/existing/shadow-root \
+  --gaps-json /absolute/private/gaps.json
 ```
 
-Keep the log and lock under `~/.local/state/pitchboard-llm-shadow`, not inside the shadow root.
-A non-empty shadow root without `experiment.json` is rejected.
+Keep the log and lock under `~/.local/state/pitchboard-llm-shadow`. Activation
+ends at `window_end_utc`. The private config controls renewal.
 
-## What remains true
+## Fetch and output policy
 
 * Instagram, the repo block list, robots, login walls, and challenges are still denied.
 * Output stays under the shadow root. There is no live database write.
-* One machine's ledger is not an account-wide spend cap. `monetary_cap: none` means this process will not stop at USD 5. The provider account can still be charged for every accepted call, up to the call cap, until the window ends.
 * If the resolver returns both a gateway address and a global address, the fetch stays `blocked_network` rather than guessing a path.
 * TLS verification stays on. A gateway that presents a private certificate fails closed.

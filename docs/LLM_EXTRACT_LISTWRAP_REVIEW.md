@@ -1,5 +1,7 @@
 # Build review: singleton list wrapper unwrap
 
+> This review records the November 18 implementation. See the [2026-11-20 cap changes](../README.md#caps-removed-2026-11-20) for current defaults.
+
 Stage: **BUILD REVIEW**, 2026-11-18. Branch `fix/shadow-qwen-list-unwrap`,
 commit `e2f403a` ("fix(shadow): unwrap singleton object lists before schema
 validation") vs `origin/main`. Scope of the diff: `src/pbdata/collect/shadow/schema.py`

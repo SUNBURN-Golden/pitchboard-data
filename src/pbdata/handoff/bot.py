@@ -116,11 +116,12 @@ def prepare_doc(doc, byte_cap, key):
                meta={"og:title": redact(doc.meta.get("og:title", ""), key)}), truncated, partial
 
 
-def extract(doc, as_of, caps, key, transport, budget, item):
+def extract(doc, as_of, caps, key, transport, budget, item, clock=timeutil.utcnow, pricing=None):
     if not key:
         item.update(outcome="llm_error", error_code="key_unavailable")
         return
-    if budget["llm_calls"] >= caps["max_llm_calls_per_run"]:
+    max_calls = caps.get("max_llm_calls_per_run")
+    if batch.exceeds(budget["llm_calls"] + 1, max_calls):
         item.update(outcome="skipped_cap", error_code="llm_cap")
         return
     try:
@@ -130,13 +131,13 @@ def extract(doc, as_of, caps, key, transport, budget, item):
                 raise common.Stop("credential_in_response" if repair else "credential_in_request")
             budget["llm_calls"] += 1
             item["repair_attempted"] = repair
+            rates = common.pricing_at(pricing, clock())
+            call = common.call_usage("qwen", None, rates)
+            item["calls"].append(call)
             raw = transport(body, key, caps["timeout_seconds"])
-            usage = raw.get("usage") if isinstance(raw, dict) else None
-            if isinstance(usage, dict):
-                for field in batch.TOKEN_FIELDS:
-                    value = usage.get(field)
-                    if type(value) is int and value >= 0:
-                        item["usage"][field] += value
+            call.update(common.call_usage("qwen", raw, rates))
+            for field, value in (call["usage"] or {}).items():
+                item["usage"][field] += value
             if key in common.dumps(raw):
                 raise common.Stop("credential_in_response")
             try:
@@ -148,7 +149,7 @@ def extract(doc, as_of, caps, key, transport, budget, item):
                     raise
                 if key in common.dumps(exc.prior):
                     raise common.Stop("credential_in_response")
-                if budget["llm_calls"] >= caps["max_llm_calls_per_run"]:
+                if batch.exceeds(budget["llm_calls"] + 1, max_calls):
                     item.update(outcome="llm_error", error_code="repair_skipped_cap")
                     return
                 body = schema.repair_body(body, exc.prior, str(exc))
@@ -165,10 +166,10 @@ def extract(doc, as_of, caps, key, transport, budget, item):
         item.update(outcome="llm_error", error_code="provider_error")
 
 
-def collect_page(target, fetcher, as_of, caps, key, transport, budget, clock):
+def collect_page(target, fetcher, as_of, caps, key, transport, budget, clock, pricing=None):
     item = dict(target, final_url=None, fetched_at=timeutil.iso(clock()), http_status=None, content_sha256=None,
                 page_text=None, rules=None, qwen=None, model=schema.QWEN_MODEL, usage=dict.fromkeys(batch.TOKEN_FIELDS, 0),
-                repair_attempted=False, repair_ok=False)
+                calls=[], repair_attempted=False, repair_ok=False)
     if key and key in item["url"]:
         item.update(url=redact(item["url"], key), outcome="blocked", error_code="credential_in_url")
         return item, False
@@ -209,7 +210,7 @@ def collect_page(target, fetcher, as_of, caps, key, transport, budget, clock):
     except Exception:
         item.update(outcome="fetch_error", error_code="page_processing_error")
         return item, True
-    extract(doc, as_of, caps, key, transport, budget, item)
+    extract(doc, as_of, caps, key, transport, budget, item, clock, pricing)
     return item, True
 
 
@@ -219,7 +220,7 @@ def run(root, *, config=CONFIG, probe=probe_proxy, fetcher_factory=policy.Policy
     folder = root / "handoff/qwen"
     folder.mkdir(parents=True, exist_ok=True)
     record = dict(started_at=timeutil.iso(started), outcome="error", batch_id=None, pages_ok=0, pages_failed=0,
-                  llm_calls=0, tokens=dict.fromkeys(batch.TOKEN_FIELDS, 0))
+                  llm_calls=0, tokens=dict.fromkeys(batch.TOKEN_FIELDS, 0), estimated_cost_usd="0")
     try:
         with status.locks(root / "locks", ("daily", "collector"), 30 * 60) as available:
             if not available:
@@ -244,6 +245,7 @@ def run(root, *, config=CONFIG, probe=probe_proxy, fetcher_factory=policy.Policy
 
 def collect_run(root, folder, config, fetcher_factory, transport, key_loader, clock, started, record):
     caps = status.read_json(config, {})
+    pricing = common.pricing_snapshot(caps.pop("pricing", None)) if isinstance(caps, dict) else None
     if not batch.valid_caps(caps):
         raise ValueError("invalid_caps")
     fetcher = fetcher_factory(require_proxy=True, timeout=caps["timeout_seconds"])
@@ -261,19 +263,21 @@ def collect_run(root, folder, config, fetcher_factory, transport, key_loader, cl
             targets = list(select_targets(conn, started, recent))
 
     items = []
-    for url, target in targets[:caps["max_pages_per_run"]]:
-        if record["llm_calls"] >= caps["max_llm_calls_per_run"]:
+    for url, target in targets[:caps.get("max_pages_per_run")]:
+        if batch.exceeds(record["llm_calls"] + 1, caps.get("max_llm_calls_per_run")):
             break
         as_of = clock().astimezone(timeutil.KST).date().isoformat()
-        item, fetched = collect_page(target, fetcher, as_of, caps, key, transport, record, clock)
+        item, fetched = collect_page(target, fetcher, as_of, caps, key, transport, record, clock, pricing)
         if fetched:
             recent[url] = item["fetched_at"]
         for field, value in item["usage"].items():
             record["tokens"][field] += value
+        record["estimated_cost_usd"] = common.total_cost(
+            [record["estimated_cost_usd"], *(call["estimated_cost_usd"] for call in item["calls"])])
         record["pages_ok" if item["outcome"] == "ok" else "pages_failed"] += 1
         items.append(item)
     record["batch_id"] = batch.write_batch(folder / "inbox", items, clock(), runner.runtime_commit(), caps,
-                                           record["llm_calls"], record["tokens"])
+                                           record["llm_calls"], record["tokens"], record["estimated_cost_usd"])
     status.atomic_json(checks_path, recent)
     record["outcome"] = "ok"
 

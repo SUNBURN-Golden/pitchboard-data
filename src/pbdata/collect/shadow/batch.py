@@ -1,4 +1,4 @@
-"""Fail-closed shared batch outcome classification and bounded dispatch."""
+"""Fail-closed shared batch outcome classification and serial dispatch."""
 from .common import Stop, digest, dumps, load_config, load_key
 from .policy import PolicyFetcher
 from .state import State
@@ -31,7 +31,7 @@ def execute(runner, root, plan, *, digest_languages=(), **run_options):
     start_day = runner.clock().date()
     state = State(root)
     with state.locked() as conn:
-        state.preflight(conn, config, runner.clock())
+        state.preflight(conn, runner.clock())
         from .common import append_sync, secure_open
         path = state.output(start_day.isoformat()).with_name("plans_" + start_day.strftime("%Y%m%d") + ".jsonl")
         with secure_open(path, "a+") as f:

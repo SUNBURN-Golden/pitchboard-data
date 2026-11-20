@@ -14,7 +14,6 @@ from ..profiles import pitchboard as prof
 from . import parse, store
 from .net import FetchResult, Fetcher, page_url, registered_domain
 
-TRIAL_PAGES = 4
 MIN_RELEVANCE = 0.4
 STRONG_FIELDS = set(prof.REQUIRED) - {"status.declared"}
 
@@ -35,7 +34,8 @@ def _same_site(a: str, b: str) -> bool:
     return registered_domain(urlparse(a).netloc.lower()) == registered_domain(urlparse(b).netloc.lower())
 
 
-def trial_crawl(svc: sqlite3.Connection, fetcher: Fetcher, cand: sqlite3.Row, target: dict, now: str) -> Evaluation:
+def trial_crawl(svc: sqlite3.Connection, fetcher: Fetcher, cand: sqlite3.Row, target: dict, now: str,
+                *, limit: Optional[int] = None) -> Evaluation:
     host = cand["host"]
     start = fetcher.requests
     pages: Dict[str, FetchResult] = {}
@@ -59,6 +59,8 @@ def trial_crawl(svc: sqlite3.Connection, fetcher: Fetcher, cand: sqlite3.Row, ta
     entry = page_url(cand["url"])
     if entry is None:
         return done("rejected", "binary_asset")
+    if limit == 0:
+        return done("new", "trial_page_limit")
     if entry.startswith("http://"):                                        # prefer https; fall back to the given http URL only if https is unusable
         up = "https://" + entry[len("http://"):]
         first = fetcher.fetch(up, now_iso=now)
@@ -82,12 +84,12 @@ def trial_crawl(svc: sqlite3.Connection, fetcher: Fetcher, cand: sqlite3.Row, ta
     if doc is None:
         return done("deprioritized", "entry_not_html")
     docs[entry] = doc
-    feeds = doc.feeds[:2]
+    feeds = doc.feeds
     # follow the most call-like same-site links
     ranked = sorted({l.href: l for l in doc.links if _same_site(l.href, first.final_url) and l.href.startswith("http")}.values(),
                     key=lambda l: -prof.link_priority(l))
     for l in ranked:
-        if len(pages) >= TRIAL_PAGES or prof.link_priority(l) < 0.5:
+        if (limit is not None and len(pages) >= limit) or prof.link_priority(l) < 0.5:
             break
         u = page_url(l.href)
         if u is None or u in pages or prof.ATTACH_RE.search(u):

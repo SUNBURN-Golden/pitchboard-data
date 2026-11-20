@@ -15,7 +15,7 @@ from ..collect import collector, metrics, promote, gaps, store, reconcile
 from ..collect.resolve import same_entity
 from ..profiles import pitchboard as prof
 from . import clips, project
-from .runner import Deferred, NonRetryable, RunContext
+from .runner import NonRetryable, RunContext
 
 
 def _since(c: RunContext) -> str:
@@ -24,7 +24,7 @@ def _since(c: RunContext) -> str:
 
 
 def _prev_run_start(c: RunContext):
-    """Start of the previous successful daemon run. The 04:20 collector fetches (and uses the day's request budget)
+    """Start of the previous successful daemon run. The 04:20 collector fetches
     before the daemon runs, so a window that starts at this run's own clock never sees those revisions and every run
     looks empty. Starting the window at the previous daemon run covers everything fetched since then (stages 3-4 are
     idempotent, so overlap is harmless)."""
@@ -38,9 +38,9 @@ def _collector_ctx(c: RunContext):
         from ..collect.net import Fetcher
         from ..collect.wiki import Api
         fetcher = c.opts.get("fetcher") or Fetcher(c.infra)
-        api = c.opts.get("api") or Api(cap=c.opts.get("api_cap", 90))
+        api = c.opts.get("api") or Api()
         c.opts["_cctx"] = collector.Ctx(c.svc, c.infra, fetcher, api, c.opts["targets"], c.run_id, c.opts.get("run_tag", c.run_id),
-                                        c.clock, c.opts.get("caps"))
+                                        c.clock, c.opts.get("caps"), api_cap=c.opts.get("api_cap"))
     return c.opts["_cctx"]
 
 
@@ -60,13 +60,11 @@ def s_incremental_fetch(c: RunContext) -> dict:
     if c.opts.get("offline"):
         return out
     cctx = _collector_ctx(c)
-    out["refresh_jobs"] = collector.enqueue_refresh(cctx, limit=c.opts.get("refresh_limit", 40))
+    out["refresh_jobs"] = collector.enqueue_refresh(cctx, limit=c.opts.get("refresh_limit"))
     before = cctx.fetcher.requests + cctx.api.calls
     stats = collector.run(cctx, c.opts.get("max_jobs"), log=None if c.opts.get("quiet") else print)
     used = cctx.fetcher.requests + cctx.api.calls - before
-    c.ledger.charge("http_requests", 0)            # cap check happens inside the collector's per-class budgets
-    c.infra.execute("INSERT INTO cost_ledger(day,resource,amount) VALUES(?,?,?) ON CONFLICT(day,resource) DO UPDATE SET amount=amount+excluded.amount",
-                    (c.ledger.day, "http_requests", used))
+    c.ledger.charge("http_requests", used)
     out.update({"requests": used, "jobs_done": stats.get("jobs_done", 0), "pages_ok": stats.get("pages_ok", 0),
                 "facts": stats.get("facts", 0), "verified_facts": stats.get("verified_facts", 0)})
     pending = c.infra.execute("SELECT count(*) FROM job WHERE state IN ('pending','retry_wait')").fetchone()[0]
@@ -94,7 +92,7 @@ def s_change_detection(c: RunContext) -> dict:
 # 4 ---------------------------------------------------------------- extraction (rules only; AI off, cap 0)
 def s_extraction(c: RunContext) -> dict:
     if c.opts.get("ai_extraction"):
-        c.ledger.charge("model_calls", 1)        # cap is 0 -> CostCapExceeded -> failure queue; never silently spends
+        raise NonRetryable("AI extraction is disabled for promotion")
     since = _since(c)
     raws = c.svc.execute("SELECT raw_id, url FROM pb_raw_ref WHERE fetched_at>=? AND outcome='ok' AND change_state!='unchanged' "
                          "AND kind IN ('html','pdf','image')", (since,)).fetchall()

@@ -28,9 +28,10 @@ def main(argv=None) -> int:
     ap.add_argument("--root", default=os.environ.get("PB_DATA_ROOT", "/workspace/pitchboard/data-root"))
     ap.add_argument("--targets", default=DEFAULT_TARGETS)
     ap.add_argument("--run-id", default=None, help="reuse to resume from the failed stage")
-    ap.add_argument("--max-jobs", type=int, default=None)
-    ap.add_argument("--caps", default=None)
-    ap.add_argument("--api-cap", type=int, default=90)
+    ap.add_argument("--max-jobs", type=int, help="maximum jobs to run (default: unlimited)")
+    ap.add_argument("--caps", help='optional JSON request caps per lane, e.g. {"discovery":{"requests":150}}')
+    ap.add_argument("--api-cap", type=int, help="maximum Wikimedia API calls (default: unlimited)")
+    ap.add_argument("--refresh-limit", type=int, help="maximum refresh jobs to enqueue (default: unlimited)")
     ap.add_argument("--offline", action="store_true", help="skip network stages (recompute/verify only)")
     a = ap.parse_args(argv)
     os.environ["PB_DATA_ROOT"] = a.root
@@ -52,9 +53,10 @@ def main(argv=None) -> int:
     clock = lambda: timeutil.iso(timeutil.utcnow())
     run_id = a.run_id or "dmn_" + time.strftime("%Y%m%dT%H%M%S")
     caps = json.loads(a.caps) if a.caps else None
-    opts = {"targets": json.load(open(a.targets)), "caps": caps, "max_jobs": a.max_jobs, "api_cap": a.api_cap, "offline": a.offline,
+    opts = {"targets": json.load(open(a.targets)), "caps": caps, "max_jobs": a.max_jobs, "api_cap": a.api_cap,
+            "refresh_limit": a.refresh_limit, "offline": a.offline,
             "run_tag": run_id, "quiet": True}
-    ledger = Ledger(infra, time.strftime("%Y-%m-%d"), {"model_calls": 0, "model_usd": 0})
+    ledger = Ledger(infra, time.strftime("%Y-%m-%d"))
     ctx = RunContext(svc, infra, a.root, run_id, clock, ledger, opts)
     with DaemonLock(os.path.join(a.root, "locks", "daemon.lock")), DaemonLock(os.path.join(a.root, "locks", "collector.lock")):
         rep = StageRunner(ctx, STAGES).run()

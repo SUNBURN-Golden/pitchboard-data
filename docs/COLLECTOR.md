@@ -4,7 +4,7 @@ The collector *finds* sources, *tries* them, *collects* from them, and *looks fo
 Everything lives in `src/pbdata/collect/` (shared engine) and `src/pbdata/profiles/pitchboard.py` (the only Pitchboard-specific file:
 lexicons, extractors, labels, required fields). Another service reuses the engine with its own profile and target list.
 
-**AI extraction is OFF (cost cap 0).** Every extractor, label and gap decision is rule-based. A model may later be added for ambiguous
+**Promotion is rules-only.** Every extractor, label and gap decision is rule-based. A model may later be added for ambiguous
 documents only (not implemented); until then ambiguous input yields an explicit unknown (`unknown_period`, no deadline), never a guess.
 `model_cost_usd` in the metrics is therefore exactly 0.
 
@@ -13,9 +13,9 @@ documents only (not implemented); until then ambiguous input yields an explicit 
 ```
 targets (country x language x genre x organizer type x year x event keywords)      config/targets/pitchboard.json
    |  discover  (Wikidata class x country/language SPARQL, Wikipedia category directories, entity-search query combos,
-   |             entity follow-up from names found in text; relevance / depth / API-call budgets; exclude + blocked hosts)
+   |             entity follow-up from names found in text; relevance filters, exclusions and blocked hosts)
    v
-pb_discovery_candidate  -- evaluate (trial crawl <= 4 pages: relevance, novelty vs seed list / registered domain / entity duplicate,
+pb_discovery_candidate  -- evaluate (trial crawl: relevance, novelty vs seed list / registered domain / entity duplicate,
    |                                 extractability, original vs repost/aggregator, robots+HTTP permission)
    |   registered | registered_existing | deprioritized | rejected | manual_lead (SNS: never fetched)
    v
@@ -49,11 +49,40 @@ For `policy.ai`, `mentioned_unclassified` is a non-committal mention and cannot 
 
 ## Scheduler
 Jobs live in the infra DB with an idempotency key (`kind|subject|run_tag`), 300 s leases, expired-lease requeue (resume), bounded retry with backoff
-(3 attempts -> `dead` + `failure_queue`), a per-class daily request ledger (`discovery`, `backfill`, `freshness` are separate budgets) and a flock `RunLock`.
+(3 attempts -> `dead` + `failure_queue`), a daily request ledger for each lane (`discovery`, `backfill`, `freshness`) and a flock `RunLock`.
 `priority = 0.30 novelty + 0.25 gap importance + 0.20 urgency(deadline) + 0.15 quality - 0.10 cost - 0.15 duplication - 0.20 min(1, failures/3)`.
 Checkpoints are written after every job. `PB_CRASH_AFTER_LEASE=n` kills the process while holding a lease (used for the resume proof).
 
-Refresh prioritizes sources backing live deadline/status facts that are stale or expire within 48 hours (including confirmations), soonest expiry first; past deadline dates are excluded. Configure the horizon with `PB_REFRESH_HORIZON_HOURS`. Canonical URLs with successful HTML/PDF/image fetches are preferred; remaining slots fill oldest-first within the same limit, without duplicate URLs. Compare top-40 coverage with `python scripts/eval_refresh_live_calls.py SERVICE_SQLITE [--now YYYY-MM-DDTHH:MM:SSZ]`; it queries a temporary read-only copy, defaults to the latest raw fetch time, and needs no infra DB.
+Refresh prioritizes sources backing live deadline/status facts that are stale or expire within 48 hours (including confirmations), soonest expiry first. Past deadlines are excluded. Configure the horizon with `PB_REFRESH_HORIZON_HOURS`. Canonical URLs with successful HTML/PDF/image fetches are preferred, then other URLs refresh oldest first. Compare top-40 coverage with `python scripts/eval_refresh_live_calls.py SERVICE_SQLITE [--now YYYY-MM-DDTHH:MM:SSZ]`. It queries a temporary read-only copy and defaults to the latest raw fetch time.
+
+## Caps removed 2026-11-20
+
+The collector and ontology daemon accept optional `--max-jobs`, `--api-cap`,
+`--refresh-limit` and `--caps` in their respective `cli.py` files. For example,
+`--caps '{"discovery":{"requests":150}}'` enables a daily request cap for the
+discovery lane. The scheduler checks it between jobs and accounts for requests
+in each lane. Omitted lanes, omitted request limits, and JSON `null` are unlimited.
+
+`src/pbdata/collect/cli.py` and `src/pbdata/daemon/cli.py` dropped the 90-call
+Wikimedia API defaults. `src/pbdata/collect/collector.py` dropped the
+150/200/60 discovery/backfill/freshness request defaults, the 10-page site
+cap, the 3,000-URL sitemap limit, and the two-page and two-attempt gap-fill
+defaults. Refresh enqueueing dropped its 30-job collector default in that
+file and its 40-job daemon default in `src/pbdata/daemon/stages.py`.
+
+Set optional count limits in the top-level `budget` object passed via
+`--targets`. Omitted or JSON `null` values are unlimited.
+
+| Source | Optional settings |
+| --- | --- |
+| `src/pbdata/collect/{collector,discover,wiki}.py` | `api_calls`, `max_candidates` per strategy, `max_depth` for discovery, `wikidata_results`, `category_members`, `max_queries`, `search_results`, `entity_search_results`, `call_index_pages` |
+| `src/pbdata/collect/{collector,evaluate}.py` | `trial_pages`, `max_pages_per_site`, `crawl_depth`, `pagination_hops`, `pagination_links`, `follow_links`, `entity_followups`, `entity_followup_depth` |
+| `src/pbdata/collect/collector.py` | `sitemap_files`, `sitemap_urls`, `feeds`, `feed_items`, `expansion_pages`, `gap_attempts`, `gap_pages`, `refresh_limit` |
+
+`PB_MAX_PAGES_PER_SITE` overrides the site page setting. Each `call_indexes`
+entry can set `max_pages` and `max_details`. The shipped target file omits these
+limits. HTTP requests run serially with robots, proxy fail-closed behavior,
+honest User-Agents, blocked hosts, permission checks, and access denials enforced.
 
 ## Alerts (extraction breakage)
 `extraction_breakage` (>=2 core fields before, 0 after on a changed page), `field_lost`, `segments_collapsed` (<30% of >=8), `page_gone`, `login_wall`, `challenge`, `denied_*`.
@@ -62,8 +91,8 @@ Alerts do not delete or overwrite facts.
 ## Run
 ```
 export PYTHONPATH=src
-python -m pbdata.collect run     --root $PB_DATA_ROOT --run-tag $(date +%Y%m%dT%H%M%S) --api-cap 120 --max-jobs 700
-python -m pbdata.collect refresh --root $PB_DATA_ROOT --run-tag f1        # freshness budget: re-fetch oldest / most urgent pages
+python -m pbdata.collect run     --root $PB_DATA_ROOT --run-tag $(date +%Y%m%dT%H%M%S)
+python -m pbdata.collect refresh --root $PB_DATA_ROOT --run-tag f1
 python -m pbdata.collect metrics --root $PB_DATA_ROOT                    # metrics scoped to config/targets/*.json
 python -m pbdata.collect status  --root $PB_DATA_ROOT
 ```

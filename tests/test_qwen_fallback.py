@@ -20,6 +20,11 @@ def qwen_completion(fields=None):
 
 
 class QwenFallbackTests(Harness):
+    def setUp(self):
+        super().setUp()
+        self.config["qwen_pricing"] = dict(self.config["pricing"])
+        self.write_config()
+
     def fallback(self, url=URL, deepseek=None, qwen=None, **kwargs):
         def fail(*_):
             self.calls.append(("deepseek",))
@@ -165,25 +170,30 @@ class QwenFallbackTests(Harness):
         self.assertIs(repair["enable_thinking"], False)
         self.assertEqual({**repair, "messages": repair["messages"][:-1]}, first)
         self.assert_persisted_record(result)
-        self.assertEqual(self.run_page(URL + "-next")["reason"], "budget_exhausted")
+        self.assertEqual(self.run_page(URL + "-next")["outcome"], "ok")
 
-    def test_caps_skip_repair_after_two_reserved_calls(self):
-        for cap, value in (("daily_call_cap", 2), ("daily_cost_cap_usd", "0.6049152")):
-            with self.subTest(cap=cap), patch.dict(self.config, {cap: value}):
-                self.root = self.base / cap
-                self.write_config()
-                qwen = Mock(return_value=qwen_completion({"fee_krw": 100}))
-                result = self.fallback(qwen=qwen)
-                self.assertEqual(result["outcome"], "invalid_schema")
-                self.assertEqual(result["provider"], "qwen")
-                self.assertEqual(result["fallback_from"], "provider_error")
-                self.assertIs(result["repair_attempted"], False)
-                self.assertEqual(result["repair_outcome"], "skipped_cap")
-                self.assertEqual(result["provider_calls"], 2)
-                self.assertEqual(qwen.call_count, 1)
-                self.assertEqual(result["reserved_usd"], "0.6049152")
-                self.assertEqual(result["charged_ceiling_usd"], "0.6049152")
-                self.assert_persisted_record(result)
+    def test_fallback_repair_uses_qwen_rates_and_logs_failed_primary(self):
+        self.config["qwen_pricing"]["input_usd_per_million_ceiling"] = "1.00"
+        self.config.update(daily_call_cap=1, daily_cost_cap_usd="0", monetary_cap="enforced")
+        self.write_config()
+        qwen = Mock(side_effect=[qwen_completion({"fee_krw": 100}), qwen_completion()])
+        result = self.fallback(qwen=qwen)
+        self.assertEqual((result["outcome"], result["repair_outcome"]), ("ok", "ok"))
+        self.assertEqual(qwen.call_count, 2)
+        self.assertEqual(result["provider_calls"], 3)
+        self.assertEqual([call["provider"] for call in result["calls"]], ["deepseek", "qwen", "qwen"])
+        self.assertEqual([call["estimated_cost_usd"] for call in result["calls"]], [None, "0.000243", "0.000243"])
+        self.assertIsNone(result["estimated_cost_usd"])
+        self.assert_persisted_record(result)
+
+    def test_fallback_without_qwen_pricing_logs_usage_and_unknown_cost(self):
+        del self.config["qwen_pricing"]
+        self.write_config()
+        result = self.fallback()
+        self.assertEqual(result["outcome"], "ok")
+        self.assertEqual(result["calls"][1]["usage"], qwen_completion()["usage"])
+        self.assertIsNone(result["calls"][1]["estimated_cost_usd"])
+        self.assertIsNone(result["charged_ceiling_usd"])
 
     def test_escaped_primary_key_in_qwen_response_prevents_repair(self):
         raw = qwen_completion({"invented": KEY})
@@ -233,7 +243,7 @@ class QwenFallbackTests(Harness):
         self.assertEqual(result["provider_calls"], 1)
         self.assertEqual(calls, [])
 
-    def test_both_providers_fail_records_and_continues_budget(self):
+    def test_both_providers_fail_and_later_calls_continue(self):
         def qwen(*_):
             self.calls.append("qwen")
             raise TimeoutError("lost")
@@ -244,37 +254,8 @@ class QwenFallbackTests(Harness):
         self.assertEqual(first["provider_calls"], 2)
         self.assertEqual(first["fallback_from"], "provider_error")
         self.assertEqual(first["schema_shape"], {})
-        # A later page can still run; the failed fallback consumed two call units.
-        self.config["daily_call_cap"] = 3
-        self.write_config()
+        self.assertEqual([call["usage"] for call in first["calls"]], [None, None])
         self.assertEqual(self.run_page(URL + "2")["outcome"], "ok")
-        self.assertEqual(self.run_page(URL + "3")["reason"], "budget_exhausted")
-
-    def test_fallback_counts_toward_the_same_call_cap(self):
-        self.config["daily_call_cap"] = 2
-        self.write_config()
-        self.assertEqual(self.fallback(URL + "1")["outcome"], "ok")
-        # Two units used; a further primary-only page is denied.
-        self.assertEqual(self.run_page(URL + "2")["reason"], "budget_exhausted")
-
-    def test_no_fallback_when_cap_has_only_one_unit_left(self):
-        self.config["daily_call_cap"] = 1
-        self.write_config()
-        qcalls = []
-
-        def qwen(*_):
-            qcalls.append(1)
-            return qwen_completion()
-
-        result = self.fallback(qwen=qwen)
-        self.assertEqual(result["outcome"], "provider_error")
-        self.assertEqual(result["provider"], "deepseek")
-        self.assertEqual(result["provider_calls"], 1)
-        self.assertIs(result["repair_attempted"], False)
-        self.assertIsNone(result["repair_outcome"])
-        self.assertIsNone(result["fallback_from"])
-        self.assertEqual(qcalls, [])
-        self.assertEqual(result["charged_ceiling_usd"], "0.3024576")
 
     def test_missing_qwen_key_skips_fallback(self):
         def qwen(*_):

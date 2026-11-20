@@ -236,14 +236,14 @@ def read_ledger(path):
         yield conn if exists else None
 
 
-def pending(folder, ledger, limit, *, recover=False):
+def pending(folder, ledger, limit=None, *, recover=False):
     queued = []
     for path, data in batch.ready_batches(folder / "inbox"):
         prior = ledger.execute("SELECT * FROM batches WHERE batch_id=?", (path.name,)).fetchone() if ledger else None
         if prior:
             if recover:
                 close_batch(folder, path, data, prior["state"], json.loads(prior["detail"]))
-        elif len(queued) < limit:
+        elif limit is None or len(queued) < limit:
             queued.append((path, data))
             if len(queued) == limit:
                 break

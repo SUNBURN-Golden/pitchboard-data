@@ -58,9 +58,9 @@ The bot gives first priority to live deadlines within 21 days. A
 failed SOCKS5 probe skips publication after five attempts. Fetch failures that
 occur after a successful probe are included in the batch.
 
-The handoff consumes at most ten batches, oldest first. Replay rechecks the
+The handoff consumes pending batches oldest first. Replay rechecks the
 source registry and declines a stale observation if a newer successful raw
-already exists. A capped page cannot withdraw deadlines based on unseen text.
+already exists. A page with truncated text cannot withdraw deadlines based on unseen text.
 The site publishes verified deadlines and only advances outlet check dates
 when the outlet can be mapped by its official URLs. The build runs in a
 temporary directory using `git archive` from `/workspace/pitchboard-site`.
@@ -68,13 +68,29 @@ Deployment requires the box's Python `blake3` module and runtime token at
 `/home/box/.secrets/pitchboard_cf_pages_token.txt`. Alerts dispatch uses
 `/home/box/.secrets/pitchboard_alerts_cron_secret` when present.
 
-The daemon accepts `--root`, `--site-repo`, `--max-batches` (0–10),
+The daemon accepts `--root`, `--site-repo`, `--max-batches`,
 `--dry-run`, `--no-deploy`, and `--alerts-dry-run`. Dry-run prints the
 pending batch IDs and committed site revision using local state. With `--no-deploy`, the daemon
 still runs the DB phase, builds and verifies the site, and dispatches alerts
 when configured. `--alerts-dry-run` sends the dispatch request with
 `dry_run=1` to suppress alert delivery. Dispatch logs the HTTP status and any
 short error code returned by the service.
+
+## Caps removed 2026-11-20
+
+- `config/qwen_bot.json`, `src/pbdata/handoff/bot.py`, and
+  `src/pbdata/handoff/batch.py` dropped the defaults
+  of 30 pages and 40 Qwen calls per run. An absent or JSON `null`
+  `max_pages_per_run` or `max_llm_calls_per_run` allows all eligible work.
+  A nonnegative integer sets an explicit limit. The byte, timeout, and output
+  token limits apply, and schema repair still gets one retry per item.
+- `src/pbdata/handoff/daemon.py` and `src/pbdata/handoff/replay.py` dropped the 10-batch default.
+  Omit `--max-batches` for all pending batches or pass a nonnegative integer.
+- `handoff/qwen/usage.jsonl` and each manifest record total calls, tokens, and
+  `estimated_cost_usd`. Each item records usage per call, including repair.
+  Estimates use optional Qwen `pricing` in `config/qwen_bot.json`, with the
+  same rate fields as the shadow config. Missing or expired rates or missing
+  token counts produce JSON `null` for the estimate. [Pricing fields](LLM_EXTRACT_ACTIVATE.md#caps-removed-2026-11-20)
 
 ## Weekly share cards
 

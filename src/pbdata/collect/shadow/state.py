@@ -1,8 +1,8 @@
-"""Private shadow ledger. Reservations are permanent ceiling charges, never refunds."""
+"""Private shadow attempts ledger with durable dispatch accounting."""
 from __future__ import annotations
 
 from contextlib import contextmanager
-from decimal import Decimal, ROUND_CEILING
+from decimal import Decimal, DecimalException, ROUND_CEILING
 import fcntl
 import os
 from pathlib import Path
@@ -10,29 +10,22 @@ import sqlite3
 import stat
 import uuid
 
-from .common import Stop, append_sync, dumps, loads, money, no_symlinks, secure_open, shadow_root, sync_dir
+from .common import (Stop, append_sync, dumps, loads, no_symlinks, pricing_at,
+                     secure_open, shadow_root, sqlite_snapshot, sync_dir, total_cost)
 
 
-def reservation(config):
-    p = config["pricing"]
-    return ((Decimal(p["input_token_reservation_ceiling"]) * money(p["input_usd_per_million_ceiling"]) +
-             Decimal(config["max_output_tokens"]) * money(p["output_usd_per_million_ceiling"])) /
-            Decimal(1000000)).quantize(Decimal("0.0000001"), rounding=ROUND_CEILING)
-
-
-def _call_units(reserved_usd, result, unit):
-    if result:
-        rec = loads(result)
-        calls = rec.get("provider_calls")
-        if type(calls) is int and calls >= 1:
-            return calls
-    return max(1, int((money(reserved_usd) / unit).to_integral_value(rounding=ROUND_CEILING)))
-
-
-def day_usage(conn, day, unit):
-    rows = list(conn.execute("SELECT reserved_usd, result FROM attempts WHERE day=?", (day,)))
-    costs = [money(r[0]) for r in rows]
-    return costs, sum(_call_units(r[0], r[1], unit) for r in rows)
+def reservation(config, now, provider):
+    """Optional legacy ceiling estimate for logging a dispatch before usage arrives."""
+    p = config.get("qwen_pricing" if provider == "qwen" else "pricing")
+    rates = pricing_at(p, now)
+    if rates is None or "input_token_reservation_ceiling" not in p:
+        return None
+    try:
+        return ((Decimal(p["input_token_reservation_ceiling"]) * rates[0] +
+                 Decimal(config["max_output_tokens"]) * rates[1]) /
+                Decimal(1000000)).quantize(Decimal("0.0000001"), rounding=ROUND_CEILING)
+    except DecimalException:
+        return None
 
 
 def read_history(root):
@@ -80,23 +73,18 @@ def read_history(root):
             os.close(fd)
     if len(raw) > 256_000_000:
         raise Stop("budget_state_too_large")
-    if not hasattr(sqlite3.Connection, "deserialize"):
-        raise Stop("python_requires_311")
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
+    if raw[:16] != b"SQLite format 3\x00" or raw[18:20] != b"\x01\x01":
+        raise Stop("corrupt_budget_state")
     try:
-        conn.deserialize(raw)
-        conn.execute("PRAGMA query_only=ON")
-        if conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-            raise Stop("corrupt_budget_state")
-        if conn.execute("SELECT value FROM meta WHERE key='experiment_id'").fetchone()[0] != identity["experiment_id"]:
-            raise Stop("invalid_experiment")
-        return [loads(r[0]) for r in conn.execute(
-            "SELECT result FROM attempts WHERE result IS NOT NULL ORDER BY rowid")]
+        with sqlite_snapshot(raw) as conn:
+            if conn.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise Stop("corrupt_budget_state")
+            if conn.execute("SELECT value FROM meta WHERE key='experiment_id'").fetchone()[0] != identity["experiment_id"]:
+                raise Stop("invalid_experiment")
+            return [loads(r[0]) for r in conn.execute(
+                "SELECT result FROM attempts WHERE result IS NOT NULL ORDER BY rowid")]
     except sqlite3.Error:
         raise Stop("corrupt_budget_state") from None
-    finally:
-        conn.close()
 
 
 def comparison_output(root, extra_protected=()):
@@ -165,7 +153,7 @@ class State:
                 conn.executescript("""
                 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
                 CREATE TABLE attempts(id TEXT PRIMARY KEY, dedup TEXT UNIQUE NOT NULL,
-                  day TEXT NOT NULL, reserved_usd TEXT NOT NULL, result TEXT);
+                  day TEXT NOT NULL, reserved_usd TEXT NOT NULL, result TEXT, provider_calls INTEGER);
                 """)
                 conn.execute("INSERT INTO meta VALUES('experiment_id',?)", (identity["experiment_id"],))
                 conn.execute("INSERT INTO meta VALUES('watermark','')")
@@ -176,6 +164,8 @@ class State:
                 raise Stop("corrupt_budget_state")
             if conn.execute("SELECT value FROM meta WHERE key='experiment_id'").fetchone()[0] != identity["experiment_id"]:
                 raise Stop("invalid_experiment")
+            if "provider_calls" not in {row["name"] for row in conn.execute("PRAGMA table_info(attempts)")}:
+                conn.execute("ALTER TABLE attempts ADD COLUMN provider_calls INTEGER")
             yield conn
         finally:
             conn.close()
@@ -243,65 +233,43 @@ class State:
                     existing[row[id_key]] = row
         sync_dir(path.parent)
 
-    def preflight(self, conn, config, now):
+    def preflight(self, conn, now):
         time = now.isoformat()
         last = conn.execute("SELECT value FROM meta WHERE key='watermark'").fetchone()[0]
         if last and time < last:
             raise Stop("clock_backwards")
         if conn.execute("SELECT value FROM meta WHERE key='halted'").fetchone()[0]:
             raise Stop("experiment_halted")
-        day = now.date().isoformat()
-        charge = reservation(config)
-        costs, calls = day_usage(conn, day, charge)
-        mode = config["monetary_cap"]
-        if mode not in ("enforced", "none"):
-            raise Stop("invalid_config")
-        # The ceiling is always recorded. Only enforced mode also stops on the dollar sum.
-        # Fallback provider calls share this cap: each API invocation is one unit.
-        over_cost = mode == "enforced" and sum(costs, Decimal(0)) + charge > money(config["daily_cost_cap_usd"])
-        if calls >= config["daily_call_cap"] or over_cost:
-            raise Stop("budget_exhausted")
 
-    def reserve(self, conn, config, dedup, now):
-        if conn.execute("SELECT value FROM meta WHERE key='halted'").fetchone()[0]:
-            raise Stop("experiment_halted")
+    def reserve(self, conn, dedup, now):
+        self.preflight(conn, now)
         if conn.execute("SELECT 1 FROM attempts WHERE dedup=?", (dedup,)).fetchone():
             raise Stop("duplicate_page")
-        self.preflight(conn, config, now)
-        time, day, charge = now.isoformat(), now.date().isoformat(), reservation(config)
+        time, day = now.isoformat(), now.date().isoformat()
         # Preflight output before the durable reservation. No network on failure.
         with secure_open(self.output(day), "a+"):
             pass
         attempt_id = uuid.uuid4().hex
-        conn.execute("INSERT INTO attempts VALUES(?,?,?,?,NULL)", (attempt_id, dedup, day, str(charge)))
+        conn.execute("INSERT INTO attempts(id,dedup,day,reserved_usd,provider_calls) VALUES(?,?,?,?,0)",
+                     (attempt_id, dedup, day, "0"))
         conn.execute("UPDATE meta SET value=? WHERE key='watermark'", (time,))
         conn.commit()
-        return attempt_id, day, str(charge)
+        return attempt_id, day
 
-    def reserve_extra_call(self, conn, config, now, attempt_id):
-        """Charge one extra call on an in-flight attempt before fallback or repair."""
-        if conn.execute("SELECT value FROM meta WHERE key='halted'").fetchone()[0]:
-            raise Stop("experiment_halted")
-        time = now.isoformat()
-        last = conn.execute("SELECT value FROM meta WHERE key='watermark'").fetchone()[0]
-        if last and time < last:
-            raise Stop("clock_backwards")
-        row = conn.execute("SELECT day, reserved_usd, result FROM attempts WHERE id=?", (attempt_id,)).fetchone()
+    def record_call(self, conn, config, now, attempt_id, provider):
+        """Durably count each dispatch even if its result is lost."""
+        self.preflight(conn, now)
+        row = conn.execute("SELECT reserved_usd, result FROM attempts WHERE id=?", (attempt_id,)).fetchone()
         if row is None or row["result"] is not None:
             raise Stop("shadow_state_error")
-        charge = reservation(config)
-        costs, calls = day_usage(conn, row["day"], charge)
-        mode = config["monetary_cap"]
-        if mode not in ("enforced", "none"):
-            raise Stop("invalid_config")
-        over_cost = mode == "enforced" and sum(costs, Decimal(0)) + charge > money(config["daily_cost_cap_usd"])
-        if calls >= config["daily_call_cap"] or over_cost:
-            raise Stop("budget_exhausted")
-        new_reserved = money(row["reserved_usd"]) + charge
-        conn.execute("UPDATE attempts SET reserved_usd=? WHERE id=? AND result IS NULL", (str(new_reserved), attempt_id))
-        conn.execute("UPDATE meta SET value=? WHERE key='watermark'", (time,))
+        charge = reservation(config, now, provider)
+        prior = row["reserved_usd"]
+        new_reserved = total_cost((None if prior == "unknown" else prior, None if charge is None else str(charge)))
+        conn.execute("UPDATE attempts SET reserved_usd=?,provider_calls=provider_calls+1 WHERE id=?",
+                     ("unknown" if new_reserved is None else new_reserved, attempt_id))
+        conn.execute("UPDATE meta SET value=? WHERE key='watermark'", (now.isoformat(),))
         conn.commit()
-        return str(new_reserved)
+        return new_reserved
 
     def finish(self, conn, record):
         if record["outcome"] in ("model_mismatch", "usage_invariant"):

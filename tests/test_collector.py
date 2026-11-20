@@ -1,6 +1,7 @@
 import datetime as dt
 import os
 import unittest
+from unittest.mock import Mock, patch
 
 from helpers import NOW, add_source
 import fixture_site as fx
@@ -200,6 +201,39 @@ class E2E(unittest.TestCase):
         collector.run(c, max_jobs=60, log=None)
         kinds = {r["kind"] for r in self.inf.execute("SELECT kind FROM alert")}
         self.assertTrue(kinds & {"extraction_breakage", "field_lost", "segments_collapsed"}, kinds)
+
+    def test_default_collector_drains_every_lane_past_former_request_caps(self):
+        for lane in collector.LANES:
+            for i in range(3):
+                scheduler.enqueue(self.inf, "fixture", lane, {}, f"{lane}|{i}", .5, NOW)
+        ctx = collector.Ctx(self.svc, self.inf, self.fetcher, Api(), self.targets, "run_limits", "limits", lambda: NOW)
+
+        def requests(c, payload, job):
+            c.fetcher.requests += 225
+            return {}
+
+        with patch.dict(collector.HANDLERS, fixture=requests):
+            self.assertEqual(collector.run(ctx, log=None)["jobs_done"], 9)
+        self.assertIsNone(ctx.api.cap)
+        self.assertIsNone(ctx.site_page_cap)
+        for lane in collector.LANES:
+            self.assertEqual(scheduler.budget_used(self.inf, NOW[:10], lane, "requests"), 675)
+
+    def test_explicit_request_cap_only_applies_to_its_lane(self):
+        for lane in collector.LANES:
+            scheduler.enqueue(self.inf, "fixture", lane, {}, lane, .5, NOW)
+        ctx = collector.Ctx(self.svc, self.inf, self.fetcher, Api(), self.targets, "run_limits", "limits", lambda: NOW,
+                            {"backfill": {"requests": 0}, "freshness": {"requests": None}})
+        with patch.dict(collector.HANDLERS, fixture=Mock(return_value={})):
+            self.assertEqual(collector.run(ctx, log=None)["jobs_done"], 2)
+        self.assertEqual(self.inf.execute("SELECT budget_class FROM job WHERE state='pending'").fetchone()[0], "backfill")
+
+    def test_default_refresh_enqueues_past_former_collector_and_daemon_limits(self):
+        candidates = [{"url": self.origin + f"/call/{i}", "source_id": self.sid, "depth": 1,
+                       "refresh_fresh_until": None} for i in range(45)]
+        with patch.object(collector, "refresh_candidates", return_value=candidates):
+            self.assertEqual(collector.enqueue_refresh(self.ctx("all")), 45)
+            self.assertEqual(collector.enqueue_refresh(self.ctx("limited"), limit=3), 3)
 
     def test_resume_after_crash(self):
         c = self.ctx("a")

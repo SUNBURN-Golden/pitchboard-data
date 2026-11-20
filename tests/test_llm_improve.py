@@ -14,13 +14,6 @@ from unittest.mock import patch
 from pbdata.collect.shadow import batch, common, planner, runner, schema, state
 from test_llm_extract import Harness, NOW, URL, KEY, HTML, page, proposal, completion
 
-# sqlite3.Connection.deserialize landed in Python 3.11. CI still discovers on
-# 3.9, so success paths that snapshot a database in memory must skip there.
-HAS_DESERIALIZE = hasattr(sqlite3.Connection, "deserialize")
-deserialize_required = unittest.skipUnless(
-    HAS_DESERIALIZE, "sqlite3.Connection.deserialize requires Python 3.11+")
-
-
 def candidate(**changes):
     row = dict(gap_id="gap_1", subject_type="outlet", subject_id="out_1", predicate="fee.submission",
                scope_ref="unspecified", state="open", gap_class="not_extracted", importance=.7,
@@ -54,9 +47,11 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(len(plan["targets"][0]["targets"]), 2)
         self.assertEqual(set(plan["reasons"]), {"unsupported_predicate", "excluded_owner", "blocked_host", "no_outlet_relation", "superseded_observation", "ineligible_source"})
         many = export(*(candidate(gap_id=f"gap_{i}", url=f"https://example.org/{i}") for i in range(60)))
-        self.assertEqual(len(planner.plan(many)["targets"]), 40)
+        self.assertEqual(len(planner.plan(many)["targets"]), 60)
+        self.assertEqual(len(planner.plan(many, limit=51)["targets"]), 51)
+        self.assertEqual(planner.plan(many, limit=0)["targets"], [])
         with self.assertRaisesRegex(common.Stop, "invalid_limit"):
-            planner.plan(many, limit=51)
+            planner.plan(many, limit=-1)
 
     def test_planner_best_page_attempt_order_and_metadata_only(self):
         rows = [candidate(url="https://example.org/other", relevance=2), candidate(),
@@ -97,7 +92,6 @@ class InputSafetyTests(unittest.TestCase):
         self.assertFalse(planner.plan(export(candidate()), history=[h], config_hash="config")["targets"])
         self.assertTrue(planner.plan(export(candidate(predicate="status.declared")), history=[h], config_hash="config")["targets"])
 
-    @deserialize_required
     def test_db_snapshot_parity_and_no_writes(self):
         p = self.tmp_path / "fixture.sqlite"
         c = sqlite3.connect(p)
@@ -136,7 +130,6 @@ class InputSafetyTests(unittest.TestCase):
         c.commit(); c.close()
         self.assertFalse(planner.plan(planner.read_db(p, NOW))["targets"])
 
-    # Fails on the sidecar check before deserialize, so it still guards 3.9.
     def test_db_sidecars_require_export(self):
         p = self.tmp_path / "fixture.sqlite"
         c = sqlite3.connect(p)
@@ -176,16 +169,6 @@ class BatchUnitTests(unittest.TestCase):
                   {"outcome": "credential_in_response"}, None):
             self.assertTrue(batch.terminal(r))
         self.assertFalse(batch.terminal({"outcome": "provider_error"}))
-
-
-class BatchTests(Harness):
-    def test_cap_before_fetch_and_single_shared_ledger(self):
-        self.config["daily_call_cap"] = 1
-        self.write_config()
-        self.assertEqual(self.run_page()["outcome"], "ok")
-        with patch.object(runner.PolicyFetcher, "fetch", side_effect=AssertionError("fetch")):
-            r = runner.ShadowRunner(self.config_path, clock=lambda: NOW).run(shadow_root=self.root, url=URL)
-        self.assertEqual(r["reason"], "budget_exhausted")
 
 
 class CacheTests(Harness):
@@ -366,7 +349,6 @@ class ReportTests(Harness):
         self.assertEqual(row["outcome"], "ok")
         return row, next(self.root.glob("data/shadow/llm_extract_*.jsonl")), score_shadow
 
-    @deserialize_required
     def test_missing_key_record_stays_scoreable(self):
         from pbdata.collect.shadow.report import score_shadow
         raw = proposal()
@@ -380,7 +362,6 @@ class ReportTests(Harness):
         self.assertEqual(report["field_coverage"]["pay"]["accepted"], 0)
         self.assertEqual(report["field_coverage"]["deadline"]["accepted"], 1)
 
-    @deserialize_required
     def test_empty_object_record_zero_coverage_and_planner_done_parity(self):
         from pbdata.collect.shadow.report import score_shadow
         row = self.run_page(transport=lambda *_: completion({}))
@@ -404,12 +385,13 @@ class ReportTests(Harness):
         self.assertEqual(nulls["validation_reasons"], {})
         self.assertEqual(empty_plan, planner.plan(export(candidate()), history=state.read_history(self.root)))
 
-    @deserialize_required
     def test_offline_missing_gold_fee_denominators_cost_and_unfinished(self):
         row, path, score_shadow = self.inputs()
         self.run_page(url="https://example.org/failed", transport=lambda *_: (_ for _ in ()).throw(common.Stop("provider_error")))
         with state.State(self.root).locked() as c:
-            state.State(self.root).reserve(c, self.config, "unfinished", NOW)
+            ledger = state.State(self.root)
+            attempt, _ = ledger.reserve(c, "unfinished", NOW)
+            ledger.record_call(c, self.config, NOW, attempt, "deepseek")
         with patch("socket.socket", side_effect=AssertionError("network")), patch.object(runner, "provider", side_effect=AssertionError("provider")), patch.object(common, "load_key", side_effect=AssertionError("key")):
             report = score_shadow([path], self.root, NOW, self.config, ledger_path=self.root / "budget.sqlite3")
         self.assertEqual(report["counts"]["attempted"], 2)
@@ -421,8 +403,8 @@ class ReportTests(Harness):
         self.assertEqual(report["ledger"]["ceiling_usd"], "0.9073728")
         day = report["ledger"]["days"]["2026-11-05"]
         self.assertEqual((day["attempts"], day["failed"], day["unfinished"], day["unknown_usage"]), (3, 1, 1, 2))
-        self.assertEqual(day["cap_basis"], "recorded_config")
-        self.assertIn("not invoices", report["ledger"]["meaning"])
+        self.assertEqual(day["provider_calls"], 3)
+        self.assertIsNone(day["estimated_cost_usd"])
         self.assertTrue(report["runtime_commits"])
 
     def test_gold_accuracy_fields_invalid_evidence_missing_text_duplicates(self):
@@ -472,9 +454,6 @@ with patch('socket.socket', side_effect=AssertionError('network')), patch.object
 '''
         args = [sys.executable, "-B", "-c", program, str(script), "--input-mode", "shadow", "--shadow-root", str(self.root),
                 "--predictions", str(path), "--config", str(self.config_path), "--as-of", "2026-11-05"]
-        if not HAS_DESERIALIZE:
-            # Avoid the ledger snapshot on 3.9; these tripwires do not need it.
-            args += ["--ledger", str(self.base / "absent-ledger.sqlite3")]
         result = subprocess.run(args, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["verified_unique_pages"], 1)
@@ -484,10 +463,9 @@ with patch('socket.socket', side_effect=AssertionError('network')), patch.object
 
 
 class BatchIntegrationTests(Harness):
-    def test_batch_stops_before_fetch_at_cap_and_records_private_plan(self):
-        self.config["daily_call_cap"] = 2
-        self.write_config()
-        plan = planner.plan(export(*(candidate(gap_id=f"gap_{i}", url=f"https://example.org/{i}") for i in range(4))))
+    def test_batch_selection_override_and_private_plan(self):
+        plan = planner.plan(export(*(candidate(gap_id=f"gap_{i}", url=f"https://example.org/{i}") for i in range(4))),
+                            limit=2)
         fetched = []
         def fetch(url):
             fetched.append(url)
@@ -495,8 +473,7 @@ class BatchIntegrationTests(Harness):
         with patch.object(runner.PolicyFetcher, "fetch", side_effect=fetch):
             rows = batch.execute(runner.ShadowRunner(self.config_path, clock=lambda: NOW), self.root, plan,
                                  key_loader=lambda: KEY, transport=self.transport)
-        self.assertEqual([r["outcome"] for r in rows], ["ok", "ok", "skipped"])
-        self.assertEqual(rows[-1]["reason"], "budget_exhausted")
+        self.assertEqual([r["outcome"] for r in rows], ["ok", "ok"])
         self.assertEqual(len(fetched), len(self.calls))
         self.assertEqual(len(self.calls), 2)
         path = next(self.root.glob("data/shadow/plans_*.jsonl"))
@@ -504,11 +481,10 @@ class BatchIntegrationTests(Harness):
         self.assertNotIn(KEY, path.read_text())
         from pbdata.collect.shadow.report import score_shadow
         output = next(self.root.glob("data/shadow/llm_extract_*.jsonl"))
-        # The cap/planning assertions below do not need the ledger snapshot.
         report = score_shadow([output], self.root, NOW, self.config,
-                              ledger_path=self.root / "budget.sqlite3" if HAS_DESERIALIZE else None)
-        self.assertEqual(report["planning"]["selected_urls"], 4)
-        self.assertEqual(report["planning"]["selected_without_attempt"], 2)
+                              ledger_path=self.root / "budget.sqlite3")
+        self.assertEqual(report["planning"]["selected_urls"], 2)
+        self.assertEqual(report["planning"]["selected_without_attempt"], 0)
 
     def test_key_in_plan_stops_before_persisting(self):
         plan = planner.plan(export(candidate(owner_name=KEY)))
@@ -518,7 +494,7 @@ class BatchIntegrationTests(Harness):
 
 
 class FinalSafetyTests(Harness):
-    def test_shared_concurrent_batch_single_cap_and_halts(self):
+    def test_shared_concurrent_batch_and_single_ledger_with_halts(self):
         from concurrent.futures import ThreadPoolExecutor
         self.config["daily_call_cap"] = 3
         self.write_config()
@@ -530,10 +506,10 @@ class FinalSafetyTests(Harness):
             many = pool.submit(batch.execute, runner.ShadowRunner(self.config_path, clock=lambda: NOW), self.root, plan,
                                key_loader=lambda: KEY, transport=self.transport)
             single, rows = one.result(), many.result()
-        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(len(self.calls), 5)
         with state.State(self.root).locked() as c:
-            self.assertEqual(c.execute("SELECT count(*) FROM attempts").fetchone()[0], 3)
-        self.assertTrue(any(r.get("reason") == "budget_exhausted" for r in [single] + rows))
+            self.assertEqual(c.execute("SELECT sum(provider_calls) FROM attempts").fetchone()[0], 5)
+        self.assertEqual([r["outcome"] for r in [single] + rows], ["ok"] * 5)
         self.root = self.base / "halted"
         def mismatch(*args):
             self.calls.append(None)
@@ -623,7 +599,7 @@ class ServiceHashContractTests(Harness):
         outputs = list(self.root.glob("data/shadow/llm_extract_*.jsonl"))
         # Counts/coverage below are ledger-independent; the snapshot needs 3.11.
         report = score_shadow(outputs, self.root, next_clock, self.config,
-                              ledger_path=self.root / "budget.sqlite3" if HAS_DESERIALIZE else None)
+                              ledger_path=self.root / "budget.sqlite3")
         self.assertEqual(report["counts"]["verified_unique_pages"], 2)
         self.assertEqual(report["counts"]["changed_source_attempts"], 0)
         self.assertEqual(report["field_coverage"]["submission_fee"]["targeted_pages"], 2)
@@ -666,8 +642,6 @@ class LegacyScoreTests(unittest.TestCase):
 
 
 class PlanOnlyHistoryTests(Harness):
-    # read_history snapshots the ledger through deserialize.
-    @deserialize_required
     def test_plan_only_reflects_prior_static_completion_without_writes(self):
         self.assertEqual(self.run_page()["outcome"], "ok")
         before = {p: p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
@@ -686,6 +660,6 @@ class PlanOnlyHistoryTests(Harness):
 
 
 class ProjectMetadataTests(unittest.TestCase):
-    def test_python_floor_declares_deserialize_support(self):
+    def test_python_floor_supports_snapshot_fallback(self):
         pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
-        self.assertIn('requires-python = ">=3.11"', pyproject)
+        self.assertIn('requires-python = ">=3.9"', pyproject)

@@ -114,13 +114,13 @@ def fetch_page(svc: sqlite3.Connection, fetcher: Fetcher, url: str, site_source_
     elif kind == "feed":
         items = parse.parse_feed(res.body)
         doc = parse.Doc("feed", title="feed")
-        for i, it in enumerate(items[:100]):
+        for i, it in enumerate(items):
             doc.segments.append(parse.Segment(i, "p", (it["title"] + " " + it["summary"]).strip(), "", {"link": it["link"], "date": it["date"]}))
             doc.links.append(parse.Link(it["link"], it["title"]))
     elif kind == "sitemap":
         pages, kids = parse.parse_sitemap(res.body)
         doc = parse.Doc("sitemap", title="sitemap")
-        doc.links = [parse.Link(u, "") for u in pages[:5000]] + [parse.Link(u, "sitemap") for u in kids]
+        doc.links = [parse.Link(u, "") for u in pages] + [parse.Link(u, "sitemap") for u in kids]
         doc.segments = [parse.Segment(0, "p", "sitemap %d urls" % len(pages), "")]
     else:
         doc = parse.parse_html(res.body, res.final_url)

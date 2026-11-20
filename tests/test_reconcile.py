@@ -165,7 +165,7 @@ class ReconcileTests(unittest.TestCase):
             # A separate outlet prevents promotion reusing an existing edition.
             self.outlet = add_outlet(self.svc)
             cid, *_ = self.legacy_call(status=status)
-            ctx = RunContext(self.svc, self.infra, "unused", "test", lambda: LATER, Ledger(self.infra, LATER[:10], {}), {})
+            ctx = RunContext(self.svc, self.infra, "unused", "test", lambda: LATER, Ledger(self.infra, LATER[:10]), {})
             result = stages.s_state_update(ctx)
             self.assertEqual(self.status(cid), "closed" if status in reconcile.ACTIVE_STATUSES else status)
             self.assertEqual(result["closed_nonwriting"], int(status in reconcile.ACTIVE_STATUSES))

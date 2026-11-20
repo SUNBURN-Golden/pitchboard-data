@@ -1,5 +1,7 @@
 # Optional DeepSeek Flash extraction: BUILD
 
+> The original BUILD design below describes the November 5–7 budget policy. See the [2026-11-20 cap changes](../README.md#caps-removed-2026-11-20) for current defaults.
+
 Implemented on `feat/deepseek-extract-shadow`, 2026-11-05. The flag remains **false**.
 No real provider calls, credential reads, live collector execution, deployment,
 cron changes, or live database writes were performed during BUILD. Source changes

@@ -343,7 +343,7 @@ def response(raw, doc, as_of, config, provider="deepseek", *, schema_shape=None,
     if not isinstance(usage, dict) or not all(type(usage.get(k)) is int and usage[k] >= 0 for k in ("prompt_tokens", "completion_tokens", "total_tokens")):
         raise Stop("invalid_usage")
     if (usage["total_tokens"] != usage["prompt_tokens"] + usage["completion_tokens"] or
-            usage["prompt_tokens"] > 1000000 or usage["completion_tokens"] > config["max_output_tokens"]):
+            usage["completion_tokens"] > config["max_output_tokens"]):
         raise Stop("usage_invariant")
     details = usage.get("completion_tokens_details", {})
     if not isinstance(details, dict) or details.get("reasoning_tokens", 0) != 0:

@@ -7,7 +7,7 @@ import unittest
 from pbdata import db, facts, statemachine
 from pbdata.model import FactInput
 from pbdata.daemon import project, questions, clips
-from pbdata.daemon.runner import DaemonLock, Ledger, RunContext, StageRunner, CostCapExceeded
+from pbdata.daemon.runner import DaemonLock, Ledger, RunContext, StageRunner
 from pbdata.daemon import stages as S
 from helpers import add_outlet, add_source, add_call, add_revision
 
@@ -35,7 +35,7 @@ class Env:
     def ctx(self, run_id="r1", **opts):
         o = {"offline": True, "targets": {"targets": []}}
         o.update(opts)
-        c = RunContext(self.svc, self.infra, self.root, run_id, lambda: self.now, Ledger(self.infra, self.now[:10], {}), o)
+        c = RunContext(self.svc, self.infra, self.root, run_id, lambda: self.now, Ledger(self.infra, self.now[:10]), o)
         c.log = lambda *_: None
         return c
 
@@ -163,12 +163,24 @@ class RunnerTest(unittest.TestCase):
         finally:
             e.close()
 
-    def test_model_cost_cap_zero(self):
+    def test_ai_promotion_is_disabled_even_with_unlimited_ledger(self):
         e = Env()
         try:
             rep = StageRunner(e.ctx("rc", ai_extraction=True), [("extraction", S.s_extraction)], sleep=lambda s: None).run()
             self.assertEqual(rep["stages"]["extraction"]["status"], "failed")
+            self.assertEqual(rep["stages"]["extraction"]["error"], "AI extraction is disabled for promotion")
             self.assertIsNone(e.infra.execute("SELECT amount FROM cost_ledger WHERE resource='model_calls'").fetchone())
+        finally:
+            e.close()
+
+    def test_ledger_logs_counts_tokens_and_cost_without_caps(self):
+        e = Env()
+        try:
+            ledger = e.ctx().ledger
+            for resource, amount in (("model_calls", 60), ("model_tokens", 1_000_000), ("model_usd", 12.5)):
+                ledger.charge(resource, amount)
+                ledger.charge(resource, amount)
+                self.assertEqual(ledger.used(resource), amount * 2)
         finally:
             e.close()
 

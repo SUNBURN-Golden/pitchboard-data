@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline held-out scoring (default) or explicit bounded cached-page generation."""
+"""Offline held-out scoring (default) or explicit cached-page generation."""
 import argparse
 from collections import defaultdict
 import os
@@ -13,7 +13,7 @@ from pbdata.collect.shadow.common import CONFIG, Stop, digest, dumps, load_confi
 from pbdata.collect.shadow.compare import load_cohorts, predictions, score
 from pbdata.collect.shadow.state import State, comparison_output
 
-from pbdata.collect.shadow.batch import CONTINUE_REASONS, terminal
+from pbdata.collect.shadow.batch import terminal
 
 
 def write_report(path, report):
@@ -63,7 +63,7 @@ def main():
     parser.add_argument("--predictions", type=Path, nargs="+", help="one or more daily shadow JSONL files")
     parser.add_argument("--operation", choices=("score", "generate"), default="score")
     parser.add_argument("--config", type=Path, default=CONFIG)
-    parser.add_argument("--sample-size", type=int, default=112)
+    parser.add_argument("--sample-size", type=int, help="maximum held-out pages to generate (default: unlimited)")
     parser.add_argument("--input-mode", choices=("heldout", "shadow"), default="heldout")
     parser.add_argument("--gold-json", type=Path)
     parser.add_argument("--ledger", type=Path)
@@ -95,7 +95,7 @@ def main():
                 group.sort(key=lambda x: digest(experiment + "\0" + x.url + "\0" + x.body_hash))
             ordered = [group[i] for i in range(max((len(g) for g in strata.values()), default=0))
                        for _, group in sorted(strata.items()) if i < len(group)]
-            if not 1 <= args.sample_size <= 112:
+            if args.sample_size is not None and args.sample_size < 0:
                 raise Stop("invalid_sample_size")
             selected = ordered[:args.sample_size]
             sample = dumps([{"cohort": i.cohort, "url": i.url, "body_sha256": i.body_hash, "as_of": i.as_of} for i in selected])

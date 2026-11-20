@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan metadata-only gaps or explicitly execute a bounded isolated shadow batch."""
+"""Plan metadata-only gaps or explicitly execute an isolated shadow batch."""
 import argparse
 from pathlib import Path
 import sys
@@ -17,7 +17,7 @@ def main():
     source.add_argument("--service-db", type=Path)
     p.add_argument("--plan-only", action="store_true")
     p.add_argument("--allow-stale", action="store_true", help="plan-only inspection")
-    p.add_argument("--limit", type=int, default=40)
+    p.add_argument("--limit", type=int, help="maximum number of distinct URLs to select (default: unlimited)")
     p.add_argument("--config", type=Path, default=CONFIG)
     p.add_argument("--shadow-root", type=Path)
     p.add_argument("--digest-languages", default="", choices=("", "ko", "en", "ko,en"))
@@ -33,7 +33,7 @@ def main():
         from pbdata.collect.shadow.state import State
         state = State(args.shadow_root)
         with state.locked() as conn:
-            state.preflight(conn, config, now)
+            state.preflight(conn, now)
             from pbdata.collect.shadow.common import loads
             history = [loads(r[0]) for r in conn.execute("SELECT result FROM attempts WHERE result IS NOT NULL")]
     elif args.shadow_root is not None:
