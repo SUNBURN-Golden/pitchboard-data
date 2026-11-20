@@ -1,20 +1,26 @@
 """Strict configuration, safe credentials, and isolated file primitives."""
 from __future__ import annotations
 
+from contextlib import closing, contextmanager
 import datetime as dt
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import stat
-from decimal import Decimal
+import tempfile
+from decimal import Decimal, DecimalException
 
 UTC = dt.timezone.utc
 CONFIG = Path(__file__).resolve().parents[4] / "config/llm_extract.json"
 PROTECTED = tuple(Path(p) for p in (
     "/workspace/pitchboard", "/workspace/pitchboard-data", "/workspace/pitchboard-data-main",
     "/workspace/pb-eval"))
+TOKEN_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens")
+LEGACY_BUDGET_KEYS = {"daily_call_cap", "daily_cost_cap_usd", "monetary_cap"}
+RATE_KEYS = ("input_usd_per_million_ceiling", "output_usd_per_million_ceiling")
 
 
 class Stop(Exception):
@@ -78,52 +84,90 @@ def money(value):
     return result
 
 
+def pricing_at(pricing, now):
+    """Return a validated rate snapshot usable at this UTC time."""
+    try:
+        verified = dt.date.fromisoformat(pricing["verified_on"])
+        expiry = stamp(pricing["valid_until_utc"])
+        if verified <= now.date() and now < expiry:
+            return tuple(money(pricing[field]) for field in RATE_KEYS)
+    except (AttributeError, DecimalException, KeyError, TypeError, ValueError):
+        pass
+    return None
+
+
+def call_usage(provider, raw, rates):
+    """Keep only numeric token counts, even when response validation fails."""
+    usage = raw.get("usage") if isinstance(raw, dict) else None
+    tokens = {k: usage[k] for k in TOKEN_FIELDS
+              if isinstance(usage, dict) and type(usage.get(k)) is int and usage[k] >= 0}
+    cost = None
+    if (rates is not None and len(tokens) == len(TOKEN_FIELDS)
+            and tokens["prompt_tokens"] + tokens["completion_tokens"] == tokens["total_tokens"]):
+        try:
+            cost = str((tokens["prompt_tokens"] * rates[0] + tokens["completion_tokens"] * rates[1])
+                       / 1_000_000)
+        except DecimalException:
+            pass
+    return {"provider": provider, "usage": tokens or None, "estimated_cost_usd": cost}
+
+
+def total_cost(estimates):
+    total = Decimal(0)
+    try:
+        for cost in estimates:
+            if cost is None:
+                return None
+            total += money(cost)
+    except DecimalException:
+        return None
+    return str(total)
+
+
+def pricing_snapshot(pricing):
+    """Keep only rate metadata in persisted config, independent of the clock."""
+    try:
+        dt.date.fromisoformat(pricing["verified_on"])
+        stamp(pricing["valid_until_utc"])
+        for field in RATE_KEYS:
+            money(pricing[field])
+        result = {k: pricing[k] for k in (*RATE_KEYS, "verified_on", "valid_until_utc")}
+        token_ceiling = pricing.get("input_token_reservation_ceiling")
+        if type(token_ceiling) is int and token_ceiling >= 0:
+            result["input_token_reservation_ceiling"] = token_ceiling
+        return result
+    except (AttributeError, DecimalException, KeyError, TypeError, ValueError):
+        return None
+
+
 def load_config(path=CONFIG, now=None):
     """Fail closed. Disabled means no credentials, state, or network are touched."""
     try:
         c = loads(Path(path).read_bytes())
         if not isinstance(c, dict) or c.get("enabled") is not True:
             raise Stop("disabled")
-        keys = {"enabled", "mode", "model", "daily_call_cap", "daily_cost_cap_usd", "monetary_cap", "egress",
+        keys = {"enabled", "mode", "model", "egress",
                 "max_page_utf8_bytes", "max_output_tokens", "timeout_seconds",
-                "window_start_utc", "window_end_utc", "pricing"}
-        if set(c) != keys or c["mode"] != "shadow" or c["model"] != "deepseek-flash":
+                "window_start_utc", "window_end_utc"}
+        if (not keys <= set(c) <= keys | LEGACY_BUDGET_KEYS | {"pricing", "qwen_pricing"}
+                or c["mode"] != "shadow" or c["model"] != "deepseek-flash"):
             raise Stop("invalid_config")
-        if c["monetary_cap"] not in ("enforced", "none") or c["egress"] not in ("direct", "sandbox"):
+        if c["egress"] not in ("direct", "sandbox"):
             raise Stop("invalid_config")
-        for k, low, high in (("daily_call_cap", 0, 10000), ("max_page_utf8_bytes", 1, 24000),
+        for k, low, high in (("max_page_utf8_bytes", 1, 24000),
                              ("max_output_tokens", 1, 2048), ("timeout_seconds", 1, 60)):
             if type(c[k]) is not int or not low <= c[k] <= high:
                 raise Stop("invalid_config")
-        p = c["pricing"]
-        if not isinstance(p, dict) or set(p) != {"input_usd_per_million_ceiling",
-                "output_usd_per_million_ceiling", "input_token_reservation_ceiling", "verified_on", "valid_until_utc"}:
-            raise Stop("invalid_config")
-        if type(p["input_token_reservation_ceiling"]) is not int or p["input_token_reservation_ceiling"] != 1000000:
-            raise Stop("invalid_config")
-        if money(p["input_usd_per_million_ceiling"]) < Decimal("0.30") or money(p["output_usd_per_million_ceiling"]) < Decimal("1.20"):
-            raise Stop("invalid_config")
-        if c["daily_call_cap"] == 0:
-            raise Stop("budget_exhausted")
-        if c["monetary_cap"] == "enforced":
-            if money(c["daily_cost_cap_usd"]) == 0:
-                raise Stop("budget_exhausted")
-        elif c["daily_cost_cap_usd"] is not None:
-            # "none" is the only opt-in, and it cannot sit beside a dollar figure that looks enforced.
-            raise Stop("invalid_config")
         start, end = stamp(c["window_start_utc"]), stamp(c["window_end_utc"])
         now = now or utcnow()
         if not start < end or end - start > dt.timedelta(days=7):
             raise Stop("invalid_window")
         if not start <= now < end:
             raise Stop("inactive_window")
-        verified = dt.date.fromisoformat(p["verified_on"])
-        expiry = stamp(p["valid_until_utc"])
-        if verified > now.date() or expiry - dt.datetime.combine(verified, dt.time(), UTC) > dt.timedelta(days=7):
-            raise Stop("invalid_pricing")
-        if expiry < end or now >= expiry:
-            raise Stop("expired_pricing")
-        return c
+        for field in ("pricing", "qwen_pricing"):
+            if field in c:
+                c[field] = pricing_snapshot(c[field])
+        return {k: v for k, v in c.items() if k not in LEGACY_BUDGET_KEYS}
     except Stop:
         raise
     except FileNotFoundError:
@@ -206,6 +250,27 @@ def no_symlinks(path):
     if any(p.is_symlink() for p in (path, *path.parents)):
         raise Stop("unsafe_path")
     return path
+
+
+@contextmanager
+def sqlite_snapshot(raw):
+    """Query copied bytes without SQLite opening or updating the source DB."""
+    if hasattr(sqlite3.Connection, "deserialize"):
+        with closing(sqlite3.connect(":memory:")) as conn:
+            conn.deserialize(raw)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only=ON")
+            yield conn
+    else:
+        with tempfile.TemporaryDirectory(prefix="pb-shadow-snapshot-") as folder:
+            with tempfile.NamedTemporaryFile(dir=folder) as snapshot:
+                snapshot.write(raw)
+                snapshot.flush()
+                uri = Path(snapshot.name).as_uri() + "?mode=ro&immutable=1"
+                with closing(sqlite3.connect(uri, uri=True)) as conn:
+                    conn.row_factory = sqlite3.Row
+                    conn.execute("PRAGMA query_only=ON")
+                    yield conn
 
 
 def secure_open(path, mode, create=True):

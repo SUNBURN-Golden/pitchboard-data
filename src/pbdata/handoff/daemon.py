@@ -9,7 +9,6 @@ from pbdata import db, timeutil
 
 from . import batch, cards, deploy, replay, site, status
 
-MAX_BATCHES = 10
 LOG = logging.getLogger(__name__)
 
 
@@ -34,8 +33,8 @@ def database_phase(root, record, max_batches, clock):
                 replay.export_projection(svc, root, timeutil.iso(clock()))
 
 
-def run(root, site_repo, *, max_batches=MAX_BATCHES, no_deploy=False, clock=timeutil.utcnow,
-        build_site=site.build_site, alerts=deploy.dispatch_alerts, cards_mode="auto",
+def run(root, site_repo, *, max_batches=None, no_deploy=False, clock=timeutil.utcnow,
+        build_site=site.build_site, alerts=deploy.dispatch_alerts, alerts_dry_run=False, cards_mode="auto",
         generate_card=cards.generate_card):
     started = clock()
     record = dict(started_at=timeutil.iso(started), batches_consumed=0, batches_failed=0, items_ok=0, facts_promoted=0,
@@ -56,7 +55,8 @@ def run(root, site_repo, *, max_batches=MAX_BATCHES, no_deploy=False, clock=time
         eastern_date = as_of.astimezone(cards.EASTERN).date()
         for item in record["cards"]:
             try:
-                out_dir = generate_card(item["kind"], today, site_data, deadline_start=eastern_date)
+                out_dir = generate_card(item["kind"], today, site_data, deadline_start=eastern_date,
+                                        site_commit=record["site"]["commit"])
                 item.update(ok=True, out_dir=str(out_dir), error=None)
             except Exception as exc:
                 item["error"] = str(exc) or type(exc).__name__
@@ -71,11 +71,9 @@ def run(root, site_repo, *, max_batches=MAX_BATCHES, no_deploy=False, clock=time
         print(f"handoff site phase failed ({type(exc).__name__})", flush=True)
         record["site"]["error_code"] = "site_phase_error"
     try:
-        record["alerts_status"] = alerts()
+        record["alerts_status"] = alerts(dry_run=True) if alerts_dry_run else alerts()
     except Exception:
         pass
-    if record["alerts_status"] is not None:
-        print(f'handoff alerts HTTP {record["alerts_status"]}', flush=True)
     record["finished_at"] = timeutil.iso(clock())
     if "error_code" in record["site"]:
         record["outcome"] = record["site"]["error_code"]
@@ -95,7 +93,7 @@ def run(root, site_repo, *, max_batches=MAX_BATCHES, no_deploy=False, clock=time
     return record
 
 
-def dry_run(root, site_repo, max_batches):
+def dry_run(root, site_repo, max_batches=None):
     folder = root / "handoff/qwen"
     with replay.read_ledger(folder / "ledger.sqlite3") as ledger:
         planned = replay.pending(folder, ledger, max_batches)
@@ -111,11 +109,14 @@ def main(argv=None, *, lock_held=False):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--root", type=Path, default=db.data_root())
     parser.add_argument("--site-repo", type=Path, default=site.DEFAULT_REPO)
-    parser.add_argument("--max-batches", type=int, default=MAX_BATCHES, choices=range(MAX_BATCHES + 1))
+    parser.add_argument("--max-batches", type=int, help="maximum batches to apply (default: unlimited)")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-deploy", action="store_true")
+    parser.add_argument("--alerts-dry-run", action="store_true")
     parser.add_argument("--cards", choices=("auto", *cards.KINDS, "both", "none"), default="auto")
     args = parser.parse_args(argv)
+    if args.max_batches is not None and args.max_batches < 0:
+        parser.error("--max-batches must be nonnegative")
     try:
         if args.dry_run:
             dry_run(args.root, args.site_repo, args.max_batches)
@@ -126,7 +127,7 @@ def main(argv=None, *, lock_held=False):
                 print("handoff daemon already running")
                 return 0
             record = run(args.root, args.site_repo, max_batches=args.max_batches, no_deploy=args.no_deploy,
-                         cards_mode=args.cards)
+                         alerts_dry_run=args.alerts_dry_run, cards_mode=args.cards)
             return int(bool(record.get("db_error") or record["site"].get("error_code")))
     except Exception:
         print("handoff daemon error")

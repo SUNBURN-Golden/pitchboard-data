@@ -16,18 +16,18 @@ is a static copy of its seed domains, used only to decide "novel vs already know
 (approved default #3) mutates its DB and has **not** been executed; do it deliberately and never for the 7 blocked domains.
 
 ## Daily operation
-1. `run` (discovery + backfill + freshness budgets are separate; defaults 150/200/60 requests per day, override with `--caps`).
+1. `run` drains discovery, backfill, and freshness work with unlimited requests by default. Optional per-lane request limits use `--caps`.
 2. `refresh` re-fetches the oldest / most urgent pages; unchanged pages only log `unchanged`.
 3. `metrics` -> JSON. Watch `alerts` (extraction_breakage, field_lost, segments_collapsed, page_gone, login_wall, challenge, denied_*) and `failure_queue`.
 4. A crashed run: start the same command again (same `--run-tag`, `--run-id`, `--no-seed`). Leased jobs expire after 300 s and are re-queued; jobs that fail 3 times are dead-lettered.
 
 ## Gap handling
-`not_extracted` (page had no parseable value; gap_fill tries same-site reverse search, max 2 attempts) -> `filled` (fact with evidence) or stays `open`;
+`not_extracted` (page had no parseable value; gap_fill tries same-site reverse search) -> `filled` (fact with evidence) or stays `open`;
 `absent_in_source` (inspected pages state nothing; recorded as `not_stated_in_inspected_scope`, never as "no restriction"; stays open until reviewed);
 `inaccessible` (login wall / robots / HTTP denial; `blocked`); `conflict` (sources disagree; both kept in a conflict group).
 
 ## Rules-only / cost
-AI extraction is disabled (cap 0): no model calls, no per-fact model cost. OCR is local tesseract. Request cost = HTTP requests + Wikimedia API calls (`--api-cap`).
+Promotion uses rules only and OCR uses local Tesseract. The collector records HTTP and Wikimedia API requests. See the [2026-11-20 cap changes](../README.md#caps-removed-2026-11-20) for CLI overrides and the daily timeouts.
 
 ## Edition semantics
 `edition_key` is the first-seen close date (or year) of a call. A later date on the same single-deadline page while the call is still live is the *same* call:
@@ -50,7 +50,6 @@ Daily collector jobs (`scripts/daily.sh`, `scripts/daemon_daily.sh`, and the Dee
 and no fetch falls back to the box IP. DNS for those fetches is resolved by the proxy. LLM API calls
 (`api.deepseek.com` and, on DeepSeek failure only, `token-plan.maas.qwencloudapi.com` via
 `shadow.runner.provider`) stay direct and still ignore `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`.
-A Qwen fallback call counts toward the same daily call cap. If both providers fail, the attempt
-is recorded and the batch skips to the next target.
+The shadow ledger records DeepSeek and Qwen fallback calls, including failed calls. If both providers fail, the batch moves to the next target.
 Headless Chromium uses `--proxy-server=socks5://127.0.0.1:1080` with remote DNS and blocks images, fonts, and media.
 Bytes fetched through the proxy are appended to `$PB_DATA_ROOT/logs/proxy_traffic.log`.

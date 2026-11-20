@@ -8,14 +8,16 @@ import shutil
 import sqlite3
 
 from pbdata import timeutil
+from pbdata.collect.shadow.common import TOKEN_FIELDS
 
 from .status import json_line, sync_dir, write_file
 
 SCHEMA = "pb-qwen-batch-1"
 BATCH_ID = re.compile(r"qb[0-9]{8}T[0-9]{6}Z-[0-9a-f]{6}")
 OUTCOMES = ("ok", "blocked", "robots_disallowed", "fetch_error", "llm_error", "skipped_cap")
-TOKEN_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens")
-CAP_FIELDS = {"max_pages_per_run", "max_llm_calls_per_run", "max_page_utf8_bytes", "timeout_seconds", "max_output_tokens"}
+
+COUNT_CAPS = {"max_pages_per_run", "max_llm_calls_per_run"}
+TECHNICAL_LIMITS = {"max_page_utf8_bytes", "timeout_seconds", "max_output_tokens"}
 
 
 def service_path(root):
@@ -35,13 +37,16 @@ def copy_database(source, target):
         dst.execute("PRAGMA journal_mode=DELETE")
 
 
-def write_batch(inbox, items, created_at, git_commit, caps, llm_calls, tokens):
+def write_batch(inbox, items, created_at, git_commit, caps, llm_calls, tokens, estimated_cost_usd=None):
     created_at = created_at.astimezone(timeutil.UTC)
     batch_id = "qb" + created_at.strftime("%Y%m%dT%H%M%SZ") + "-" + secrets.token_hex(3)
     data = b"".join(json_line(item) for item in items)
     manifest = dict(schema=SCHEMA, batch_id=batch_id, created_at=timeutil.iso(created_at), git_commit=git_commit,
                     counts={outcome: sum(item["outcome"] == outcome for item in items) for outcome in OUTCOMES},
-                    items_sha256=hashlib.sha256(data).hexdigest(), llm_calls=llm_calls, caps=caps, **tokens)
+                    repair_attempted=sum(item.get("repair_attempted", False) for item in items),
+                    repair_ok=sum(item.get("repair_ok", False) for item in items),
+                    items_sha256=hashlib.sha256(data).hexdigest(), llm_calls=llm_calls, caps=caps,
+                    estimated_cost_usd=estimated_cost_usd, **tokens)
     staging = inbox / (".tmp-" + batch_id)
     staging.mkdir(parents=True)
     try:
@@ -76,9 +81,9 @@ def ready_batches(inbox):
             counts, caps = manifest["counts"], manifest["caps"]
             if (not isinstance(counts, dict) or set(counts) != set(OUTCOMES)
                     or any(type(value) is not int or value < 0 for value in counts.values())
-                    or not valid_caps(caps) or sum(counts.values()) > caps["max_pages_per_run"]
+                    or not valid_caps(caps) or exceeds(sum(counts.values()), caps.get("max_pages_per_run"))
                     or not all(type(manifest[key]) is int and manifest[key] >= 0 for key in (*TOKEN_FIELDS, "llm_calls"))
-                    or manifest["llm_calls"] > caps["max_llm_calls_per_run"]
+                    or exceeds(manifest["llm_calls"], caps.get("max_llm_calls_per_run"))
                     or not re.fullmatch(r"[0-9a-f]{40}|unknown", manifest["git_commit"])):
                 continue
             data = items_file.read_bytes()
@@ -89,5 +94,10 @@ def ready_batches(inbox):
 
 
 def valid_caps(caps):
-    return (isinstance(caps, dict) and set(caps) == CAP_FIELDS
-            and all(type(value) is int and value > 0 for value in caps.values()))
+    return (isinstance(caps, dict) and TECHNICAL_LIMITS <= set(caps) <= TECHNICAL_LIMITS | COUNT_CAPS
+            and all(type(caps[k]) is int and caps[k] > 0 for k in TECHNICAL_LIMITS)
+            and all(caps.get(k) is None or (type(caps[k]) is int and caps[k] >= 0) for k in COUNT_CAPS))
+
+
+def exceeds(count, cap):
+    return cap is not None and count > cap

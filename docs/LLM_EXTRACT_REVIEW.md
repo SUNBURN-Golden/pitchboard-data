@@ -1,5 +1,7 @@
 # BUILD REVIEW: optional DeepSeek Flash shadow extraction
 
+> This review records the November 5 implementation. See the [2026-11-20 cap changes](../README.md#caps-removed-2026-11-20) for current defaults.
+
 Reviewed 2026-11-05, `feat/deepseek-extract-shadow` vs `main`: single commit
 `8bd02b6` ("Add disabled DeepSeek extraction shadow experiment and guard
 tests"), 14 files, +2,539 lines — all new except an 8-line README section. No

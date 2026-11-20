@@ -7,7 +7,7 @@ import re
 import sqlite3
 import stat
 
-from .common import Stop, digest, dumps, loads, no_symlinks, stamp
+from .common import Stop, digest, dumps, loads, no_symlinks, sqlite_snapshot, stamp
 from .policy import canonical_url
 
 EXPORT_SCHEMA = "pb-shadow-gaps-1"
@@ -50,7 +50,7 @@ def read_json(path, now, *, allow_stale=False):
         age = now - stamp(data["exported_at_utc"])
         if age < dt.timedelta(0) or (age > dt.timedelta(hours=24) and not allow_stale):
             raise Stop("stale_gap_export")
-        if not isinstance(data["rows"], list) or len(data["rows"]) > 20000:
+        if not isinstance(data["rows"], list):
             raise Stop("invalid_gap_export")
         return data
     except (ValueError, TypeError, KeyError):
@@ -58,7 +58,7 @@ def read_json(path, now, *, allow_stale=False):
 
 
 def read_db(path, now):
-    """Read a stable rollback-journal DB into memory with O_RDONLY only.
+    """Read a stable rollback-journal database snapshot with O_RDONLY only.
 
     SQLite never opens the input file: it cannot create sidecars. Active journals
     and WAL format require a consistent operator export. No immutable live reads.
@@ -80,14 +80,9 @@ def read_db(path, now):
     raw = _read_regular(path, 256_000_000, "gap_input_too_large")
     if snapshot() != before or raw[:16] != b"SQLite format 3\x00" or raw[18:20] != b"\x01\x01":
         raise Stop("db_requires_export")
-    if not hasattr(sqlite3.Connection, "deserialize"):
-        raise Stop("python_requires_311")
-    conn = sqlite3.connect(":memory:")
-    conn.row_factory = sqlite3.Row
     try:
-        conn.deserialize(raw)
-        conn.execute("PRAGMA query_only=ON")
-        rows = conn.execute('''
+        with sqlite_snapshot(raw) as conn:
+            rows = conn.execute('''
         SELECT g.gap_id,g.subject_type,g.subject_id,g.predicate,g.scope_ref,g.state,g.gap_class,g.importance,
           s.owner_outlet_id,s.source_id,s.owner_name,o.canonical_name AS outlet_name,s.permission,
           r.raw_id,r.url,r.final_url,r.kind,r.outcome,r.http_status,r.content_hash,r.text_hash,r.fetched_at,
@@ -102,20 +97,17 @@ def read_db(path, now):
         LEFT JOIN pb_raw_ref r ON r.source_id=s.source_id
         WHERE g.state='open' AND g.gap_class='not_extracted'
         ''').fetchall()
-        # Include latest observations from every source, including unrelated denied
-        # observations of the same URL, so an older success cannot win the join.
-        latest = {r["url"]: r["raw_id"] for r in conn.execute(
-            "SELECT url,raw_id FROM pb_raw_ref ORDER BY fetched_at,raw_id")}
-        result = [dict(r) for r in rows if r["url"] is None or latest[r["url"]] == r["raw_id"]]
-        return {"schema": EXPORT_SCHEMA, "exported_at_utc": now.isoformat(), "rows": result}
+            # Include denied observations of the same URL so an older success cannot win the join.
+            latest = {r["url"]: r["raw_id"] for r in conn.execute(
+                "SELECT url,raw_id FROM pb_raw_ref ORDER BY fetched_at,raw_id")}
+            result = [dict(r) for r in rows if r["url"] is None or latest[r["url"]] == r["raw_id"]]
+            return {"schema": EXPORT_SCHEMA, "exported_at_utc": now.isoformat(), "rows": result}
     except (sqlite3.Error, ValueError):
         raise Stop("invalid_gap_database") from None
-    finally:
-        conn.close()
 
 
-def plan(data, *, limit=40, history=(), config_hash=None):
-    if type(limit) is not int or not 1 <= limit <= 50:
+def plan(data, *, limit=None, history=(), config_hash=None):
+    if limit is not None and (type(limit) is not int or limit < 0):
         raise Stop("invalid_limit")
     from .schema import PROMPT_HASH, SCHEMA_HASH
     reasons, candidates = Counter(), []

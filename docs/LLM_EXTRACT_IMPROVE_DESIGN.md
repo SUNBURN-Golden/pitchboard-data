@@ -1,5 +1,7 @@
 # DeepSeek shadow improvement design
 
+> The November 10 design and operator notes below describe the original batch budget. See the [2026-11-20 cap changes](../README.md#caps-removed-2026-11-20) for current defaults.
+
 Stage: **BUILD**, 2026-11-10. The five stages are implemented in order, with
 affected pytest checks and a commit for each stage on
 `feat/deepseek-shadow-target-gaps`. Never push to `main` or force-push.

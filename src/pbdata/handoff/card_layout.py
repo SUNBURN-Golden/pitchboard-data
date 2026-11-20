@@ -1,6 +1,5 @@
 """SVG layouts for The Pitchboard's weekly share cards."""
 
-from decimal import Decimal
 from html import escape
 import re
 from typing import Optional
@@ -163,27 +162,14 @@ def portrait_text(value: str, line_limit: int, total_limit: int, baseline: int, 
     )
 
 
-def listed_amount(match):
-    amount = match["upper"] or match["first"] or match["before_code"]
-    return Decimal(amount.replace(",", ""))
-
-
-def compact_rate(value: str, limit: int, *, suffix: str = "", sort_value=None) -> str:
+def compact_rate(value: str, limit: int, *, suffix: str = "") -> str:
     if len(value) + len(suffix) <= limit:
         return value + suffix
     budget = limit - len(suffix)
     shortened = ellipsize(value, budget)
-    amounts = list(AMOUNT.finditer(value))
-    if not amounts:
+    match = AMOUNT.search(value)
+    if not match:
         return shortened + suffix
-    if sort_value is None:
-        match = amounts[0]
-    else:
-        # Select a verbatim part of the listing. For rates written in another
-        # currency, use its stated upper amount without converting it.
-        match = next((amount for amount in amounts if listed_amount(amount) == sort_value), None)
-        if match is None:
-            match = max(amounts, key=listed_amount)
     amount = match[0]
     if amount not in shortened:
         if len(amount) <= budget:
@@ -191,6 +177,16 @@ def compact_rate(value: str, limit: int, *, suffix: str = "", sort_value=None) -
         elif suffix and len(amount) <= limit:
             return amount + ("…" if len(amount) < limit and amount != value else "")
     return shortened + suffix
+
+
+def top10_rate(figure: str, x: int, y: int, size: int) -> str:
+    # VIRAL SPEC C3's 14-character cap is a sizing threshold here. Keep the
+    # whole figure in the C2 slot and reduce the font to about 80% as needed.
+    font_size = max(round(size * 0.8), min(size, size * 14 / len(figure)))
+    return (
+        f'<text x="{x}" y="{y}" text-anchor="end" font-family="{SERIF}" '
+        f'font-size="{font_size:g}" fill="{TEXT}">{escape(figure)}</text>'
+    )
 
 
 def top10_x_svg(rows, date_label: str, note: str) -> str:
@@ -212,8 +208,7 @@ def top10_x_svg(rows, date_label: str, note: str) -> str:
         y0 = header_bottom + i * row_h
         rank = f"{i + 1:02d}"
         name = escape(ellipsize(row["outlet_name"], 32))
-        rate = escape(compact_rate(row["rate_as_listed"], 14, sort_value=row["pay_usd_max"]))
-        unit = escape(ellipsize(row["unit"], 18))
+        unit = escape(row["unit"])
         # faint zebra
         if i % 2 == 0:
             parts.append(
@@ -232,10 +227,7 @@ def top10_x_svg(rows, date_label: str, note: str) -> str:
                 f'<text x="112" y="{y0 + 38}" font-family="{SANS}" font-weight="400" '
                 f'font-size="12" fill="{MUTED}">{unit}</text>'
             )
-        parts.append(
-            f'<text x="1152" y="{y0 + 30}" text-anchor="end" font-family="{SERIF}" '
-            f'font-size="22" fill="{TEXT}">{rate}</text>'
-        )
+        parts.append(top10_rate(row["rate_as_listed"], 1152, y0 + 30, 22))
         if i < len(rows) - 1:
             parts.append(
                 f'<line x1="48" y1="{y0 + row_h}" x2="1152" y2="{y0 + row_h}" '
@@ -263,8 +255,7 @@ def top10_portrait_svg(rows, date_label: str, note: str) -> str:
     for i, row in enumerate(rows):
         y0 = header_bottom + i * row_h
         rank = f"{i + 1:02d}"
-        rate = escape(compact_rate(row["rate_as_listed"], 14, sort_value=row["pay_usd_max"]))
-        unit = escape(ellipsize(row["unit"], 18))
+        unit = escape(row["unit"])
         if i % 2 == 0:
             parts.append(
                 f'<rect x="56" y="{y0}" width="968" height="{row_h}" fill="{SURFACE}" opacity="0.7"/>'
@@ -279,10 +270,7 @@ def top10_portrait_svg(rows, date_label: str, note: str) -> str:
                 f'<text x="140" y="{y0 + 76}" font-family="{SANS}" font-weight="400" '
                 f'font-size="16" fill="{MUTED}">{unit}</text>'
             )
-        parts.append(
-            f'<text x="1024" y="{y0 + 64}" text-anchor="end" font-family="{SERIF}" '
-            f'font-size="32" fill="{TEXT}">{rate}</text>'
-        )
+        parts.append(top10_rate(row["rate_as_listed"], 1024, y0 + 64, 32))
         if i < len(rows) - 1:
             parts.append(
                 f'<line x1="56" y1="{y0 + row_h}" x2="1024" y2="{y0 + row_h}" '

@@ -128,10 +128,8 @@ class ConfigTests(Harness):
     def test_checked_in_flag_is_false_and_no_side_effects(self):
         shipped = json.loads(common.CONFIG.read_text())
         self.assertIs(shipped["enabled"], False)
-        self.assertEqual(shipped["monetary_cap"], "enforced")
         self.assertEqual(shipped["egress"], "direct")
-        self.assertEqual(shipped["daily_cost_cap_usd"], "5.00")
-        self.assertEqual(shipped["daily_call_cap"], 50)
+        self.assertFalse(common.LEGACY_BUDGET_KEYS & shipped.keys())
         with patch.object(runner, "load_key", side_effect=AssertionError("credentials touched")), patch.object(policy.PolicyFetcher, "fetch", side_effect=AssertionError("network")):
             result = runner.ShadowRunner().run(shadow_root=self.root, url=URL)
         self.assertEqual(result["reason"], "disabled")
@@ -139,21 +137,13 @@ class ConfigTests(Harness):
 
     def test_missing_invalid_false_config_all_skip_without_secrets_or_network(self):
         cases = [None, {}, {"enabled": False}, {"enabled": "true"}, {**self.config, "extra": 1},
-                 {**self.config, "daily_call_cap": True}, {**self.config, "daily_call_cap": 0},
-                 {**self.config, "daily_cost_cap_usd": "0"}, {**self.config, "daily_cost_cap_usd": "NaN"},
-                 {**self.config, "daily_cost_cap_usd": "-1"}, {**self.config, "daily_cost_cap_usd": None},
-                 {**self.config, "monetary_cap": "none"}, {**self.config, "monetary_cap": "unlimited"},
-                 {**self.config, "monetary_cap": "none", "daily_cost_cap_usd": "0"},
-                 {**self.config, "monetary_cap": "none", "daily_cost_cap_usd": "none"},
-                 {k: v for k, v in self.config.items() if k != "monetary_cap"},
                  {**self.config, "egress": "open"}, {**self.config, "egress": "198.18.0.0/15"},
                  {k: v for k, v in self.config.items() if k != "egress"},
                  {**self.config, "mode": "live"},
                  {**self.config, "window_end_utc": "2026-11-14T00:00:00Z"},
                  {**self.config, "window_end_utc": "2026-11-06"},
                  {**self.config, "window_start_utc": "2026-11-06T00:00:00Z"},
-                 {**self.config, "window_end_utc": "2026-11-05T01:00:00Z"},
-                 {**self.config, "pricing": {**self.config["pricing"], "valid_until_utc": "2026-11-11T00:00:00Z"}}]
+                 {**self.config, "window_end_utc": "2026-11-05T01:00:00Z"}]
         for c in cases:
             with self.subTest(config=c):
                 if c is None:
@@ -165,100 +155,116 @@ class ConfigTests(Harness):
                 self.assertFalse(self.root.exists())
         self.assertFalse(self.calls)
 
-    def test_invalid_duplicate_config_and_stale_rates(self):
+    def test_duplicate_config_fails_closed(self):
         self.config_path.write_text('{"enabled":true,"enabled":true}')
         self.assertEqual(self.run_page()["reason"], "duplicate_json_key")
-        self.config["pricing"]["input_usd_per_million_ceiling"] = "0.01"
-        self.write_config()
-        self.assertEqual(self.run_page()["reason"], "invalid_config")
+        self.assertFalse(self.root.exists())
 
 
-class BudgetTests(Harness):
-    def test_call_cap_restart_failed_attempts_and_utc_rollover(self):
-        self.config.update(daily_call_cap=2, daily_cost_cap_usd="100")
+class UsageTests(Harness):
+    def test_continues_past_former_call_and_cost_caps_with_usage(self):
+        self.config.update(daily_call_cap=50, daily_cost_cap_usd="5.00", monetary_cap="enforced")
         self.write_config()
-        def fail(*_):
-            self.calls.append(1)
-            raise TimeoutError(KEY)
-        self.assertEqual(self.run_page(URL + "1", transport=fail)["outcome"], "provider_error")
-        self.assertEqual(self.run_page(URL + "2")["outcome"], "ok")
-        self.assertEqual(self.run_page(URL + "3")["reason"], "budget_exhausted")
+
+        def transport(*args):
+            raw = self.transport(*args)
+            raw["usage"].update(prompt_tokens=1_100_000, total_tokens=1_100_100)
+            return raw
+
+        rows = [self.run_page(URL + str(i), transport=transport) for i in range(55)]
+        self.assertEqual({r["outcome"] for r in rows}, {"ok"})
+        self.assertEqual(len(self.calls), 55)
+        self.assertTrue(all(r["calls"][0]["usage"]["total_tokens"] == 1_100_100 for r in rows))
+        self.assertEqual(rows[-1]["charged_ceiling_usd"], "0.3024576")
+        self.assertGreater(sum(Decimal(r["estimated_cost_usd"]) for r in rows), Decimal("5.00"))
+        output = next(self.root.glob("data/shadow/llm_extract_*.jsonl"))
+        self.assertEqual([json.loads(line) for line in output.read_text().splitlines()], rows)
+        with state.State(self.root).locked() as conn:
+            calls, count = conn.execute("SELECT sum(provider_calls),count(*) FROM attempts").fetchone()
+        self.assertEqual((calls, count), (55, 55))
+
+    def test_missing_expired_and_invalid_pricing_leave_cost_unknown(self):
+        for name, pricing in (
+            ("absent", None),
+            ("expired", dict(self.config["pricing"], valid_until_utc=NOW.isoformat())),
+            ("invalid", dict(self.config["pricing"], input_usd_per_million_ceiling="NaN")),
+        ):
+            with self.subTest(pricing=name):
+                self.root = self.base / name
+                if pricing is None:
+                    self.config.pop("pricing", None)
+                else:
+                    self.config["pricing"] = pricing
+                self.write_config()
+                result = self.run_page()
+                self.assertEqual(result["outcome"], "ok")
+                self.assertEqual(result["usage"]["total_tokens"], 223)
+                self.assertIsNone(result["estimated_cost_usd"])
+                self.assertIsNone(result["charged_ceiling_usd"])
+                self.assert_persisted_record(result)
+
+    def test_pricing_can_expire_between_primary_and_repair(self):
+        self.config["pricing"]["valid_until_utc"] = (NOW + dt.timedelta(minutes=1)).isoformat()
+        self.write_config()
+
+        def send(*_):
+            if self.clock == NOW:
+                self.clock += dt.timedelta(minutes=2)
+                return completion({"wrapped": proposal()})
+            return completion()
+
+        result = self.run_page(transport=send)
+        self.assertEqual(result["outcome"], "ok")
+        self.assertEqual(result["provider_calls"], 2)
+        self.assertEqual(Decimal(result["calls"][0]["estimated_cost_usd"]), Decimal("0.0001569"))
+        self.assertIsNone(result["calls"][1]["estimated_cost_usd"])
+        self.assertIsNone(result["estimated_cost_usd"])
+
+    def test_failed_dispatch_and_next_utc_day_are_logged(self):
+        failed = self.run_page(transport=Mock(side_effect=TimeoutError(KEY)))
+        self.assertEqual(failed["outcome"], "provider_error")
+        self.assertEqual(failed["calls"], [{"provider": "deepseek", "phase": "primary", "usage": None,
+                                           "estimated_cost_usd": None}])
+        self.assertIsNone(failed["estimated_cost_usd"])
         self.clock += dt.timedelta(days=1)
-        self.assertEqual(self.run_page(URL + "4")["outcome"], "ok")
-        self.assertEqual(len(self.calls), 3)
+        self.assertEqual(self.run_page(URL + "next")["outcome"], "ok")
+        self.assertEqual(len(list(self.root.glob("data/shadow/llm_extract_*.jsonl"))), 2)
         self.assertNotIn(KEY.encode(), self.artifacts())
 
-    def test_cost_cap_exact_boundary_and_conservative_default(self):
-        unit = state.reservation(self.config)
-        self.assertEqual(unit, Decimal("0.3024576"))
-        self.config["daily_cost_cap_usd"] = str(unit * 2)
-        self.write_config()
-        for i in range(2):
-            self.assertEqual(self.run_page(URL + str(i))["outcome"], "ok")
-        self.assertEqual(self.run_page(URL + "last")["reason"], "budget_exhausted")
-        self.assertEqual(len(self.calls), 2)
-
-    def test_insufficient_cost_zero_provider_calls(self):
-        self.config["daily_cost_cap_usd"] = "0.3024575"
-        self.write_config()
-        self.assertEqual(self.run_page()["reason"], "budget_exhausted")
-        self.assertFalse(self.calls)
-
-    def test_default_five_dollars_allows_sixteen_calls(self):
-        for i in range(16):
-            self.assertEqual(self.run_page(URL + str(i))["outcome"], "ok")
-        self.assertEqual(self.run_page(URL + "17")["reason"], "budget_exhausted")
-        self.assertEqual(len(self.calls), 16)
-
-    def test_monetary_cap_none_keeps_call_cap_ceiling_and_pricing(self):
-        self.config.update(monetary_cap="none", daily_cost_cap_usd=None, daily_call_cap=17, egress="sandbox")
-        self.write_config()
-        for i in range(17):
-            result = self.run_page(URL + str(i))
-            self.assertEqual(result["outcome"], "ok")
-            self.assertEqual(result["charged_ceiling_usd"], "0.3024576")
-        self.assertEqual(self.run_page(URL + "stop")["reason"], "budget_exhausted")
-        self.assertEqual(len(self.calls), 17)
-        self.config["pricing"]["valid_until_utc"] = "2026-11-11T00:00:00Z"
-        self.write_config()
-        self.root = self.base / "expired-none"
-        self.assertEqual(self.run_page(URL + "later")["reason"], "expired_pricing")
-        self.assertEqual(len(self.calls), 17)
-
-    def test_monetary_cap_none_concurrency_stops_at_call_cap(self):
-        self.config.update(monetary_cap="none", daily_cost_cap_usd=None, daily_call_cap=2)
+    def test_concurrent_dispatches_share_ledger_without_caps(self):
+        self.config.update(daily_call_cap=3, daily_cost_cap_usd="0.01", monetary_cap="enforced")
         self.write_config()
         with state.State(self.root).locked():
             pass
-        with ThreadPoolExecutor(max_workers=6) as pool:
-            results = list(pool.map(lambda i: self.run_page(URL + str(i)), range(8)))
-        self.assertEqual(sum(r["outcome"] == "ok" for r in results), 2)
-        self.assertEqual(len(self.calls), 2)
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            results = list(pool.map(lambda i: self.run_page(URL + str(i)), range(12)))
+        self.assertEqual(sum(r["outcome"] == "ok" for r in results), 12)
+        self.assertEqual(len(self.calls), 12)
+        with state.State(self.root).locked() as conn:
+            self.assertEqual(conn.execute("SELECT sum(provider_calls) FROM attempts").fetchone()[0], 12)
 
-    def test_concurrent_call_and_cost_caps(self):
-        for binding in ("call", "cost"):
-            with self.subTest(binding=binding):
-                self.root = self.base / binding
-                self.calls.clear()
-                self.config.update(daily_call_cap=3 if binding == "call" else 50,
-                                   daily_cost_cap_usd="100" if binding == "call" else str(state.reservation(self.config) * 3))
-                self.write_config()
-                # Initialize once, then independent State connections and locks compete.
-                with state.State(self.root).locked():
-                    pass
-                with ThreadPoolExecutor(max_workers=8) as pool:
-                    results = list(pool.map(lambda i: self.run_page(URL + str(i)), range(12)))
-                self.assertEqual(sum(r["outcome"] == "ok" for r in results), 3)
-                self.assertEqual(len(self.calls), 3)
-
-    def test_crashed_reservation_counts_and_is_deduplicated(self):
-        self.config["daily_call_cap"] = 1
-        self.write_config()
+    def test_crashed_dispatch_counts_and_is_deduplicated(self):
         with patch.object(state.State, "finish", side_effect=OSError(KEY)):
             self.assertEqual(self.run_page()["outcome"], "skipped")
         self.assertEqual(self.run_page()["reason"], "duplicate_page")
-        self.assertEqual(self.run_page(URL + "next")["reason"], "budget_exhausted")
-        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.run_page(URL + "next")["outcome"], "ok")
+        with state.State(self.root).locked() as conn:
+            self.assertEqual(conn.execute("SELECT provider_calls FROM attempts WHERE result IS NULL").fetchone()[0], 1)
+        self.assertEqual(len(self.calls), 2)
+
+    def test_legacy_ledger_keeps_existing_attempts_when_adding_call_counts(self):
+        ledger = state.State(self.root)
+        with ledger.locked() as conn:
+            conn.executescript("""
+                DROP TABLE attempts;
+                CREATE TABLE attempts(id TEXT PRIMARY KEY, dedup TEXT UNIQUE NOT NULL,
+                  day TEXT NOT NULL, reserved_usd TEXT NOT NULL, result TEXT);
+                INSERT INTO attempts VALUES('legacy','legacy','2026-11-05','0.3024576',NULL);
+            """)
+        self.assertEqual(self.run_page()["outcome"], "ok")
+        with ledger.locked() as conn:
+            rows = [tuple(row) for row in conn.execute("SELECT provider_calls,reserved_usd FROM attempts ORDER BY rowid")]
+        self.assertEqual(rows, [(None, "0.3024576"), (1, "0.3024576")])
 
     def test_publish_recovery_no_new_provider_call(self):
         with patch.object(state.State, "publish", side_effect=OSError(KEY)):
@@ -319,7 +325,7 @@ class BudgetTests(Harness):
         original = state.State.reserve
         def reserve(*args):
             result = original(*args)
-            self.config["daily_call_cap"] = 1
+            self.config["timeout_seconds"] = 20
             self.write_config()
             return result
         with patch.object(state.State, "reserve", side_effect=reserve, autospec=True):
@@ -854,7 +860,7 @@ class SchemaRepairTests(Harness):
         self.assertEqual(repair_request["messages"][-1]["content"].splitlines()[-1], dumps(prior))
         self.assert_persisted_record(result)
         self.assertNotIn(b"previous_value_sentinel", self.artifacts())
-        self.assertEqual(self.run_page(URL + "-next")["reason"], "budget_exhausted")
+        self.assertEqual(self.run_page(URL + "-next")["outcome"], "ok")
 
     def test_repair_requires_all_keys_and_never_retries_again(self):
         transport = Mock(side_effect=[completion({"extra": 1}), completion({"open_call": None})])
@@ -903,21 +909,18 @@ class SchemaRepairTests(Harness):
                 if outcome in {"model_mismatch", "usage_invariant"}:
                     self.assertEqual(self.run_page(URL + "-next")["reason"], "experiment_halted")
 
-    def test_call_and_cost_caps_skip_repair_without_charging(self):
-        for cap, value in (("daily_call_cap", 1), ("daily_cost_cap_usd", "0.3024576")):
-            with self.subTest(cap=cap), patch.dict(self.config, {cap: value}):
-                self.root = self.base / cap
-                self.write_config()
-                transport = Mock(return_value=completion({"extra": 1}))
-                result = self.run_page(transport=transport)
-                self.assertEqual(result["outcome"], "invalid_schema")
-                self.assertIs(result["repair_attempted"], False)
-                self.assertEqual(result["repair_outcome"], "skipped_cap")
-                self.assertEqual(result["provider_calls"], 1)
-                self.assertEqual(transport.call_count, 1)
-                self.assertEqual(result["reserved_usd"], "0.3024576")
-                self.assertEqual(result["charged_ceiling_usd"], "0.3024576")
-                self.assert_persisted_record(result)
+    def test_repair_runs_and_logs_both_calls_despite_legacy_budget(self):
+        self.config.update(daily_call_cap=1, daily_cost_cap_usd="0", monetary_cap="enforced")
+        self.write_config()
+        transport = Mock(side_effect=[completion({"extra": 1}), completion()])
+        result = self.run_page(transport=transport)
+        self.assertEqual((result["outcome"], result["repair_outcome"]), ("ok", "ok"))
+        self.assertEqual(result["provider_calls"], 2)
+        self.assertEqual(transport.call_count, 2)
+        self.assertEqual([call["phase"] for call in result["calls"]], ["primary", "repair"])
+        self.assertTrue(all(call["usage"] == completion()["usage"] for call in result["calls"]))
+        self.assertEqual(Decimal(result["estimated_cost_usd"]), Decimal("0.0003138"))
+        self.assert_persisted_record(result)
 
     def test_guards_recheck_config_and_dispatch_day_before_charging(self):
         def disable():

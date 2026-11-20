@@ -1,7 +1,9 @@
 import datetime as dt
+from functools import partial
 import json
 from pathlib import Path
 import struct
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -9,7 +11,7 @@ from urllib.parse import parse_qs, urlsplit
 from xml.etree import ElementTree
 
 from pbdata import timeutil
-from pbdata.handoff import card_layout, cards, daemon, deploy, status
+from pbdata.handoff import card_layout, cards, daemon, deploy, site, status
 
 THURSDAY = dt.date(2026, 11, 19)
 TUESDAY = dt.date(2026, 11, 17)
@@ -21,6 +23,7 @@ def render_fixture(svg_path, png_path, width, height):
 
 
 def outlet(name, sort_value, pay=None, **fields):
+    fields.setdefault("status", "open")
     return dict(name=name, pay_usd_max=sort_value, pays=pay, last_checked="2026-11-15", **fields)
 
 
@@ -48,27 +51,139 @@ class CardTest(unittest.TestCase):
         return cards.generate_card(kind, date, self.data, self.out,
                                    renderer=opts.pop("renderer", render_fixture), **opts)
 
-    def test_top10_uses_site_sort_and_verbatim_pay(self):
+    def test_top10_uses_site_sort_and_filters_ineligible_outlets(self):
         outlets = [
             outlet("Featured", 9999, "$9,999"),
             outlet("Paid slot", 9100, "$9,100", sponsored=True),
-            outlet("Unknown", None),
+            outlet("Unranked", None, "$0.40/word", pay_usd_per_word=0.40),
+            outlet("Unknown", 1000, "Honorarium"),
             outlet("Zebra", 81, "CAD $65-$112"),
-            outlet("amber", 81, "£61", status="closed"),
+            outlet("amber", 81, "£61", status="pitch-first"),
             outlet("Closed High", 200, "$200", status="closed"),
-            outlet("Reviewed", 55, "$55 per review"),
+            outlet("No guidelines", 300, "$300", status="no-public-guidelines"),
+            outlet("Active period", 80, "$80 for a long review", status="periodic-calls"),
+            outlet("Inactive period", 90, "$90", status="periodic-calls"),
         ]
         self.write("outlets.json", outlets)
         self.write("sponsors.json", {"featured": [{"outlet": "Featured"}]})
+        self.write("calls.json", {"calls": [
+            dict(call("active", deadline=TUESDAY), outlet="Active period"),
+            dict(call("past", deadline=TUESDAY - dt.timedelta(days=1)), outlet="Inactive period"),
+            dict(call("rolling", deadline=None), outlet="Inactive period"),
+            dict(call("future", opens=THURSDAY.isoformat()), outlet="Inactive period"),
+            dict(call("closed", status="closed"), outlet="Inactive period"),
+        ]})
         dest = self.generate("top10", TUESDAY)
         meta = json.loads((dest / "top10-meta.json").read_text())
         rows = meta["rows"]
-        self.assertEqual(["Closed High", "amber", "Zebra", "Reviewed"], [r["outlet_name"] for r in rows])
-        self.assertEqual(["$200", "£61", "CAD $65-$112", "$55 per review"], [r["rate_as_listed"] for r in rows])
-        self.assertEqual(["", "", "", "per review"], [r["unit"] for r in rows])
+        self.assertEqual(["amber", "Zebra", "Active period"], [r["outlet_name"] for r in rows])
+        self.assertEqual(["£61", "CAD $65–$112", "$80"], [r["rate_as_listed"] for r in rows])
+        self.assertEqual(["", "", "per review"], [r["unit"] for r in rows])
+        self.assertEqual({"Featured": "sponsored_or_featured", "Paid slot": "sponsored_or_featured",
+                          "Unranked": "no_pay_usd_max", "Unknown": "no_clean_rate", "Closed High": "closed",
+                          "No guidelines": "no-public-guidelines", "Inactive period": "no_live_call"},
+                         {r["outlet_name"]: r["reason"] for r in meta["excluded"]})
+        self.assertIn("deadline on or after the generation date", meta["eligibility_rule"])
+        self.assertEqual("explicit_override", meta["site_data_source"])
+        self.assertIsNone(meta["site_commit"])
         self.assertEqual("2026-11-15", meta["source_data_date"])
         self.assertFalse(meta["posted"])
         self.assertIn("Ranking uses the directory’s dated USD conversion.", (dest / "top10-x.svg").read_text())
+        self.assertIn("Active period — $80 per review", (dest / "top10-copy-reddit.txt").read_text())
+
+    def test_clean_rates_keep_currency_and_group_by_unit(self):
+        for text, expected in (
+            ("Minimum $0.25/word on the web, $0.40/word in print", ("$0.25–$0.40", "per word")),
+            ("$2,000 for a long review", ("$2,000", "per review")),
+            ("On web, 75c/word up to $1000", ("$1,000", "")),
+            ("$500-2000", ("$500–$2,000", "")),
+            ("£500 to £2000 per article", ("£500–£2,000", "per article")),
+            ("AUD $1,237", ("AUD $1,237", "")),
+            ("£150", ("£150", "")),
+            ("700-1200 GBP", ("700 GBP–1,200 GBP", "")),
+            ("$0.80 per word; $2,000 flat", ("$2,000", "flat")),
+            ("$250 for ~800-word reviews; $450 for ~1,500-word reviews", ("$250–$450", "per review")),
+            ("$150, $250, and $350 per review", ("$150–$350", "per review")),
+            ("$2,000 for essays; $25 for short reviews", ("$2,000", "per essay")),
+            ("AUD $10 stipend; GBP 500 allowance", ("AUD $10", "stipend")),
+            ("$20 per printed page", ("$20", "per page")),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(expected, cards.clean_rate(text))
+
+    def test_long_rate_reduces_font_size_without_truncation(self):
+        figure = "$123,456,789–$234,567,890"
+        self.write("outlets.json", [outlet("Review", 234567890, figure + " per review")])
+        dest = self.generate("top10")
+        for layout, template_size, unit_size in (("x", 22, "12"), ("portrait", 32, "16")):
+            nodes = ElementTree.parse(dest / f"top10-{layout}.svg").getroot().findall("{*}text")
+            by_text = {node.text: node for node in nodes}
+            rate_size = float(by_text[figure].attrib["font-size"])
+            self.assertLess(rate_size, template_size)
+            self.assertGreaterEqual(rate_size, template_size * 0.8)
+            self.assertEqual(unit_size, by_text["per review"].attrib["font-size"])
+        self.assertIn(f"Review — {figure} per review", (dest / "top10-copy-reddit.txt").read_text())
+
+    def test_cli_archives_descendant_origin_main_and_applies_overlay(self):
+        repo = self.root / "site"
+        repo.mkdir()
+
+        def git(*args):
+            return subprocess.check_output(["git", "-C", str(repo), *args], stderr=subprocess.PIPE, text=True).strip()
+
+        def commit(name):
+            git("add", "data")
+            git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.org", "commit", "-m", name)
+            return git("rev-parse", "HEAD")
+
+        def write_outlet(name):
+            status.atomic_json(repo / "data/outlets.json", [outlet(
+                name, 2000, "$2,000 for a long review", id="outlet", source_url="https://fixture.example/submit",
+                status="periodic-calls",
+            )])
+
+        git("init", "-b", "main")
+        write_outlet("Local Main")
+        status.atomic_json(repo / "data/calls.json", {"calls": []})
+        local = commit("local main")
+        write_outlet("Committed Origin")
+        remote = commit("origin main")
+        origin = self.root / "origin.git"
+        git("clone", "--bare", str(repo), str(origin))
+        git("checkout", "--detach")
+        git("branch", "-f", "main", local)
+        git("remote", "add", "origin", str(origin))
+        write_outlet("Dirty Worktree")
+        url = "https://fixture.example/submit"
+        overlay_path = self.root / "handoff/site_overlay.json"
+        overlay = {"calls": [dict(outlet_id="id", url=url, call_id="call", title_raw="Open call",
+                                  deadline=TUESDAY.isoformat(), last_checked=TUESDAY.isoformat())]}
+        status.atomic_json(overlay_path, overlay)
+        args = ["--card", "top10", "--date", TUESDAY.isoformat(), "--out-root", str(self.out)]
+        meta_path = self.out / TUESDAY.isoformat() / "top10-meta.json"
+        env = {"PB_DATA_ROOT": str(self.root), "GIT_ALLOW_PROTOCOL": "file"}
+        with patch.object(site, "DEFAULT_REPO", repo), patch.dict("os.environ", env), \
+                patch.object(cards, "generate_card", partial(cards.generate_card, renderer=render_fixture)):
+            self.assertEqual(0, cards.main(args))
+            meta = status.read_json(meta_path, {})
+            self.assertEqual(remote, meta["site_commit"])
+            self.assertEqual("archived_commit_with_overlay", meta["site_data_source"])
+            self.assertEqual("Committed Origin", meta["rows"][0]["outlet_name"])
+            overlay["outlets"] = [dict(outlet_id="id", url=url, checked_on=TUESDAY.isoformat())]
+            status.atomic_json(overlay_path, overlay)
+            self.assertEqual(0, cards.main(args))
+            self.assertEqual(TUESDAY.isoformat(), status.read_json(meta_path, {})["rows"][0]["last_checked"])
+
+    def test_cli_explicit_data_override_skips_the_site_repo(self):
+        self.write("outlets.json", [outlet("Explicit Data", 2000, "$2,000")])
+        args = ["--card", "top10", "--date", TUESDAY.isoformat(), "--out-root", str(self.out),
+                "--site-data", str(self.data), "--site-repo", str(self.root / "absent")]
+        with patch.object(cards, "generate_card", partial(cards.generate_card, renderer=render_fixture)):
+            self.assertEqual(0, cards.main(args))
+        meta = status.read_json(self.out / TUESDAY.isoformat() / "top10-meta.json", {})
+        self.assertEqual("explicit_override", meta["site_data_source"])
+        self.assertIsNone(meta["site_commit"])
+        self.assertEqual("Explicit Data", meta["rows"][0]["outlet_name"])
 
     def test_deadlines_uses_open_calls_and_an_inclusive_eastern_window(self):
         eastern_start = THURSDAY - dt.timedelta(days=1)
@@ -96,15 +211,14 @@ class CardTest(unittest.TestCase):
     def test_ellipsis_limits_and_portrait_wrap(self):
         name = "The Journal of Very Interesting Book Reviews and Critical Essays"
         title = "A Weekly Reading Period for Critical Essays and Very Long Book Reviews"
-        self.write("outlets.json", [outlet(name, 1000, "On web, 75c/word up to $1000",
-                                          unit="per printed review page")])
+        self.write("outlets.json", [outlet(name, 1000, "$1000 for a long review")])
         self.write("calls.json", {"calls": [dict(call("one", pay="AUD $7,000 for a fellowship"),
                                                 title=title, outlet=name)]})
         dest = self.generate("top10")
         top_x = svg_text(dest / "top10-x.svg")
         self.assertIn("The Journal of Very Interesting…", top_x)
-        self.assertIn("per printed…", top_x)
-        self.assertIn("$1000…", top_x)
+        self.assertIn("per review", top_x)
+        self.assertIn("$1,000", top_x)
         top_portrait = svg_text(dest / "top10-portrait.svg")
         self.assertIn("The Journal of Very Interesting", top_portrait)
         self.assertIn("Book…", top_portrait)
@@ -163,7 +277,7 @@ class CardTest(unittest.TestCase):
     def test_placeholder_and_empty_slots_fail_without_outputs(self):
         for marker in cards.PLACEHOLDERS:
             with self.subTest(marker=marker):
-                self.write("outlets.json", [outlet("Review", 100, f"$100 per review ({marker})")])
+                self.write("outlets.json", [outlet(f"Review {marker}", 100, "$100 per review")])
                 with self.assertRaisesRegex(cards.CardError, "forbidden marker"):
                     self.generate("top10")
                 self.assertFalse((self.out / THURSDAY.isoformat()).exists())
@@ -220,12 +334,13 @@ class CardDaemonTest(unittest.TestCase):
             generate = Mock(return_value=root / "cards")
 
             def build(*args, after_build, **kwargs):
+                args[3]["commit"] = "a" * 40
                 after_build(root / "overlaid-data")
 
             record = daemon.run(root, root, clock=lambda: now, build_site=build,
                                 alerts=lambda: None, generate_card=generate)
             generate.assert_called_once_with("deadlines", THURSDAY, root / "overlaid-data",
-                                             deadline_start=dt.date(2026, 11, 18))
+                                             deadline_start=dt.date(2026, 11, 18), site_commit="a" * 40)
             self.assertTrue(record["cards"][0]["ok"])
 
     def test_failure_in_one_card_does_not_stop_other_card_or_alerts(self):

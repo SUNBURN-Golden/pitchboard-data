@@ -1,5 +1,5 @@
 """Pitchboard profile: paid book-review/criticism outlets and open calls (literary magazines, publishers, foundations,
-cultural orgs, universities). Rules only (AI extraction is off; cost cap 0)."""
+cultural orgs, universities). Rules only."""
 from __future__ import annotations
 
 import dataclasses

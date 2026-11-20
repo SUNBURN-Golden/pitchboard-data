@@ -9,7 +9,6 @@ import urllib.parse
 import urllib.request
 from typing import Dict, List, Optional
 
-from .net import USER_AGENT
 from . import egress
 
 API_UA = os.environ.get("PITCHBOARD_API_UA", "PitchboardBot/0.1 (research collector; contact hanset@soulbound.co.kr)")
@@ -45,24 +44,30 @@ class Api:
             return None
 
     # ---- MediaWiki
-    def search(self, lang: str, text: str, limit: int = 8) -> List[str]:
-        d = self.get("https://%s.wikipedia.org/w/api.php" % lang, {"action": "query", "list": "search", "srsearch": text, "srlimit": str(limit), "format": "json", "srnamespace": "0"})
-        return [r["title"] for r in (d or {}).get("query", {}).get("search", [])]
-
-    def category_members(self, lang: str, category: str, limit: int = 60) -> List[str]:
-        out, cont = [], None
-        while len(out) < limit:
-            p = {"action": "query", "list": "categorymembers", "cmtitle": category, "cmlimit": str(min(50, limit - len(out))), "format": "json", "cmnamespace": "0"}
-            if cont:
-                p["cmcontinue"] = cont
-            d = self.get("https://%s.wikipedia.org/w/api.php" % lang, p)
+    def _wiki_titles(self, lang, module, params, prefix, cursor_key, limit):
+        out, continuation, seen = [], {}, set()
+        base = "https://%s.wikipedia.org/w/api.php" % lang
+        while limit is None or len(out) < limit:
+            size = 50 if limit is None else min(50, limit - len(out))
+            d = self.get(base, {"action": "query", "list": module, "format": "json",
+                                prefix + "limit": str(size), **params, **continuation})
             if not d:
                 break
-            out += [m["title"] for m in d.get("query", {}).get("categorymembers", [])]
-            cont = d.get("continue", {}).get("cmcontinue")
-            if not cont:
+            out.extend(m["title"] for m in d.get("query", {}).get(module, []))
+            next_page = d.get("continue") or {}
+            cursor = next_page.get(cursor_key)
+            if cursor is None or cursor in seen:
                 break
-        return out
+            seen.add(cursor)
+            continuation = {k: str(next_page[k]) for k in ("continue", cursor_key) if k in next_page}
+        return out[:limit]
+
+    def search(self, lang: str, text: str, limit: Optional[int] = None) -> List[str]:
+        return self._wiki_titles(lang, "search", {"srsearch": text, "srnamespace": "0"}, "sr", "sroffset", limit)
+
+    def category_members(self, lang: str, category: str, limit: Optional[int] = None) -> List[str]:
+        return self._wiki_titles(lang, "categorymembers", {"cmtitle": category, "cmnamespace": "0"},
+                                 "cm", "cmcontinue", limit)
 
     def qids_for_titles(self, lang: str, titles: List[str]) -> Dict[str, str]:
         out = {}
@@ -96,9 +101,21 @@ class Api:
         r = (d or {}).get("search", [])
         return r[0]["id"] if r else None
 
-    def search_entities(self, text: str, lang: str = "en", limit: int = 3) -> List[dict]:
-        d = self.get("https://www.wikidata.org/w/api.php", {"action": "wbsearchentities", "search": text, "language": lang, "uselang": lang, "type": "item", "limit": str(limit), "format": "json"})
-        return (d or {}).get("search", [])
+    def search_entities(self, text: str, lang: str = "en", limit: Optional[int] = None) -> List[dict]:
+        out, cursor, seen = [], None, set()
+        while limit is None or len(out) < limit:
+            size = 50 if limit is None else min(50, limit - len(out))
+            params = {"action": "wbsearchentities", "search": text, "language": lang, "uselang": lang,
+                      "type": "item", "limit": str(size), "format": "json"}
+            if cursor is not None:
+                params["continue"] = str(cursor)
+            d = self.get("https://www.wikidata.org/w/api.php", params) or {}
+            out.extend(d.get("search", []))
+            cursor = d.get("search-continue")
+            if cursor is None or cursor in seen:
+                break
+            seen.add(cursor)
+        return out[:limit]
 
     def sparql(self, query: str) -> List[dict]:
         d = self.get("https://query.wikidata.org/sparql", {"query": query, "format": "json"}, accept="application/sparql-results+json", timeout=90)

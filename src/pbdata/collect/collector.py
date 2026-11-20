@@ -7,7 +7,8 @@ import json
 import os
 import re
 import sqlite3
-from typing import Callable, Dict, List, Optional
+from collections import deque
+from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
 from .. import facts, timeutil
@@ -17,23 +18,28 @@ from . import discover, evaluate, executor, gaps, names, parse, promote, resolve
 from .net import Fetcher, FetchResult, normalize_url, origin_of, page_url, registered_domain
 from .wiki import Api
 
-MAX_DEPTH = 3
-MAX_PAGES_PER_SITE = int(os.environ.get("PB_MAX_PAGES_PER_SITE", "10"))
-DEFAULT_CAPS = {"discovery": {"requests": 150}, "backfill": {"requests": 200}, "freshness": {"requests": 60}}
+LANES = ("discovery", "backfill", "freshness")
 
 
 class Ctx:
     def __init__(self, svc, infra, fetcher: Fetcher, api: Api, targets: dict, run_id: str, run_tag: str, clock: Callable[[], str],
-                 caps: Optional[dict] = None):
+                 caps: Optional[dict] = None, *, api_cap: Optional[int] = None):
         self.svc, self.infra, self.fetcher, self.api = svc, infra, fetcher, api
         self.targets = {t["id"]: t for t in targets["targets"]}
         self.year = targets.get("year") or int(clock()[:4])
         self.run_id, self.run_tag, self.clock = run_id, run_tag, clock
-        self.caps = caps or DEFAULT_CAPS
+        self.request_caps = {lane: (limits or {}).get("requests") for lane, limits in (caps or {}).items()}
         self.trial_cache: Dict[str, FetchResult] = {}
-        self.budget = discover.Budget(api_calls=targets.get("budget", {}).get("api_calls", 60), max_candidates=targets.get("budget", {}).get("max_candidates", 80),
-                                      max_depth=targets.get("budget", {}).get("max_depth", 2))
-        self.sitemap_cache: Dict[str, List[str]] = {}
+        self.limits = targets.get("budget") or {}
+        if api_cap is not None:
+            self.api.cap = api_cap
+        elif self.limits.get("api_calls") is not None and getattr(self.api, "cap", None) is None:
+            self.api.cap = self.limits.get("api_calls")
+        self.budget = discover.Budget(max_candidates=self.limits.get("max_candidates"),
+                                      max_depth=self.limits.get("max_depth"))
+        site_page_cap = os.environ.get("PB_MAX_PAGES_PER_SITE")
+        self.site_page_cap = int(site_page_cap) if site_page_cap is not None else self.limits.get("max_pages_per_site")
+        self.sitemap_cache: Dict[Tuple[str, Optional[int]], List[str]] = {}
         self.stats: Dict[str, int] = {}
         self.touched = set()
 
@@ -62,19 +68,21 @@ def h_discover(ctx: Ctx, p: dict, job) -> dict:
     t, now = ctx.targets[p["target_id"]], ctx.clock()
     strat = p["strategy"]
     if strat == "wikidata_class":
-        cands = discover.wikidata_class(ctx.api, t)
+        cands = discover.wikidata_class(ctx.api, t, ctx.limits.get("wikidata_results"))
     elif strat == "wiki_category":
-        cands = discover.wiki_category(ctx.api, t)
+        cands = discover.wiki_category(ctx.api, t, ctx.limits.get("category_members"))
     elif strat == "query_combo":
-        cands = discover.query_search(ctx.api, t, ctx.year)
+        cands = discover.query_search(ctx.api, t, ctx.year, ctx.limits.get("max_queries"),
+                                      results=ctx.limits.get("search_results"))
     elif strat == "call_index":
-        cands = discover.call_index(ctx.fetcher, t, now, ctx.year)
+        cands = discover.call_index(ctx.fetcher, t, now, ctx.year, ctx.limits.get("call_index_pages"))
     elif strat == "entity_followup":
-        cands = discover.entity_followup(ctx.api, p["name"], t.get("language", "en"), p.get("parent", ""))
+        cands = discover.entity_followup(ctx.api, p["name"], t.get("language", "en"), p.get("parent", ""),
+                                          ctx.limits.get("entity_search_results"))
     else:
         raise ValueError("unknown strategy")
     ids = discover.add_candidates(ctx.svc, cands, t["id"], now, ctx.budget, depth=p.get("depth", 0))
-    # candidates are ranked by prior relevance; the first N per run are evaluated (relevance/depth/request budgets)
+    # Prior relevance sets the evaluation order.
     for cid in ids:
         prior = ctx.svc.execute("SELECT prior_relevance, host, label FROM pb_discovery_candidate WHERE cand_id=?", (cid,)).fetchone()
         dup = 1.0 if store.is_seed(prior["host"]) else 0.0
@@ -92,7 +100,7 @@ def h_evaluate(ctx: Ctx, p: dict, job) -> dict:
     if cand["state"] != "new":
         return {"skipped": cand["state"]}
     t = ctx.targets[cand["target_id"]]
-    ev = evaluate.trial_crawl(ctx.svc, ctx.fetcher, cand, t, now)
+    ev = evaluate.trial_crawl(ctx.svc, ctx.fetcher, cand, t, now, limit=ctx.limits.get("trial_pages"))
     source_id = None
     if ev.state == "registered":
         first = next(iter(ev.pages.values()))
@@ -136,7 +144,8 @@ def _site_page_count(ctx, site_source_id: str) -> int:
 def h_fetch_page(ctx: Ctx, p: dict, job) -> dict:
     now = ctx.clock()
     url, site_id, depth = normalize_url(p["url"]), p["site_source_id"], p.get("depth", 1)
-    if _site_page_count(ctx, site_id) >= MAX_PAGES_PER_SITE and p.get("via") not in ("trial", "refresh", "gap"):
+    if (ctx.site_page_cap is not None and p.get("via") not in ("trial", "refresh", "gap")
+            and _site_page_count(ctx, site_id) >= ctx.site_page_cap):
         return {"skipped": "site_page_cap"}
     site = store.site_row(ctx.svc, site_id)
     ctx.touched.add((site["site_outlet"], site["target_id"]))
@@ -164,7 +173,8 @@ def h_fetch_page(ctx: Ctx, p: dict, job) -> dict:
     gp = gaps.compute_gaps(ctx.svc, site["site_outlet"], site["target_id"], now)
     out["gaps_open"] = gp["open"]
     _enqueue_gap_jobs(ctx, site, now)
-    if r.doc is not None and r.kind == "html" and (r.change_state != "unchanged" or r.reextracted or True) and depth < MAX_DEPTH:
+    crawl_depth = ctx.limits.get("crawl_depth")
+    if r.doc is not None and r.kind == "html" and (crawl_depth is None or depth < crawl_depth):
         _follow(ctx, r, site, site_id, r.url, depth, now, p.get("hop", 0))
     return out
 
@@ -178,14 +188,16 @@ def _follow(ctx: Ctx, r, site, site_id: str, url: str, depth: int, now: str, hop
     doc = r.doc
     n = 0
     seen_urls = {url}
-    for nxt in doc.next_pages[:2]:       # list pagination stays at the same depth; bounded by hop count (<=5) and the per-site page cap
+    max_hops = ctx.limits.get("pagination_hops")
+    for nxt in doc.next_pages[:ctx.limits.get("pagination_links")]:
         nxt = page_url(nxt)
-        if nxt is not None and nxt not in seen_urls and _same_site(nxt, url) and hop < 5:
+        if nxt is not None and nxt not in seen_urls and _same_site(nxt, url) and (max_hops is None or hop < max_hops):
             scheduler.enqueue(ctx.infra, "fetch_page", "backfill", {"url": nxt, "site_source_id": site_id, "depth": depth, "via": "pagination", "hop": hop + 1},
                               "fetch|%s|%s" % (nxt, ctx.run_tag), scheduler.priority(novelty=0.6, quality=0.5, cost=0.3), now, depth=depth)
             seen_urls.add(nxt)
+    max_links = ctx.limits.get("follow_links")
     for l in sorted(doc.links, key=lambda x: -prof.link_priority(x)):
-        if n >= 8:
+        if max_links is not None and n >= max_links:
             break
         href = page_url(l.href)
         if href is None or href in seen_urls or not href.startswith("http") or prof.cycle_score(href + " " + (l.text or "")) < 0:
@@ -210,12 +222,13 @@ def _follow(ctx: Ctx, r, site, site_id: str, url: str, depth: int, now: str, hop
         elif prof.SNS_HOST.search(l.href):
             _sns_lead(ctx, l.href, site, now)
     # entity follow-ups from text (organisers / sponsors named on the page)
-    seen = set()
-    for e in r.exts:
-        if e.field == "signal.entity" and e.value["name"] not in seen and len(seen) < 2 and depth <= 1:
-            seen.add(e.value["name"])
-            scheduler.enqueue(ctx.infra, "discover", "discovery", {"target_id": site["target_id"], "strategy": "entity_followup", "name": e.value["name"], "parent": url, "depth": depth},
-                              "discover|entity|%s|%s" % (e.value["name"].lower(), ctx.run_tag), scheduler.priority(novelty=0.8, quality=0.4, cost=0.3), now, depth=depth)
+    followup_depth = ctx.limits.get("entity_followup_depth")
+    if followup_depth is not None and depth > followup_depth:
+        return
+    entities = list(dict.fromkeys(e.value["name"] for e in r.exts if e.field == "signal.entity"))
+    for name in entities[:ctx.limits.get("entity_followups")]:
+        scheduler.enqueue(ctx.infra, "discover", "discovery", {"target_id": site["target_id"], "strategy": "entity_followup", "name": name, "parent": url, "depth": depth},
+                          "discover|entity|%s|%s" % (name.lower(), ctx.run_tag), scheduler.priority(novelty=0.8, quality=0.4, cost=0.3), now, depth=depth)
 
 
 def _sns_lead(ctx: Ctx, href: str, site, now: str) -> None:
@@ -232,20 +245,27 @@ def _sns_lead(ctx: Ctx, href: str, site, now: str) -> None:
 
 
 def _enqueue_gap_jobs(ctx: Ctx, site, now: str) -> None:
-    for g in ctx.svc.execute("SELECT * FROM pb_gap WHERE state='open' AND gap_class IN ('not_extracted','absent_in_source') AND attempts<2 AND "
-                             "subject_id IN (SELECT ?  UNION SELECT call_id FROM pb_call_edition WHERE outlet_id=?)", (site["site_outlet"], site["site_outlet"])):
+    max_attempts = ctx.limits.get("gap_attempts")
+    for g in ctx.svc.execute("SELECT * FROM pb_gap WHERE state='open' AND gap_class IN ('not_extracted','absent_in_source') "
+                             "AND (? IS NULL OR attempts<?) AND "
+                             "subject_id IN (SELECT ? UNION SELECT call_id FROM pb_call_edition WHERE outlet_id=?)",
+                             (max_attempts, max_attempts, site["site_outlet"], site["site_outlet"])):
         scheduler.enqueue(ctx.infra, "gap_fill", "backfill", {"gap_id": g["gap_id"], "site_source_id": site["source_id"]},
                           "gap|%s|%d|%s" % (g["gap_id"], g["attempts"], ctx.run_tag), scheduler.priority(novelty=0.5, gap_importance=g["importance"], quality=0.6, cost=0.3), now)
 
 
-def _sitemap_urls(ctx: Ctx, origin: str, limit: int = 3000) -> List[str]:
-    if origin in ctx.sitemap_cache:
-        return ctx.sitemap_cache[origin]
+def _sitemap_urls(ctx: Ctx, origin: str, limit: Optional[int] = None) -> List[str]:
+    if limit is None:
+        limit = ctx.limits.get("sitemap_urls")
+    cache_key = (origin, limit)
+    if cache_key in ctx.sitemap_cache:
+        return ctx.sitemap_cache[cache_key].copy()
     urls: List[str] = []
     cands = ctx.fetcher.robots_sitemaps(origin) or [origin + "/sitemap.xml"]
-    queue, seen = list(cands[:2]), set()
-    while queue and len(seen) < 4 and len(urls) < limit:
-        sm = queue.pop(0)
+    queue, seen = deque(cands), set()
+    max_files = ctx.limits.get("sitemap_files")
+    while queue and (max_files is None or len(seen) < max_files) and (limit is None or len(urls) < limit):
+        sm = queue.popleft()
         if sm in seen or not _same_site(sm, origin):
             continue
         seen.add(sm)
@@ -254,9 +274,9 @@ def _sitemap_urls(ctx: Ctx, origin: str, limit: int = 3000) -> List[str]:
             continue
         pages, kids = parse.parse_sitemap(res.body)
         urls += pages
-        queue += [k for k in kids if re.search(r"post|page|news|notice|board|call|submission", k, re.I)][:3] + kids[:1]
-    ctx.sitemap_cache[origin] = urls[:limit]
-    return ctx.sitemap_cache[origin]
+        queue.extend(sorted(kids, key=lambda k: not re.search(r"post|page|news|notice|board|call|submission", k, re.I)))
+    ctx.sitemap_cache[cache_key] = urls[:limit]
+    return ctx.sitemap_cache[cache_key].copy()
 
 
 def h_expand_site(ctx: Ctx, p: dict, job) -> dict:
@@ -264,17 +284,17 @@ def h_expand_site(ctx: Ctx, p: dict, job) -> dict:
     site = store.site_row(ctx.svc, p["site_source_id"])
     origin = site["origin"]
     urls = _sitemap_urls(ctx, origin)
-    for f in p.get("feeds", []):
+    for f in p.get("feeds", [])[:ctx.limits.get("feeds")]:
         res = ctx.fetcher.fetch(f, accept="application/rss+xml,application/atom+xml,application/xml", now_iso=now)
         if res.outcome == "ok":
-            urls += [it["link"] for it in parse.parse_feed(res.body)[:40] if it["link"]]
+            urls += [it["link"] for it in parse.parse_feed(res.body)[:ctx.limits.get("feed_items")] if it["link"]]
     picked = []
     for u in dict.fromkeys(map(page_url, urls)):
         if u is None or not (prof.HIGH_VALUE_PATH.search(u) or (prof.NEWS_PATH.search(u) and prof.cycle_score(u) > 0)) or prof.cycle_score(u) < 0 \
                 or re.search(r"/tag/|/category/|/author/", u):
             continue
         picked.append(u)
-    picked = sorted(picked, key=lambda u: -prof.cycle_score(u))[:8]
+    picked = sorted(picked, key=lambda u: -prof.cycle_score(u))[:ctx.limits.get("expansion_pages")]
     for u in picked:
         scheduler.enqueue(ctx.infra, "fetch_page", "backfill", {"url": u, "site_source_id": p["site_source_id"], "depth": 2, "via": "sitemap"},
                           "fetch|%s|%s" % (u, ctx.run_tag), scheduler.priority(novelty=0.8, quality=0.6, urgency=0.4, cost=0.3), now, depth=2)
@@ -287,6 +307,9 @@ def h_gap_fill(ctx: Ctx, p: dict, job) -> dict:
     g = ctx.svc.execute("SELECT * FROM pb_gap WHERE gap_id=?", (p["gap_id"],)).fetchone()
     if g["state"] != "open":
         return {"skipped": g["state"]}
+    max_attempts = ctx.limits.get("gap_attempts")
+    if max_attempts is not None and g["attempts"] >= max_attempts:
+        return {"skipped": "gap_attempt_limit"}
     site = store.site_row(ctx.svc, p["site_source_id"])
     ctx.touched.add((site["site_outlet"], site["target_id"]))
     hints = [h.lower() for h in prof.FIELD_HINTS.get(g["predicate"], [])]
@@ -294,9 +317,7 @@ def h_gap_fill(ctx: Ctx, p: dict, job) -> dict:
     fetched = {r[0] for r in ctx.svc.execute("SELECT DISTINCT url FROM pb_raw_ref r JOIN pb_source s USING(source_id) WHERE s.owner_outlet_id=?", (site["site_outlet"],))}
     scored = sorted(((sum(1 for h in hints if h in u.lower()), u) for u in dict.fromkeys(map(page_url, urls))
                      if u is not None and u not in fetched and not re.search(r"/(19|20(0\d|1\d))/|/tag/|/category/", u)), reverse=True)
-    pick = [u for s, u in scored if s > 0][:2]
-    filled_before = g["state"]
-    before_facts = ctx.svc.execute("SELECT count(*) FROM pb_fact").fetchone()[0]
+    pick = [u for s, u in scored if s > 0][:ctx.limits.get("gap_pages")]
     for u in pick:
         r = executor.fetch_page(ctx.svc, ctx.fetcher, u, p["site_source_id"], now, run_id=ctx.run_id, depth=3, infra=ctx.infra)
         if r.outcome == "ok" and r.change_state != "unchanged":
@@ -355,8 +376,10 @@ def refresh_candidates(svc: sqlite3.Connection, now: str, horizon_hours: float =
                   if r["refresh_fresh_until"] is not None else (1, r["last"], r["url"]))
 
 
-def enqueue_refresh(ctx: Ctx, limit: int = 30, horizon_hours: Optional[float] = None) -> int:
-    if limit <= 0:
+def enqueue_refresh(ctx: Ctx, limit: Optional[int] = None, horizon_hours: Optional[float] = None) -> int:
+    if limit is None:
+        limit = ctx.limits.get("refresh_limit")
+    if limit is not None and limit <= 0:
         return 0
     if horizon_hours is None:
         horizon_hours = float(os.environ.get("PB_REFRESH_HORIZON_HOURS", "48"))
@@ -372,7 +395,7 @@ def enqueue_refresh(ctx: Ctx, limit: int = 30, horizon_hours: Optional[float] = 
         if scheduler.enqueue(ctx.infra, "fetch_page", "freshness", {"url": r["url"], "site_source_id": owner["source_id"], "depth": r["depth"], "via": "refresh"},
                              "fetch|%s|%s" % (r["url"], ctx.run_tag), scheduler.priority(novelty=0.1, urgency=urgency, quality=0.5, cost=0.2), now, depth=r["depth"]):
             n += 1
-            if n >= limit:
+            if limit is not None and n >= limit:
                 break
     return n
 
@@ -387,7 +410,8 @@ def run(ctx: Ctx, max_jobs: Optional[int] = None, log=print) -> Dict[str, int]:
     while max_jobs is None or done < max_jobs:
         now = ctx.clock()
         day = _day(now)
-        allowed = [c for c, caps in ctx.caps.items() if scheduler.budget_used(ctx.infra, day, c, "requests") < caps["requests"]]
+        allowed = [lane for lane in LANES if ctx.request_caps.get(lane) is None
+                   or scheduler.budget_used(ctx.infra, day, lane, "requests") < ctx.request_caps[lane]]
         job = scheduler.lease_next(ctx.infra, now, allowed)
         if job is None:
             break

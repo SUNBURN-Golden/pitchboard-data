@@ -1,13 +1,12 @@
 """Offline targeted-run scoring. Agreement is never used as human gold."""
 from collections import Counter, defaultdict
 import datetime as dt
-from decimal import Decimal
 import os
 from pathlib import Path
 import re
 import sqlite3
 
-from .common import Stop, digest, dumps, loads, money, no_symlinks, secure_open, stamp
+from .common import Stop, digest, dumps, loads, no_symlinks, secure_open, sqlite_snapshot, stamp, total_cost
 from .compare import boolean_metrics
 from .schema import VERSION, FIELDS, PROMPT_HASH, SCHEMA_HASH, validator
 from . import source_cache
@@ -106,44 +105,44 @@ def load_gold(path, checks):
         raise Stop("invalid_gold") from None
 
 
-def ledger_report(path, rows, config, checks):
+def ledger_report(path, rows, checks):
     if path is None or not Path(path).exists():
         return {"complete": False, "reason": "missing_ledger", "ceiling_usd": None}
     path = no_symlinks(path)
     if any(Path(str(path) + suffix).exists() for suffix in ("-wal", "-shm", "-journal")):
         raise Stop("ledger_requires_snapshot")
-    # SQLite only sees this immutable byte snapshot in memory, never the file.
+    # SQLite only sees the immutable byte snapshot.
     raw = frozen_read(path, checks)
     if raw[:16] != b"SQLite format 3\x00" or raw[18:20] != b"\x01\x01":
         raise Stop("invalid_ledger")
-    if not hasattr(sqlite3.Connection, "deserialize"):
-        raise Stop("python_requires_311")
-    c = sqlite3.connect(":memory:")
-    c.row_factory = sqlite3.Row
     try:
-        c.deserialize(raw)
-        c.execute("PRAGMA query_only=ON")
-        if c.execute("PRAGMA quick_check").fetchone()[0] != "ok":
-            raise Stop("invalid_ledger")
-        attempts = list(c.execute("SELECT id,day,reserved_usd,result FROM attempts"))
-        meta = dict(c.execute("SELECT key,value FROM meta"))
+        with sqlite_snapshot(raw) as c:
+            if c.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise Stop("invalid_ledger")
+            has_calls = any(row["name"] == "provider_calls" for row in c.execute("PRAGMA table_info(attempts)"))
+            attempts = list(c.execute("SELECT id,day,reserved_usd,result,%s FROM attempts" %
+                                      ("provider_calls" if has_calls else "NULL AS provider_calls")))
+            meta = dict(c.execute("SELECT key,value FROM meta"))
     except sqlite3.Error:
         raise Stop("invalid_ledger") from None
-    finally:
-        c.close()
     days, discrepancies, snapshots = {}, [], {}
     input_ids = {r["attempt_id"] for r in rows}
     attempt_ids = {r["id"] for r in attempts}
     by_id = {r["attempt_id"]: r for r in rows}
     groups = defaultdict(list)
+    ceilings = []
     for a in attempts:
-        groups[a["day"]].append(a)
+        ceiling = None if a["reserved_usd"] == "unknown" else a["reserved_usd"]
+        ceilings.append(ceiling)
+        r = None
         if a["result"] is not None:
             r = loads(a["result"])
             if r.get("experiment_id") != meta.get("experiment_id") or r.get("attempt_id") != a["id"] or r.get("budget_day") != a["day"]:
                 discrepancies.append({"attempt_id": a["id"], "reason": "ledger_identity_mismatch"})
-            if r.get("charged_ceiling_usd") != a["reserved_usd"]:
+            if r.get("charged_ceiling_usd") != ceiling:
                 discrepancies.append({"attempt_id": a["id"], "reason": "ledger_charge_mismatch"})
+            if a["provider_calls"] is not None and r.get("provider_calls") != a["provider_calls"]:
+                discrepancies.append({"attempt_id": a["id"], "reason": "ledger_call_count_mismatch"})
             if a["id"] in by_id and r != by_id[a["id"]]:
                 discrepancies.append({"attempt_id": a["id"], "reason": "ledger_result_mismatch"})
             snapshot = r.get("config_snapshot")
@@ -151,21 +150,22 @@ def ledger_report(path, rows, config, checks):
                 if digest(dumps(snapshot)) != r.get("config_sha256"):
                     raise Stop("config_snapshot_mismatch")
                 snapshots[r["config_sha256"]] = snapshot
-    for day, attempts_day in sorted(groups.items()):
-        total = sum((money(a["reserved_usd"]) for a in attempts_day), Decimal(0))
-        completed = [loads(a["result"]) for a in attempts_day if a["result"] is not None]
+        calls = a["provider_calls"]
+        if calls is None and r is not None:
+            calls = r.get("provider_calls", 1)
+        groups[a["day"]].append((r, calls, ceiling))
+    for day, entries in sorted(groups.items()):
+        completed = [row for row, _, _ in entries if row is not None]
         daily_configs = {r.get("config_sha256") for r in completed}
-        cap_config = snapshots.get(next(iter(daily_configs))) if len(daily_configs) == 1 else None
-        cap_config = cap_config or config
-        days[day] = {"attempts": len(attempts_day), "unfinished": sum(a["result"] is None for a in attempts_day),
+        unfinished = len(entries) - len(completed)
+        call_counts = [calls for _, calls, _ in entries]
+        days[day] = {"attempts": len(entries), "unfinished": unfinished,
                      "successful": sum(r["outcome"] == "ok" for r in completed),
                      "failed": sum(r["outcome"] != "ok" for r in completed),
-                     "unknown_usage": sum(not r.get("usage") for r in completed) + sum(a["result"] is None for a in attempts_day),
-                     "reserved_ceiling_usd": str(total), "configured_call_cap": cap_config["daily_call_cap"],
-                     "remaining_calls": max(0, cap_config["daily_call_cap"] - len(attempts_day)),
-                     "monetary_cap": cap_config["monetary_cap"], "configured_cost_cap_usd": cap_config["daily_cost_cap_usd"],
-                     "remaining_ceiling_usd": str(max(Decimal(0), money(cap_config["daily_cost_cap_usd"]) - total)) if cap_config["monetary_cap"] == "enforced" else None,
-                     "cap_basis": "recorded_config" if len(daily_configs) == 1 and next(iter(daily_configs)) in snapshots else "operator_config_only",
+                     "unknown_usage": sum(not r.get("usage") for r in completed) + unfinished,
+                     "provider_calls": None if None in call_counts else sum(call_counts),
+                     "reserved_ceiling_usd": total_cost(ceiling for _, _, ceiling in entries),
+                     "estimated_cost_usd": total_cost(r.get("estimated_cost_usd") if r else None for r, _, _ in entries),
                      "config_hashes": sorted(h for h in daily_configs if h),
                      "outcomes": dict(Counter(r["outcome"] for r in completed))}
     for missing in sorted(attempt_ids - input_ids):
@@ -173,9 +173,9 @@ def ledger_report(path, rows, config, checks):
     for extra in sorted(input_ids - attempt_ids):
         discrepancies.append({"attempt_id": extra, "reason": "output_missing_ledger_attempt"})
     return {"complete": not discrepancies, "experiment_id": meta.get("experiment_id"), "halt_reason": meta.get("halted"),
-            "days": days, "ceiling_usd": str(sum((money(a["reserved_usd"]) for a in attempts), Decimal(0))),
+            "days": days, "ceiling_usd": total_cost(ceilings),
             "pricing_config_snapshots": snapshots, "discrepancies": discrepancies,
-            "meaning": "Permanent reservation ceilings, not invoices or actual spend; failed/unfinished attempts are charged."}
+            "meaning": "Logged cost estimates and optional dispatch ceilings; null means unavailable."}
 
 
 def signature(field, value):
@@ -248,20 +248,12 @@ def plans_report(root, rows, checks):
 
 
 def score_shadow(paths, root, now, config, *, gold_path=None, ledger_path=None, max_page_utf8_bytes=24000):
-    try:
-        if (type(config.get("daily_call_cap")) is not int or not 1 <= config["daily_call_cap"] <= 10000
-                or config.get("monetary_cap") not in ("enforced", "none")):
-            raise ValueError()
-        if config["monetary_cap"] == "enforced":
-            money(config["daily_cost_cap_usd"])
-        elif config["daily_cost_cap_usd"] is not None:
-            raise ValueError()
-    except (KeyError, TypeError, ValueError):
-        raise Stop("invalid_config") from None
+    if not isinstance(config, dict):
+        raise Stop("invalid_config")
     checks = {}
     rows = load_rows(paths, checks)
     gold = load_gold(gold_path, checks)
-    ledger = ledger_report(ledger_path, rows, config, checks)
+    ledger = ledger_report(ledger_path, rows, checks)
     plans = plans_report(root, rows, checks)
     exclusions, verified, repeats, seen = [], [], [], {}
     for row in rows:
@@ -397,7 +389,7 @@ def score_shadow(paths, root, now, config, *, gold_path=None, ledger_path=None, 
                       "Gap-targeted cohorts are biased toward weak fields; do not infer population accuracy.",
                       "Human labels must cover negatives and agreements as well as conflicts; small samples remain low-power.",
                       "No refetch, credentials, provider dispatch or service DB is used by this report.",
-                      "Ledger reservation ceilings include failures and unfinished attempts; these are not invoices."]}
+                      "Ledger dispatch ceilings may include failed and unfinished attempts."]}
 
 
 def markdown(report):
@@ -418,5 +410,5 @@ def markdown(report):
     lines += ["", f"Ledger ceiling: USD {display(report['ledger']['ceiling_usd'])}; reconciliation complete: {report['ledger']['complete']}.", "",
               "Permanent reservation ceilings include failed and unfinished attempts. They are not invoices or actual spend.", "",
               "Agreement is not accuracy. Missing gold leaves accuracy unknown. Targeted cohorts do not establish population accuracy.", "",
-              "See JSON for frozen membership/checksums, exclusions, field gold precision/recall, caps, pricing snapshots and discrepancies."]
+              "See JSON for frozen membership/checksums, exclusions, field gold precision/recall, pricing snapshots and discrepancies."]
     return "\n".join(lines) + "\n"

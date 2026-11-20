@@ -2,11 +2,6 @@
  "profile": "pitchboard",
  "year": null,
  "note": "Target lists scope every metric. Hub categories are directory/org lists, not source seeds. call_indexes: official organiser call/news boards (kind=official, crawled as sources) and open-call directories (kind=directory, used only to discover organiser sites; no facts taken). All checked for robots allowance 2026-10-28. 2026-10-28: added KR sfac/munjang (official) and contestkorea literature list (directory; robots allow-all; detail pages followed only to find organiser sites, no facts taken). thinkcontest/wevity not used (robots/403).",
- "budget": {
-  "api_calls": 90,
-  "max_candidates": 60,
-  "max_depth": 2
- },
  "targets": [
   {
    "id": "kr-ko-lit",
@@ -81,8 +76,7 @@
      "url": "https://www.contestkorea.com/sub/list.php?int_gbn=1&Txt_bcode=030110001",
      "label": "콘테스트코리아 문학·문예 공모 목록",
      "kind": "directory",
-     "detail_re": "/sub/view\\.php",
-     "max_details": 15
+     "detail_re": "/sub/view\\.php"
     }
    ]
   },

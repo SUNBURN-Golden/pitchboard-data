@@ -241,7 +241,7 @@ class CompareTests(Harness):
         spec = importlib.util.spec_from_file_location("compare_entry_terminal", script)
         entry = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(entry)
-        for reason in ("experiment_halted", "disabled", "expired_pricing", "budget_exhausted",
+        for reason in ("experiment_halted", "disabled", "inactive_window",
                        "unrecognized_shadow_root", "config_changed", "clock_backwards"):
             with self.subTest(reason=reason):
                 self.assertTrue(entry.terminal({"outcome": "skipped", "reason": reason}))
@@ -278,7 +278,7 @@ class CompareTests(Harness):
         self.assertEqual(json.loads(result.stdout)["reason"], "disabled")
         self.assertFalse(self.root.exists())
 
-    def test_independent_processes_share_budget(self):
+    def test_independent_processes_share_usage_ledger(self):
         self.config["daily_call_cap"] = 3
         self.write_config()
         with state.State(self.root).locked():
@@ -290,14 +290,19 @@ from pbdata.collect.shadow.state import State
 s = State(sys.argv[1])
 try:
     with s.locked() as conn:
-        s.reserve(conn, load_config(sys.argv[2], stamp('2026-11-05T12:00:00Z')), sys.argv[3], stamp('2026-11-05T12:00:00Z'))
+        now = stamp('2026-11-05T12:00:00Z')
+        config = load_config(sys.argv[2], now)
+        attempt, _ = s.reserve(conn, sys.argv[3], now)
+        s.record_call(conn, config, now, attempt, 'deepseek')
     print('reserved')
 except Stop:
     print('stopped')
 '''
         processes = [subprocess.Popen([sys.executable, "-B", "-c", program, str(self.root), str(self.config_path), str(i)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for i in range(10)]
         results = [p.communicate(timeout=20) for p in processes]
-        self.assertEqual(sum(out.strip() == "reserved" for out, err in results), 3)
+        self.assertEqual(sum(out.strip() == "reserved" for out, err in results), 10)
+        with state.State(self.root).locked() as conn:
+            self.assertEqual(conn.execute("SELECT sum(provider_calls) FROM attempts").fetchone()[0], 10)
         self.assertTrue(all(not err for _, err in results))
 
 

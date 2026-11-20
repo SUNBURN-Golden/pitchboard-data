@@ -1,5 +1,7 @@
 # Proof runs (2026-10-27 KST)
 
+> The run measurements below reflect the collector settings at the time of each proof. See the [2026-11-20 cap changes](../README.md#caps-removed-2026-11-20) for current defaults.
+
 Scope: target lists `kr-ko-lit`, `us-en-lit`, `gb-en-lit`, `ca-au-en-lit` (`config/targets/pitchboard.json`). Rules only, AI cost 0.
 Real run root: `/workspace/pitchboard/data-root` (outside the repo). Raw outputs: `docs/proof_real_run_metrics.json` (counts only), `docs/proof_fixture_output.json`.
 

@@ -21,10 +21,11 @@ def main(argv=None) -> int:
     ap.add_argument("--targets", default=os.path.join(os.path.dirname(__file__), "..", "..", "..", "config", "targets", "pitchboard.json"))
     ap.add_argument("--run-tag", default=time.strftime("%Y%m%dT%H%M%S"))
     ap.add_argument("--run-id", default=None, help="reuse to resume a run")
-    ap.add_argument("--max-jobs", type=int, default=None)
+    ap.add_argument("--max-jobs", type=int, help="maximum jobs to run (default: unlimited)")
     ap.add_argument("--no-seed", action="store_true", help="resume: do not enqueue discovery jobs")
-    ap.add_argument("--caps", default=None, help='JSON budget caps, e.g. {"discovery":{"requests":150}}')
-    ap.add_argument("--api-cap", type=int, default=90)
+    ap.add_argument("--caps", help='optional JSON request caps per lane, e.g. {"discovery":{"requests":150}}')
+    ap.add_argument("--api-cap", type=int, help="maximum Wikimedia API calls (default: unlimited)")
+    ap.add_argument("--refresh-limit", type=int, help="maximum refresh jobs to enqueue (default: unlimited)")
     a = ap.parse_args(argv)
     os.environ["PB_DATA_ROOT"] = a.root
     for d in ("service_db", "infra_db", "locks"):
@@ -40,12 +41,13 @@ def main(argv=None) -> int:
         return 0
     clock = lambda: timeutil.iso(timeutil.utcnow())
     run_id = a.run_id or "run_" + a.run_tag
-    ctx = collector.Ctx(svc, infra, Fetcher(infra), Api(cap=a.api_cap), targets, run_id, a.run_tag, clock, json.loads(a.caps) if a.caps else None)
+    ctx = collector.Ctx(svc, infra, Fetcher(infra), Api(), targets, run_id, a.run_tag, clock,
+                        json.loads(a.caps) if a.caps else None, api_cap=a.api_cap)
     with RunLock(os.path.join(a.root, "locks", "collector.lock")):
         if a.cmd == "run" and not a.no_seed:
             print("seeded discover jobs:", collector.seed_discovery(ctx))
         if a.cmd == "refresh":
-            print("refresh jobs:", collector.enqueue_refresh(ctx))
+            print("refresh jobs:", collector.enqueue_refresh(ctx, a.refresh_limit))
         stats = collector.run(ctx, a.max_jobs)
     print(json.dumps({"run_id": run_id, "stats": stats, "requests": ctx.fetcher.requests, "api_calls": ctx.api.calls}, indent=1))
     return 0

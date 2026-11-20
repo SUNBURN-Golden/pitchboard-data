@@ -1,5 +1,7 @@
 # DeepSeek shadow improvement — BUILD REVIEW
 
+> This review records the November 10 implementation. See the [2026-11-20 cap changes](../README.md#caps-removed-2026-11-20) for current defaults.
+
 Review date: 2026-11-10
 
 ## Scope and method

@@ -1,5 +1,5 @@
 """Stage runner: lock, kill switch, per-stage checkpoints (infra.stage_run), bounded retries, failure queue,
-cost ledger with a hard model-cost cap of 0, and resume from the failed stage (same run_id)."""
+usage ledger, and resume from the failed stage (same run_id)."""
 from __future__ import annotations
 
 import fcntl
@@ -7,7 +7,7 @@ import json
 import os
 import time
 import traceback
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Tuple
 
 from ..ids import sha256_hex
 
@@ -15,15 +15,7 @@ MAX_ATTEMPTS = 3
 BACKOFF_S = (0, 2, 8)
 
 
-class Deferred(Exception):
-    """A cap was reached: the stage ends as 'deferred' (not a failure); the next run continues."""
-
-
 class NonRetryable(Exception):
-    pass
-
-
-class CostCapExceeded(NonRetryable):
     pass
 
 
@@ -46,30 +38,18 @@ class DaemonLock:
 
 
 class Ledger:
-    """Daily cost ledger (infra.cost_ledger). model_* resources have cap 0: any charge raises before work is done."""
-    def __init__(self, infra, day: str, caps: Dict[str, float]):
-        self.infra, self.day, self.caps = infra, day, dict(caps)
-        self.caps.setdefault("model_calls", 0)
-        self.caps.setdefault("model_usd", 0)
+    """Daily usage accounting (infra.cost_ledger)."""
+    def __init__(self, infra, day: str):
+        self.infra, self.day = infra, day
 
     def used(self, resource: str) -> float:
         r = self.infra.execute("SELECT amount FROM cost_ledger WHERE day=? AND resource=?", (self.day, resource)).fetchone()
         return r[0] if r else 0.0
 
     def charge(self, resource: str, amount: float) -> None:
-        cap = self.caps.get(resource)
-        if cap is not None and self.used(resource) + amount > cap:
-            if resource.startswith("model_"):
-                raise CostCapExceeded("%s cap %s" % (resource, cap))
-            raise Deferred("%s cap %s reached" % (resource, cap))
         self.infra.execute("INSERT INTO cost_ledger(day,resource,amount) VALUES(?,?,?) ON CONFLICT(day,resource) DO UPDATE SET amount=amount+excluded.amount",
                            (self.day, resource, amount))
         self.infra.commit()
-
-    def remaining(self, resource: str) -> float:
-        cap = self.caps.get(resource)
-        return float("inf") if cap is None else max(0.0, cap - self.used(resource))
-
 
 StageFn = Callable[["RunContext"], dict]
 
@@ -136,13 +116,6 @@ class StageRunner:
                                     (json.dumps(out, sort_keys=True, ensure_ascii=False, default=str), c.clock(), key))
                     c.infra.commit()
                     outcome = {"status": "done", "attempts": attempts, **{k: v for k, v in out.items() if not isinstance(v, (list, dict))}}
-                    break
-                except Deferred as e:
-                    c.infra.execute("UPDATE stage_run SET status='done', output_digest=?, finished_at=?, error_code='deferred' WHERE run_key=?",
-                                    (json.dumps({"deferred": str(e)}), c.clock(), key))
-                    c.infra.commit()
-                    c.state[stage] = {"deferred": str(e)}
-                    outcome = {"status": "deferred", "reason": str(e)}
                     break
                 except NonRetryable as e:
                     c.svc.rollback() if c.svc.in_transaction else None

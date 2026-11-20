@@ -11,7 +11,8 @@ import urllib.request
 
 from urllib.parse import urlsplit
 
-from .common import CONFIG, Stop, digest, dumps, load_config, load_key, load_qwen_key, loads, utcnow
+from .common import (CONFIG, Stop, call_usage, digest, dumps, load_config, load_key,
+                     load_qwen_key, loads, pricing_at, total_cost, utcnow)
 from .policy import PolicyFetcher, canonical_url
 from .schema import VERSION, PROMPT_HASH, SCHEMA_HASH, SchemaRepairCandidate, repair_body, request_body, response
 from .state import State
@@ -30,8 +31,7 @@ RECORD_STOPS = frozenset({
     "provider_http_error", "provider_too_large", "provider_error", "duplicate_json_key",
     "invalid_json_number", "model_mismatch", "invalid_usage", "usage_invariant",
     "invalid_completion", "invalid_model_json", "invalid_schema", "credential_in_response",
-    "dispatch_clock_changed", "inactive_window", "disabled", "invalid_config", "config_changed",
-    "budget_exhausted", "expired_pricing"})
+    "dispatch_clock_changed", "inactive_window", "disabled", "invalid_config", "config_changed"})
 
 
 def baseline(doc, as_of):
@@ -124,7 +124,8 @@ class ShadowRunner:
             if page is None:
                 state = State(shadow_root, extra_protected)
                 with state.locked() as conn:
-                    state.preflight(conn, load_config(self.config_path, self.clock()), self.clock())
+                    load_config(self.config_path, self.clock())
+                    state.preflight(conn, self.clock())
                 known_hash = target.get("content_hash") if target else None
                 if target:
                     # Reapply export eligibility on reuse; a caller cannot turn a
@@ -169,7 +170,7 @@ class ShadowRunner:
                 if batch_day is not None and now.date().isoformat() != batch_day:
                     raise Stop("dispatch_clock_changed")
                 cache_id = source_cache.save(state, page, doc, now, key)
-                attempt, day, cost = state.reserve(conn, config, dedup, now)
+                attempt, day = state.reserve(conn, dedup, now)
                 experiment_id = conn.execute("SELECT value FROM meta WHERE key='experiment_id'").fetchone()[0]
                 record = {"schema": VERSION, "experiment_id": experiment_id, "attempt_id": attempt,
                           "timestamp_utc": now.isoformat(), "budget_day": day,
@@ -186,9 +187,9 @@ class ShadowRunner:
                           "as_of_source": "frozen cohort KST calendar date" if page.provenance == "offline_cached" else "UTC calendar date",
                           "baseline": rules, "gap_target": target,
                           "requested_model": config["model"], "returned_model": None,
-                          "provider": "deepseek", "provider_calls": 1, "fallback_from": None,
+                          "provider": "deepseek", "provider_calls": 0, "calls": [], "fallback_from": None,
                           "repair_attempted": False, "repair_outcome": None,
-                          "reserved_usd": cost, "charged_ceiling_usd": cost, "usage": None,
+                          "reserved_usd": "0", "charged_ceiling_usd": "0", "usage": None,
                           "fields": None, "validation_reasons": {}, "schema_shape": {}, "outcome": "unknown"}
                 start = time.monotonic()
                 primary = transport or provider
@@ -196,11 +197,27 @@ class ShadowRunner:
                 fb_transport = fallback_transport or (qwen_provider if transport is None else None)
                 secrets = [key]
                 repair = None
-                try:
-                    self._dispatch_time(config, day, now)
-                    raw = primary(body, key, config["timeout_seconds"])
-                    if key in dumps(raw):
+
+                def invoke(send, request, credential, provider_name, dispatch, *, phase):
+                    cost = state.record_call(conn, config, dispatch, attempt, provider_name)
+                    record.update(reserved_usd=cost, charged_ceiling_usd=cost,
+                                  provider_calls=record["provider_calls"] + 1)
+                    if phase == "fallback":
+                        record.update(provider=provider_name, fallback_from=record["outcome"])
+                    elif phase == "repair":
+                        record.update(repair_attempted=True, repair_outcome="provider_error")
+                    telemetry = dict(call_usage(provider_name, None, None), phase=phase)
+                    record["calls"].append(telemetry)
+                    raw = send(request, credential, config["timeout_seconds"])
+                    rates = config.get("qwen_pricing" if provider_name == "qwen" else "pricing")
+                    telemetry.update(call_usage(provider_name, raw, pricing_at(rates, dispatch)))
+                    if any(secret in dumps(raw) for secret in secrets):
                         raise Stop("credential_in_response")
+                    return raw
+
+                try:
+                    dispatch = self._dispatch_time(config, day, now)
+                    raw = invoke(primary, body, key, "deepseek", dispatch, phase="primary")
                     fields, reasons, usage = response(raw, doc, as_of, config,
                                                      schema_shape=record["schema_shape"])
                     record.update(fields=fields, validation_reasons=reasons, usage=usage,
@@ -223,27 +240,14 @@ class ShadowRunner:
                         secrets.append(fb_key)
                         try:
                             dispatch = self._dispatch_time(config, day, now)
-                            new_cost = state.reserve_extra_call(conn, config, dispatch, attempt)
-                            record["reserved_usd"] = new_cost
-                            record["charged_ceiling_usd"] = new_cost
-                            record["provider_calls"] = 2
-                            record["fallback_from"] = record["outcome"]
-                            record["provider"] = "qwen"
-                            raw = fb_transport(qwen_body, fb_key, config["timeout_seconds"])
-                            if any(s in dumps(raw) for s in secrets):
-                                raise Stop("credential_in_response")
+                            raw = invoke(fb_transport, qwen_body, fb_key, "qwen", dispatch, phase="fallback")
                             fields, reasons, usage = response(raw, doc, as_of, config, provider="qwen",
                                                              schema_shape=record["schema_shape"])
                             record.update(fields=fields, validation_reasons=reasons, usage=usage,
                                           returned_model=raw["model"], outcome="ok")
                         except Stop as exc:
-                            if record["provider_calls"] == 1:
-                                # Fallback was not charged; keep the primary failure.
-                                record["provider"] = "deepseek"
-                                record["fallback_from"] = None
-                            else:
+                            if record["fallback_from"] is not None:
                                 record["outcome"] = _stop_code(exc)
-                                record["provider"] = "qwen"
                                 if isinstance(exc, SchemaRepairCandidate):
                                     repair = (exc.prior, fb_transport, fb_key, qwen_body)
                         except Exception:
@@ -270,35 +274,27 @@ class ShadowRunner:
                         pass
                     else:
                         try:
-                            new_cost = state.reserve_extra_call(conn, config, dispatch, attempt)
+                            raw = invoke(repair_transport, correction, repair_key, record["provider"],
+                                         dispatch, phase="repair")
                         except Stop as exc:
-                            # Only the cap maps to skipped_cap; other guard stops
-                            # (halt/clock/config/state) keep invalid_schema with
-                            # repair_attempted=false, like the fallback's uncharged guard.
-                            if str(exc) == "budget_exhausted":
-                                record["repair_outcome"] = "skipped_cap"
+                            if record["repair_attempted"]:
+                                record["outcome"] = _stop_code(exc)
+                        except Exception:
+                            if record["repair_attempted"]:
+                                record["outcome"] = "provider_error"
                         else:
-                            record.update(reserved_usd=new_cost, charged_ceiling_usd=new_cost,
-                                          provider_calls=record["provider_calls"] + 1,
-                                          repair_attempted=True, repair_outcome="provider_error")
-                if record["repair_attempted"]:
-                    try:
-                        raw = repair_transport(correction, repair_key, config["timeout_seconds"])
-                        if any(s in dumps(raw) for s in secrets):
-                            raise Stop("credential_in_response")
-                        try:
-                            fields, reasons, usage = response(raw, doc, as_of, config,
-                                                              provider=record["provider"], strict_repair=True)
-                        except Stop as exc:
-                            if str(exc) in REPAIR_SCHEMA_CODES:
-                                record["repair_outcome"] = "invalid_schema"
-                            raise
-                        record.update(fields=fields, validation_reasons=reasons, usage=usage,
-                                      returned_model=raw["model"], outcome="ok", repair_outcome="ok")
-                    except Stop as exc:
-                        record["outcome"] = _stop_code(exc)
-                    except Exception:
-                        record["outcome"] = "provider_error"
+                            try:
+                                fields, reasons, usage = response(raw, doc, as_of, config,
+                                                                  provider=record["provider"], strict_repair=True)
+                                record.update(fields=fields, validation_reasons=reasons, usage=usage,
+                                              returned_model=raw["model"], outcome="ok", repair_outcome="ok")
+                            except Stop as exc:
+                                record["outcome"] = _stop_code(exc)
+                                if str(exc) in REPAIR_SCHEMA_CODES:
+                                    record["repair_outcome"] = "invalid_schema"
+                            except Exception:
+                                record["outcome"] = "provider_error"
+                record["estimated_cost_usd"] = total_cost(call["estimated_cost_usd"] for call in record["calls"])
                 from .review import reviews
                 record["reviews"] = reviews(record)
                 from .digest import drafts
