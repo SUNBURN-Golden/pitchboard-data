@@ -178,7 +178,7 @@ def site_commit(repo, *, fetch=True):
     return local.stdout.strip()
 
 
-def build_site(root, repo, today, result, *, no_deploy=False, fetch=True, deploy_site=deploy.deploy):
+def build_site(root, repo, today, result, *, no_deploy=False, fetch=True, deploy_site=deploy.deploy, after_build=None):
     commit = site_commit(repo, fetch=fetch)
     result["commit"] = commit
     with tempfile.TemporaryDirectory(prefix="pb-handoff-site-") as tmp:
@@ -203,5 +203,9 @@ def build_site(root, repo, today, result, *, no_deploy=False, fetch=True, deploy
         result["pages"] = sum(path.is_file() for path in dist.rglob("*.html"))
         if not (dist / "index.html").is_file() or result["pages"] < 80:
             raise BuildError("site_verification_failed")
-        if not no_deploy:
-            result.update(deploy_site(dist))
+        try:
+            if not no_deploy:
+                result.update(deploy_site(dist))
+        finally:
+            if after_build is not None:
+                after_build(work / "data")

@@ -350,7 +350,9 @@ class SiteTest(unittest.TestCase):
             git("init", "-b", "main")
             (repo / "data").mkdir()
             (repo / "data/outlets.json").write_text("[]")
-            (repo / "data/calls.json").write_text('{"calls": []}')
+            (repo / "data/calls.json").write_text(
+                '{"calls": [{"outlet": "Fixture Review", "deadline": "2026-11-19"}]}'
+            )
             build = repo / "build.py"
             build.write_text("from pathlib import Path\np = Path('dist')\np.mkdir()\n"
                              "(p / 'index.html').touch()\nfor i in range(79): (p / f'{i}.html').touch()\n")
@@ -360,7 +362,7 @@ class SiteTest(unittest.TestCase):
             build.write_text("raise RuntimeError('dirty worktree')")
             result = {}
             deploy_fake = Mock()
-            site.build_site(root, repo, NOW.date(), result, no_deploy=True, fetch=False, deploy_site=deploy_fake)
+            site.build_site(root, repo, dt.date(2026, 11, 19), result, no_deploy=True, fetch=False, deploy_site=deploy_fake)
             self.assertEqual({"commit": commit, "pages": 80, "overlay_changes": 0}, result)
             deploy_fake.assert_not_called()
             plan = io.StringIO()
@@ -368,6 +370,18 @@ class SiteTest(unittest.TestCase):
                 self.assertEqual(0, daemon.main(["--root", str(root), "--site-repo", str(repo), "--dry-run"]))
             self.assertEqual(commit, json.loads(plan.getvalue())["site_commit"])
             self.assertFalse((root / "handoff").exists())
+
+            deploy_fake.side_effect = deploy.DeployError("fixture failure")
+            card_inputs = []
+
+            def inspect_site_data(data_dir):
+                card_inputs.append(status.read_json(data_dir / "calls.json", None))
+
+            with self.assertRaisesRegex(deploy.DeployError, "fixture failure"):
+                site.build_site(root, repo, NOW.date(), {}, fetch=False, deploy_site=deploy_fake,
+                                after_build=inspect_site_data)
+            deploy_fake.assert_called_once()
+            self.assertEqual([{"calls": [], "updated": "2026-11-20"}], card_inputs)
 
 
 class ApiTest(unittest.TestCase):

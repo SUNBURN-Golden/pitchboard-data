@@ -69,6 +69,43 @@ committed site revision using local state. With `--no-deploy`, the daemon
 still runs the DB phase, builds and verifies the site, and dispatches alerts
 when configured.
 
+## Weekly share cards
+
+The 13:00 KST handoff generates a Top 10 rates card on Tuesdays and a
+deadlines card on Thursdays. It uses the same overlaid site data as the
+verified build, including when deploy fails or `--no-deploy` is set. Use
+`--cards auto|top10|deadlines|both|none` to control generation. Dry-runs
+skip card generation. Each attempted card has a `kind`, `ok`, `out_dir`,
+and `error` in the `last_daemon_run.cards` list in `handoff/status.json`.
+Card errors leave the site and alerts phases independent.
+
+Top 10 uses the directory’s `pay_usd_max` ordering and excludes sponsored
+and featured listings. Cards show pay in its original currency. The
+deadline window includes the current US Eastern date through seven days
+later. Calls that have yet to open are skipped. The footer and output
+folder use the KST date. A deadlines card requires at least one eligible call.
+
+Each draft goes to
+`/workspace/pitchboard/social/weekly-cards/YYYY-MM-DD/` with landscape and
+portrait SVGs and PNGs, separate X, Threads, and Reddit copy, and a metadata
+file with the source date, rows, and pre-posting checks. The Reddit draft
+includes the full portrait list. Generation is local.
+
+To generate a draft manually, point `--site-data` at a directory containing
+the site JSON files. The supplied date sets the output date and the calendar
+date at the start of the Eastern deadline window.
+
+```bash
+PYTHONPATH=src python3 -m pbdata.handoff.cards --card top10 --date 2026-11-17 \
+  --site-data /path/to/site/data --out-root /path/to/weekly-cards
+```
+
+The standalone command also accepts `deadlines` and `auto`. It reuses
+complete drafts for a date and kind unless `--force` is supplied. The
+renderer uses CairoSVG via `/workspace/pitchboard/venvs/cards/bin/python`
+or the interpreter set by `PB_CARDS_PYTHON`. Inter and Source Serif Pro
+must be available through fontconfig.
+
 ## Locks and recovery
 
 The wrappers use nonblocking exclusive locks on `locks/qwen_bot.lock` and

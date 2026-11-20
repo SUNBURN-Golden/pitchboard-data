@@ -2,13 +2,15 @@
 import argparse
 from contextlib import closing, nullcontext
 import json
+import logging
 from pathlib import Path
 
 from pbdata import db, timeutil
 
-from . import batch, deploy, replay, site, status
+from . import batch, cards, deploy, replay, site, status
 
 MAX_BATCHES = 10
+LOG = logging.getLogger(__name__)
 
 
 def database_phase(root, record, max_batches, clock):
@@ -33,7 +35,8 @@ def database_phase(root, record, max_batches, clock):
 
 
 def run(root, site_repo, *, max_batches=MAX_BATCHES, no_deploy=False, clock=timeutil.utcnow,
-        build_site=site.build_site, alerts=deploy.dispatch_alerts):
+        build_site=site.build_site, alerts=deploy.dispatch_alerts, cards_mode="auto",
+        generate_card=cards.generate_card):
     started = clock()
     record = dict(started_at=timeutil.iso(started), batches_consumed=0, batches_failed=0, items_ok=0, facts_promoted=0,
                   calls_created=0, backup_path=None, site=dict(commit=None, overlay_changes=0, pages=0,
@@ -42,8 +45,25 @@ def run(root, site_repo, *, max_batches=MAX_BATCHES, no_deploy=False, clock=time
         database_phase(root, record, max_batches, clock)
     except Exception:
         record.setdefault("db_error", "db_phase_error")
+
+    as_of = clock()
+    today = as_of.astimezone(timeutil.KST).date()
+    kinds = cards.scheduled_kinds(cards_mode, today)
+    record["cards"] = [dict(kind=kind, ok=False, out_dir=None, error="built site data unavailable") for kind in kinds]
+
+    def generate_from_site_data(site_data):
+        eastern_date = as_of.astimezone(cards.EASTERN).date()
+        for item in record["cards"]:
+            try:
+                out_dir = generate_card(item["kind"], today, site_data, deadline_start=eastern_date)
+                item.update(ok=True, out_dir=str(out_dir), error=None)
+            except Exception as exc:
+                item["error"] = str(exc) or type(exc).__name__
+                LOG.error("weekly card %s failed: %s", item["kind"], item["error"])
+
     try:
-        build_site(root, site_repo, clock().astimezone(timeutil.KST).date(), record["site"], no_deploy=no_deploy)
+        options = {"after_build": generate_from_site_data} if kinds else {}
+        build_site(root, site_repo, today, record["site"], no_deploy=no_deploy, **options)
     except (site.BuildError, deploy.DeployError) as exc:
         record["site"]["error_code"] = str(exc)
     except Exception:
@@ -92,6 +112,7 @@ def main(argv=None, *, lock_held=False):
     parser.add_argument("--max-batches", type=int, default=MAX_BATCHES, choices=range(MAX_BATCHES + 1))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-deploy", action="store_true")
+    parser.add_argument("--cards", choices=("auto", *cards.KINDS, "both", "none"), default="auto")
     args = parser.parse_args(argv)
     try:
         if args.dry_run:
@@ -102,7 +123,8 @@ def main(argv=None, *, lock_held=False):
             if not available:
                 print("handoff daemon already running")
                 return 0
-            record = run(args.root, args.site_repo, max_batches=args.max_batches, no_deploy=args.no_deploy)
+            record = run(args.root, args.site_repo, max_batches=args.max_batches, no_deploy=args.no_deploy,
+                         cards_mode=args.cards)
             return int(bool(record.get("db_error") or record["site"].get("error_code")))
     except Exception:
         print("handoff daemon error")
