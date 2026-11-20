@@ -178,6 +178,8 @@ class Page:
     body: bytes = dataclasses.field(repr=False)
     hops: tuple
     provenance: str  # live_verified | offline_cached (never claims robots verification)
+    http_status: int = 200
+    content_type: str = "text/html"
 
     def doc(self):
         canonical_url(self.requested_url)
@@ -206,8 +208,15 @@ class Page:
         return source_content_hash(self.body)
 
 
+class FetchStop(Stop):
+    def __init__(self, code, http_status=None, final_url=None):
+        super().__init__(code)
+        self.http_status = http_status
+        self.final_url = final_url
+
+
 class PolicyFetcher:
-    def __init__(self, clock=time.monotonic, sleep=time.sleep, egress="direct"):
+    def __init__(self, clock=time.monotonic, sleep=time.sleep, egress="direct", *, require_proxy=False, timeout=15):
         if egress not in ("direct", "sandbox"):
             raise Stop("invalid_config")
         self.clock, self.sleep, self.egress = clock, sleep, egress
@@ -218,6 +227,9 @@ class PolicyFetcher:
             self.proxy = socks_egress.configured_proxy()
         except socks_egress.ProxyConfigError as exc:
             raise Stop("invalid_config") from exc
+        if require_proxy and not self.proxy:
+            raise Stop("proxy_not_configured")
+        self.timeout = timeout
         if self.proxy:
             self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect,
                                                       socks_egress.SocksHTTPHandler(self.proxy), socks_egress.SocksHTTPSHandler(self.proxy))
@@ -239,19 +251,20 @@ class PolicyFetcher:
                                                   "Accept-Encoding": "identity"})
         try:
             try:
-                resp = self.opener.open(req, timeout=15)
+                resp = self.opener.open(req, timeout=self.timeout)
             except urllib.error.HTTPError as e:
                 resp = e
             with resp:
                 status, headers = resp.code, resp.headers
+                if status in (401, 402, 403, 429, 451) or status >= 500:
+                    self.halted.add(origin)
                 if self.proxy and socks_egress.is_binary_media(url, headers.get("Content-Type", "")):
                     socks_egress.log_traffic(0, urlsplit(url).hostname or "", "skipped_binary_media")
-                    raise Stop("unsupported_content")
+                    code = "denied_http" if status in (401, 402, 403, 429, 451) else "unsupported_content"
+                    raise FetchStop(code, status, url)
                 body = resp.read(limit + 1)
-            if status in (401, 402, 403, 429, 451) or status >= 500:
-                self.halted.add(origin)
             if len(body) > limit or headers.get("Content-Encoding", "identity").lower() != "identity":
-                raise Stop("invalid_transport_body")
+                raise FetchStop("invalid_transport_body", status, url)
             if self.proxy:
                 socks_egress.log_traffic(len(body), urlsplit(url).hostname or "")
             return status, headers, body
@@ -280,7 +293,12 @@ class PolicyFetcher:
                     raise Stop("invalid_robots")
                 rp.parse(text.splitlines())
             else:
-                raise Stop("denied_robots")
+                try:
+                    access_check(body)
+                except Stop as exc:
+                    self.halted.add(origin)
+                    raise FetchStop(str(exc), status) from None
+                raise FetchStop("denied_robots", status)
             self.robots[origin] = (self.clock(), rp)
         else:
             rp = cached[1]
@@ -293,17 +311,34 @@ class PolicyFetcher:
         current, hops = requested, []
         for _ in range(5):
             current = canonical_url(current)
-            delay = self.allowed(current)
+            try:
+                delay = self.allowed(current)
+            except Stop as exc:
+                raise FetchStop(str(exc), getattr(exc, "http_status", None), current) from None
             hops.append(current)
-            status, headers, body = self._get(current, "text/html,application/xhtml+xml", MAX_BODY, delay)
+            try:
+                status, headers, body = self._get(current, "text/html,application/xhtml+xml", MAX_BODY, delay)
+            except Stop as exc:
+                raise FetchStop(str(exc), getattr(exc, "http_status", None), current) from None
             if status in (301, 302, 303, 307, 308) and headers.get("Location"):
-                current = canonical_url(urljoin(current, headers["Location"]))
+                try:
+                    current = canonical_url(urljoin(current, headers["Location"]))
+                except Stop as exc:
+                    raise FetchStop(str(exc), status, current) from None
                 continue
-            if not 200 <= status < 300:
-                raise Stop("denied_http")
-            if headers.get("Content-Type", "").split(";")[0].lower() not in ("text/html", "application/xhtml+xml"):
-                raise Stop("unsupported_content")
-            page = Page(requested, current, body, tuple(hops), "live_verified")
-            page.doc()
+            try:
+                if not 200 <= status < 300:
+                    access_check(body)
+                    raise Stop("denied_http")
+                content_type = headers.get("Content-Type", "").split(";")[0].lower()
+                if content_type not in ("text/html", "application/xhtml+xml"):
+                    raise Stop("unsupported_content")
+                page = Page(requested, current, body, tuple(hops), "live_verified", status, content_type)
+                page.doc()
+            except Stop as exc:
+                if str(exc) == "access_wall":
+                    p = urlsplit(current)
+                    self.halted.add(p.scheme + "://" + p.netloc)
+                raise FetchStop(str(exc), status, current) from None
             return page
         raise Stop("redirect_limit")
