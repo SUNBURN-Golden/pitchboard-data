@@ -41,6 +41,8 @@ def write_batch(inbox, items, created_at, git_commit, caps, llm_calls, tokens):
     data = b"".join(json_line(item) for item in items)
     manifest = dict(schema=SCHEMA, batch_id=batch_id, created_at=timeutil.iso(created_at), git_commit=git_commit,
                     counts={outcome: sum(item["outcome"] == outcome for item in items) for outcome in OUTCOMES},
+                    repair_attempted=sum(item.get("repair_attempted", False) for item in items),
+                    repair_ok=sum(item.get("repair_ok", False) for item in items),
                     items_sha256=hashlib.sha256(data).hexdigest(), llm_calls=llm_calls, caps=caps, **tokens)
     staging = inbox / (".tmp-" + batch_id)
     staging.mkdir(parents=True)

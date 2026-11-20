@@ -1,8 +1,11 @@
 """Generate local SVGs, PNGs, and draft copy for the weekly share cards."""
 
 import argparse
+from contextlib import nullcontext
 import datetime as dt
+from decimal import Decimal
 import fcntl
+import hashlib
 import logging
 import os
 from pathlib import Path
@@ -15,9 +18,9 @@ from urllib.parse import urlencode
 from xml.etree import ElementTree
 from zoneinfo import ZoneInfo
 
-from pbdata import timeutil
+from pbdata import db, timeutil
 
-from . import card_layout, status
+from . import card_layout, site, status
 
 LOG = logging.getLogger(__name__)
 DEFAULT_OUT_ROOT = Path("/workspace/pitchboard/social/weekly-cards")
@@ -32,7 +35,30 @@ TEMPLATES = {
     "deadlines": {"x": card_layout.deadlines_x_svg, "portrait": card_layout.deadlines_portrait_svg},
 }
 PLACEHOLDERS = ("Outlet Name", "$000", "Nov 00", "Placeholder", "placeholder", "[OWNER")
-UNIT = re.compile(r"\bper (?:review|word|article|printed page|page|essay|piece)\b", re.I)
+PAY_CODE = rf"(?:{card_layout.CURRENCY_CODE}|NZD|HKD|SGD|JPY|INR|KRW|CHF|ZAR|MXN)"
+PAY_SYMBOLS = "$£€¥₹₩"
+PAY_CURRENCY = rf"(?:US|CA|AU|NZ|HK|SG|A|C|S|{PAY_CODE})?\s*[{PAY_SYMBOLS}]|{PAY_CODE}"
+PAY_AMOUNT = re.compile(
+    rf"(?<![\w.,])(?:(?P<prefix>{PAY_CURRENCY})\s*)?(?P<first>{card_layout.NUMBER})"
+    rf"(?:(?:\s*[-–—]\s*|\s+to\s+)(?:(?P<upper_prefix>{PAY_CURRENCY})\s*)?(?P<upper>{card_layout.NUMBER}))?"
+    rf"(?!\d|[,.]\d)(?P<suffix>\s+{PAY_CODE}\b|¢|c(?=\s*(?:/|per\b)))?", re.I,
+)
+DIRECT_UNIT = re.compile(
+    r"(?:^\s*\+?\s*/|\bper\s+)(?P<count>[\d,]+\s+)?"
+    r"(?:(?:printed|published|book|single-book|long|fiction|nonfiction|accepted)\s+)?(?P<noun>[a-z]+)", re.I,
+)
+UNIT_NOUN = re.compile(r"\b(?:(review|article|essay|page|piece|poem|interview)s?|stor(?:y|ies))\b", re.I)
+UNIT_LABEL = re.compile(r"\b(flat|stipend|honorarium|hourly)\b", re.I)
+UNIT_PHRASE = re.compile(r"\bfor\s+(?:(?:a|an|the)\s+)?([a-z-]+(?:\s+(?!(?:and|or|for|to|on|in|with)\b)[a-z-]+)?)", re.I)
+PAY_CLAUSE = re.compile(r"[;(]|[,.]\s")
+PAY_LIST_SEPARATOR = re.compile(r"\s*(?:,\s*(?:and|or)?|and|or)\s*", re.I)
+PER_WORD_UNIT = re.compile(r"per (?:[\d,]+ )?words?")
+CALL_NOT_LIVE = {"closed", "cancelled", "superseded", "archived", "withdrawn", "expired", "upcoming"}
+ELIGIBILITY_RULE = (
+    "Open and pitch-first outlets qualify. Periodic-calls outlets need a live call with a deadline on or after "
+    "the generation date. Closed, no-public-guidelines, sponsored, featured, and affiliate listings are excluded. "
+    "A clean listed rate and a site pay_usd_max value are required."
+)
 RESTRICTED_WORDING = re.compile(r"\b(?:AI|LLM|ChatGPT|artificial intelligence|machine learning)\b", re.I)
 CONTACT = re.compile(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}|\b\d{3}[-. ]\d{3}[-. ]\d{4}\b")
 MONTHS = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
@@ -93,31 +119,126 @@ def listed_pay(value):
     return value
 
 
-def select_top10(outlets, featured):
-    eligible = (row for row in outlets if row.get("pay_usd_max") is not None
-                and not label_for_sponsorship(row, row.get("name"), featured))
-    # pitchboard-site/build.py's Highest pay strip uses this key and includes closed outlets.
-    ranked = sorted(eligible, key=lambda row: (-row["pay_usd_max"], (row.get("name") or "").lower()))
-    rows = []
-    for rank, outlet in enumerate(ranked[:ROW_LIMITS["top10"]["portrait"]], 1):
-        pay = listed_pay(outlet.get("pays"))
-        units = UNIT.findall(pay)
-        unit = outlet.get("unit") or (units[0] if len(units) == 1 and len(card_layout.AMOUNT.findall(pay)) == 1 else "")
-        rows.append(dict(rank=f"{rank:02d}", outlet_name=outlet.get("name"), rate_as_listed=pay, unit=unit,
-                         pay_usd_max=outlet["pay_usd_max"], last_checked=outlet.get("last_checked")))
-    return rows
+def pay_unit(after, before):
+    direct = DIRECT_UNIT.search(after)
+    if direct:
+        noun = direct["noun"].lower()
+        if direct["count"] and direct["count"].strip() != "1":
+            unit = f"per {direct['count'].strip()} {noun}"
+        else:
+            known = UNIT_NOUN.fullmatch(noun)
+            noun = (known[1] or "story").lower() if known else noun
+            unit = "per " + ("word" if noun == "words" else noun)
+        if len(unit) <= 18:
+            return unit
+    label = UNIT_LABEL.search(after)
+    if label:
+        return label[1].lower()
+    noun = UNIT_NOUN.search(after) or UNIT_NOUN.search(before)
+    if noun:
+        return "per " + (noun[1] or "story").lower()
+    phrase = UNIT_PHRASE.search(after)
+    if phrase:
+        words = phrase[1].lower().split()
+        return next((unit for unit in ("for " + " ".join(words), "for " + words[0]) if len(unit) <= 18), "")
+    return ""
+
+
+def pay_units(pay, matches):
+    units = [""] * len(matches)
+    for i in range(len(matches) - 1, -1, -1):
+        match = matches[i]
+        has_next = i + 1 < len(matches)
+        next_start = matches[i + 1].start() if has_next else len(pay)
+        prev_end = matches[i - 1].end() if i else 0
+        between = pay[match.end():next_start]
+        after = PAY_CLAUSE.split(between, maxsplit=1)[0]
+        prior_clauses = PAY_CLAUSE.split(pay[prev_end:match.start()])
+        before = prior_clauses[-1] if not i or len(prior_clauses) > 1 else ""
+        unit = pay_unit(after, before)
+        if not unit and has_next and PAY_LIST_SEPARATOR.fullmatch(between):
+            unit = units[i + 1]
+        units[i] = unit
+    return units
+
+
+def clean_rate(pay, *, per_word=False):
+    """Return the listed figure and unit, keeping each currency separate."""
+    matches = [match for match in PAY_AMOUNT.finditer(pay or "")
+               if match["prefix"] or match["upper_prefix"] or match["suffix"]]
+    rates = {}
+    for match, unit in zip(matches, pay_units(pay, matches)):
+        prefix = (match["prefix"] or match["upper_prefix"] or "").strip()
+        upper_prefix = (match["upper_prefix"] or prefix).strip()
+        suffix = match["suffix"] or ""
+        short, long = sorted((prefix.upper(), upper_prefix.upper()), key=len)
+        if short != long and (short not in PAY_SYMBOLS or not long.endswith(short)):
+            continue
+        currency = (long + suffix).strip().upper()
+        figures = rates.setdefault((currency, unit), {})
+        for number, mark in ((match["first"], prefix), (match["upper"], upper_prefix)):
+            if number:
+                amount = Decimal(number.replace(",", ""))
+                spacer = " " if mark.isalpha() else ""
+                figures.setdefault(amount, f"{mark}{spacer}{amount:,f}{suffix}")
+    if not rates:
+        return None
+    preferred = [key for key in rates if bool(PER_WORD_UNIT.fullmatch(key[1])) == per_word]
+    candidates = preferred or list(rates)
+    # Choose the largest stated upper amount within one currency, with no FX comparison.
+    currency = candidates[0][0]
+    key = max((key for key in candidates if key[0] == currency), key=lambda key: max(rates[key]))
+    figures = rates[key]
+    low, high = min(figures), max(figures)
+    return (figures[low] if low == high else f"{figures[low]}–{figures[high]}", key[1])
+
+
+def live_call_deadline(call, start):
+    if call.get("status") in CALL_NOT_LIVE:
+        return None
+    opens_value = call.get("opens")
+    opens = optional_date(opens_value)
+    deadline = optional_date(call.get("deadline"))
+    if deadline is not None and deadline >= start and (not opens_value or (opens is not None and opens <= start)):
+        return deadline
+    return None
+
+
+def select_top10(outlets, featured, calls, date):
+    live_outlets = {call["outlet"].casefold() for call in calls if live_call_deadline(call, date)}
+    rows, excluded = [], []
+    for outlet in outlets:
+        name, state = outlet.get("name"), outlet.get("status")
+        sort_value = outlet.get("pay_usd_max")
+        if label_for_sponsorship(outlet, name, featured):
+            reason = "sponsored_or_featured"
+        elif state not in ("open", "pitch-first", "periodic-calls"):
+            reason = state or "missing_status"
+        elif state == "periodic-calls" and (name or "").casefold() not in live_outlets:
+            reason = "no_live_call"
+        else:
+            rate = clean_rate(outlet.get("pays"), per_word=sort_value is None and outlet.get("pay_usd_per_word") is not None)
+            if rate is not None and sort_value is not None:
+                figure, unit = rate
+                rows.append(dict(outlet_name=name, rate_as_listed=figure, unit=unit,
+                                 pay_usd_max=sort_value, last_checked=outlet.get("last_checked")))
+                continue
+            reason = "no_clean_rate" if rate is None else "no_pay_usd_max"
+        excluded.append(dict(outlet_name=name, reason=reason))
+    # Matches the Highest pay section of the committed pitchboard-site/build.py.
+    rows.sort(key=lambda row: (-row["pay_usd_max"], (row["outlet_name"] or "").lower()))
+    rows = rows[:ROW_LIMITS["top10"]["portrait"]]
+    for rank, row in enumerate(rows, 1):
+        row["rank"] = f"{rank:02d}"
+    return rows, excluded
 
 
 def select_deadlines(calls, featured, start):
     end = start + dt.timedelta(days=7)
     eligible = []
     for call in calls:
-        if call.get("status") in ("closed", "cancelled", "superseded", "archived"):
-            continue
-        deadline = optional_date(call.get("deadline"))
-        opens_value = call.get("opens")
-        opens = optional_date(opens_value)
-        if deadline is None or not start <= deadline <= end or (opens_value and (opens is None or opens > start)):
+        deadline = live_call_deadline(call, start)
+        if deadline is None or deadline > end:
             continue
         eligible.append((deadline, call))
     eligible.sort(key=lambda entry: (entry[0], str(entry[1].get("id") or "")))
@@ -131,7 +252,7 @@ def select_deadlines(calls, featured, start):
     return rows
 
 
-def source_rows(kind, site_data, deadline_start):
+def source_rows(kind, site_data, date, deadline_start):
     sponsors = status.read_json(site_data / "sponsors.json", {})
     featured = {entry["outlet"] for entry in sponsors.get("featured", [])}
     if kind == "top10":
@@ -139,11 +260,13 @@ def source_rows(kind, site_data, deadline_start):
         if outlets is None:
             raise CardError("site data is missing outlets.json")
         checked = (optional_date(row.get("last_checked")) for row in outlets)
-        return select_top10(outlets, featured), max(filter(None, checked), default=None)
+        calls = status.read_json(site_data / "calls.json", {"calls": []})
+        rows, excluded = select_top10(outlets, featured, calls["calls"], date)
+        return rows, max(filter(None, checked), default=None), excluded
     data = status.read_json(site_data / "calls.json", None)
     if data is None:
         raise CardError("site data is missing calls.json")
-    return select_deadlines(data["calls"], featured, deadline_start), optional_date(data.get("updated"))
+    return select_deadlines(data["calls"], featured, deadline_start), optional_date(data.get("updated")), []
 
 
 def source_link(kind, channel, date):
@@ -158,7 +281,7 @@ def reddit_row(kind, row):
     if kind == "deadlines":
         return f'{row["call_title"]} — {row["outlet_name"]}{label} · closes {row["deadline_date"]} · {row["rate_as_listed"]}'
     unit = row["unit"]
-    unit_suffix = f" {unit}" if unit and unit not in row["rate_as_listed"] else ""
+    unit_suffix = f" {unit}" if unit else ""
     return row["outlet_name"] + " — " + row["rate_as_listed"] + unit_suffix
 
 
@@ -259,20 +382,23 @@ def check_png(path, width, height):
         raise CardError(f"{path.name} is not a {width}×{height} PNG")
 
 
-def _complete(out_dir, filenames):
+def _complete(out_dir, filenames, provenance):
     try:
         files = ((out_dir / filename).stat() for filename in filenames)
-        return all(stat.S_ISREG(file.st_mode) and file.st_size > 0 for file in files)
-    except FileNotFoundError:
+        if not all(stat.S_ISREG(file.st_mode) and file.st_size > 0 for file in files):
+            return False
+        meta = status.read_json(out_dir / filenames[-1], {})
+        return isinstance(meta, dict) and all(meta.get(key) == value for key, value in provenance.items())
+    except (FileNotFoundError, ValueError):
         return False
 
 
-def _publish(stage, out_dir, filenames, force):
+def _publish(stage, out_dir, filenames, force, provenance):
     # Serialize publication with other invocations, including the standalone CLI.
     lock = os.open(out_dir.parent, os.O_RDONLY | os.O_DIRECTORY)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        if not force and _complete(out_dir, filenames):
+        if not force and _complete(out_dir, filenames, provenance):
             return
         if not out_dir.exists():
             stage.rename(out_dir)
@@ -287,17 +413,23 @@ def _publish(stage, out_dir, filenames, force):
 
 
 def generate_card(kind, date, site_data, out_root=DEFAULT_OUT_ROOT, *, deadline_start=None, force=False,
-                  renderer=render_png):
+                  renderer=render_png, site_commit=None):
     """Generate a validated local draft, or reuse an existing complete draft."""
     out_dir = out_root / date.isoformat()
     filenames = [f"{kind}-{layout}.{ext}" for layout in LAYOUTS for ext in ("svg", "png")]
     filenames += [f"{kind}-copy-{channel}.txt" for channel in CHANNELS]
     meta_name = f"{kind}-meta.json"
     filenames.append(meta_name)
-    if not force and _complete(out_dir, filenames):
+    provenance = dict(site_commit=site_commit,
+                      site_data_source="archived_commit_with_overlay" if site_commit else "explicit_override")
+    if site_commit:
+        # The overlay can change even when the selected Git commit stays fixed.
+        inputs = [status.read_json(site_data / name, None) for name in ("outlets.json", "calls.json", "sponsors.json")]
+        provenance["site_data_sha256"] = hashlib.sha256(status.json_line(inputs)).hexdigest()
+    if not force and _complete(out_dir, filenames, provenance):
         return out_dir
     deadline_start = deadline_start or date
-    rows, source_date = source_rows(kind, site_data, deadline_start)
+    rows, source_date, excluded = source_rows(kind, site_data, date, deadline_start)
     used = rows[:ROW_LIMITS[kind]["portrait"]]
     check_rows(kind, used)
     copy = post_copy(kind, used, date, deadline_start)
@@ -324,12 +456,14 @@ def generate_card(kind, date, site_data, out_root=DEFAULT_OUT_ROOT, *, deadline_
         meta = dict(kind=kind, date=date.isoformat(), source_data_date=source_date.isoformat() if source_date else None,
                     rows=used, row_counts={layout: min(len(rows), limit) for layout, limit in ROW_LIMITS[kind].items()},
                     eligible_rows=len(rows), checks_passed=["required_slots", "placeholder_guard", "copy_limits", "png_size"],
-                    compliance_checklist=COMPLIANCE_CHECKLIST, posted=False)
+                    compliance_checklist=COMPLIANCE_CHECKLIST, posted=False, **provenance)
         if kind == "deadlines":
             meta["deadline_window"] = dict(start=deadline_start.isoformat(), timezone=EASTERN.key,
                                            end=(deadline_start + dt.timedelta(days=7)).isoformat())
+        else:
+            meta.update(eligibility_rule=ELIGIBILITY_RULE, excluded=excluded)
         (stage / meta_name).write_bytes(status.json_line(meta))
-        _publish(stage, out_dir, filenames, force)
+        _publish(stage, out_dir, filenames, force, provenance)
     return out_dir
 
 
@@ -337,17 +471,28 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--card", choices=(*KINDS, "auto"), required=True)
     parser.add_argument("--date", type=timeutil.parse_date, required=True)
-    parser.add_argument("--site-data", type=Path, required=True)
+    parser.add_argument("--root", type=Path, default=db.data_root())
+    parser.add_argument("--site-repo", type=Path, default=site.DEFAULT_REPO)
+    parser.add_argument("--site-data", type=Path)
     parser.add_argument("--out-root", type=Path, default=DEFAULT_OUT_ROOT)
     parser.add_argument("--force", action="store_true")
     args = parser.parse_args(argv)
-    for kind in scheduled_kinds(args.card, args.date):
-        try:
-            out_dir = generate_card(kind, args.date, args.site_data, args.out_root, force=args.force)
-        except Exception as exc:
-            LOG.error("weekly card %s failed: %s", kind, exc)
-            return 1
-        print(f"weekly card {kind} ready in {out_dir}")
+    kinds = scheduled_kinds(args.card, args.date)
+    if not kinds:
+        return 0
+    snapshot = {}
+    source = (nullcontext() if args.site_data else
+              site.site_snapshot(args.root, args.site_repo, args.date, snapshot, data_only=True))
+    try:
+        with source as work:
+            site_data = args.site_data or work / "data"
+            for kind in kinds:
+                out_dir = generate_card(kind, args.date, site_data, args.out_root, force=args.force,
+                                        site_commit=snapshot.get("commit"))
+                print(f"weekly card {kind} ready in {out_dir}")
+    except Exception as exc:
+        LOG.error("weekly card %s failed: %s", args.card, exc)
+        return 1
     return 0
 
 

@@ -1,5 +1,6 @@
 """Evidence-backed overlay for clean builds of the committed site."""
 from collections import defaultdict
+from contextlib import contextmanager
 import datetime as dt
 import json
 import os
@@ -178,13 +179,16 @@ def site_commit(repo, *, fetch=True):
     return local.stdout.strip()
 
 
-def build_site(root, repo, today, result, *, no_deploy=False, fetch=True, deploy_site=deploy.deploy, after_build=None):
+@contextmanager
+def site_snapshot(root, repo, today, result, *, fetch=True, data_only=False):
     commit = site_commit(repo, fetch=fetch)
     result["commit"] = commit
     with tempfile.TemporaryDirectory(prefix="pb-handoff-site-") as tmp:
         work = Path(tmp)
         archive = work / "site.tar"
-        git(repo, "archive", "--format=tar", "--output=" + str(archive), commit, stdout=subprocess.DEVNULL, check=True)
+        paths = ("data/",) if data_only else ()
+        git(repo, "archive", "--format=tar", "--output=" + str(archive), commit, *paths,
+            stdout=subprocess.DEVNULL, check=True)
         subprocess.run(["tar", "-xf", str(archive), "-C", str(work)], check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         archive.unlink()
@@ -196,6 +200,11 @@ def build_site(root, repo, today, result, *, no_deploy=False, fetch=True, deploy
         if result["overlay_changes"]:
             status.atomic_json(outlets_path, outlets)
             status.atomic_json(calls_path, calls)
+        yield work
+
+
+def build_site(root, repo, today, result, *, no_deploy=False, fetch=True, deploy_site=deploy.deploy, after_build=None):
+    with site_snapshot(root, repo, today, result, fetch=fetch) as work:
         build = subprocess.run([sys.executable, "build.py"], cwd=work, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if build.returncode:
             raise BuildError("site_build_failed")

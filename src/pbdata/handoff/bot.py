@@ -120,15 +120,16 @@ def extract(doc, as_of, caps, key, transport, budget, item):
     if not key:
         item.update(outcome="llm_error", error_code="key_unavailable")
         return
+    if budget["llm_calls"] >= caps["max_llm_calls_per_run"]:
+        item.update(outcome="skipped_cap", error_code="llm_cap")
+        return
     try:
         body = schema.request_body(doc, as_of, caps, provider="qwen")
         for repair in (False, True):
-            if budget["llm_calls"] >= caps["max_llm_calls_per_run"]:
-                item.update(outcome="skipped_cap", error_code="llm_cap")
-                return
             if key in common.dumps(body):
-                raise common.Stop("credential_in_request")
+                raise common.Stop("credential_in_response" if repair else "credential_in_request")
             budget["llm_calls"] += 1
+            item["repair_attempted"] = repair
             raw = transport(body, key, caps["timeout_seconds"])
             usage = raw.get("usage") if isinstance(raw, dict) else None
             if isinstance(usage, dict):
@@ -139,16 +140,23 @@ def extract(doc, as_of, caps, key, transport, budget, item):
             if key in common.dumps(raw):
                 raise common.Stop("credential_in_response")
             try:
-                fields, reasons, _ = schema.response(raw, doc, as_of, caps, provider="qwen", strict_repair=repair)
-            except common.Stop as exc:
+                # Both passes use the shadow shape tolerances, including missing keys as null.
+                fields, reasons, _ = schema.response(raw, doc, as_of, caps, provider="qwen",
+                                                     capture_repair_candidate=True)
+            except schema.SchemaRepairCandidate as exc:
                 if repair or str(exc) not in runner.REPAIR_SCHEMA_CODES:
                     raise
-                prior = exc.prior if isinstance(exc, schema.SchemaRepairCandidate) else None
-                body = schema.repair_body(body, prior)
+                if key in common.dumps(exc.prior):
+                    raise common.Stop("credential_in_response")
+                if budget["llm_calls"] >= caps["max_llm_calls_per_run"]:
+                    item.update(outcome="llm_error", error_code="repair_skipped_cap")
+                    return
+                body = schema.repair_body(body, exc.prior, str(exc))
                 continue
             if key in common.dumps(fields):
                 raise common.Stop("credential_in_response")
-            item.update(qwen=fields, validation_reasons=reasons, returned_model=raw["model"], outcome="ok")
+            item.update(qwen=fields, validation_reasons=reasons, returned_model=raw["model"], outcome="ok",
+                        repair_ok=repair)
             return
     except common.Stop as exc:
         code = str(exc)
@@ -159,7 +167,8 @@ def extract(doc, as_of, caps, key, transport, budget, item):
 
 def collect_page(target, fetcher, as_of, caps, key, transport, budget, clock):
     item = dict(target, final_url=None, fetched_at=timeutil.iso(clock()), http_status=None, content_sha256=None,
-                page_text=None, rules=None, qwen=None, model=schema.QWEN_MODEL, usage=dict.fromkeys(batch.TOKEN_FIELDS, 0))
+                page_text=None, rules=None, qwen=None, model=schema.QWEN_MODEL, usage=dict.fromkeys(batch.TOKEN_FIELDS, 0),
+                repair_attempted=False, repair_ok=False)
     if key and key in item["url"]:
         item.update(url=redact(item["url"], key), outcome="blocked", error_code="credential_in_url")
         return item, False

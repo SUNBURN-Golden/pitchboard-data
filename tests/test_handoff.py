@@ -242,15 +242,24 @@ class HandoffTest(unittest.TestCase):
         caps = self.root / "caps.json"
         status.atomic_json(caps, dict(self.caps, max_pages_per_run=3, max_llm_calls_per_run=2, max_page_utf8_bytes=400))
         fetcher = FakeFetcher()
-        transport = Mock(side_effect=[provider_response({"unexpected": None}), provider_response(dict.fromkeys(schema.FIELDS))])
+        invalid = dict(dict.fromkeys(schema.FIELDS), unexpected="prior response")
+        transport = Mock(side_effect=[provider_response(invalid), provider_response({"pay": None})])
         result = bot.run(self.root, config=caps, probe=lambda: True, fetcher_factory=Mock(return_value=fetcher),
                          transport=transport, key_loader=lambda: SECRET, clock=lambda: NOW)
         self.assertEqual((2, 1), (result["llm_calls"], result["pages_ok"]))
         self.assertEqual(1, len(fetcher.urls))
         self.assertEqual(3, len(transport.call_args.args[0]["messages"]))
+        correction = transport.call_args.args[0]["messages"][-1]["content"]
+        self.assertIn("Validation error: invalid_schema", correction)
+        self.assertIn('"unexpected":"prior response"', correction)
         self.assertEqual(50, result["tokens"]["total_tokens"])
         path = self.inbox / result["batch_id"]
         item = json.loads((path / "items.jsonl").read_bytes())
+        self.assertEqual(("ok", True, True), (item["outcome"], item["repair_attempted"], item["repair_ok"]))
+        self.assertEqual(dict.fromkeys(schema.FIELDS), item["qwen"])
+        self.assertEqual("missing_key", item["validation_reasons"]["open_call"])
+        manifest = status.read_json(path / "manifest.json", {})
+        self.assertEqual((2, 1, 1), (manifest["llm_calls"], manifest["repair_attempted"], manifest["repair_ok"]))
         self.assertLessEqual(len(item["page_text"].encode()), 400)
         self.assertIn("[email]", item["page_text"])
         self.assertIn("[phone]", item["page_text"])
@@ -260,6 +269,40 @@ class HandoffTest(unittest.TestCase):
             targets = list(bot.select_targets(svc, NOW, {fetcher.urls[0]: timeutil.iso(NOW)}))
         self.assertNotIn(fetcher.urls[0], [url for url, _ in targets])
         self.assertEqual([(0,)], self.rows("SELECT count(*) FROM pb_raw_ref"))
+
+    def test_bot_records_failed_repair_and_cap_skip(self):
+        invalid = provider_response({"unexpected": None})
+        for cap, expected_code in ((2, "invalid_schema"), (1, "repair_skipped_cap")):
+            with self.subTest(cap=cap):
+                transport = Mock(side_effect=[invalid, invalid])
+                item, _ = bot.collect_page(
+                    {"source_id": self.source_id, "outlet_id": self.outlet_id, "url": URL},
+                    FakeFetcher(), NOW.date().isoformat(), dict(self.caps, max_llm_calls_per_run=cap), SECRET,
+                    transport, {"llm_calls": 0}, lambda: NOW,
+                )
+                self.assertEqual(cap, transport.call_count)
+                self.assertEqual(("llm_error", expected_code), (item["outcome"], item["error_code"]))
+                self.assertEqual(cap == 2, item["repair_attempted"])
+                self.assertFalse(item["repair_ok"])
+
+    def test_bot_passes_rejected_model_json_and_validation_error_to_repair(self):
+        for content, code in (("malformed response", "invalid_model_json"),
+                              ('{"pay":null,"pay":null}', "duplicate_json_key"),
+                              ('{"pay":NaN}', "invalid_json_number")):
+            with self.subTest(code=code):
+                invalid = provider_response(None)
+                invalid["choices"][0]["message"]["content"] = content
+                transport = Mock(side_effect=[invalid, provider_response(dict.fromkeys(schema.FIELDS))])
+                item, _ = bot.collect_page(
+                    {"source_id": self.source_id, "outlet_id": self.outlet_id, "url": URL},
+                    FakeFetcher(), NOW.date().isoformat(), self.caps, SECRET, transport,
+                    {"llm_calls": 0}, lambda: NOW,
+                )
+                self.assertEqual(2, transport.call_count)
+                self.assertTrue(item["repair_ok"])
+                correction = transport.call_args.args[0]["messages"][-1]["content"]
+                self.assertIn("Validation error: " + code, correction)
+                self.assertEqual(content, json.loads(correction.splitlines()[-1]))
 
     def test_bot_page_cap_and_all_failures_still_publish(self):
         with closing(db.connect(self.live)) as svc:
@@ -418,6 +461,7 @@ class ApiTest(unittest.TestCase):
 
             def opener(req, *, timeout):
                 self.assertEqual(60, timeout)
+                self.assertEqual(deploy.USER_AGENT, req.get_header("User-agent"))
                 requests.append(req)
                 url = req.full_url
                 if url.endswith("/upload-token"):
@@ -464,6 +508,46 @@ class ApiTest(unittest.TestCase):
             self.assertIsNone(deploy.dispatch_alerts(secret_file=Path(temp) / "absent", opener=opener))
             opener.assert_not_called()
             self.assertEqual("", logged.getvalue())
+
+    def test_alerts_headers_dry_run_and_safe_response_logging(self):
+        with tempfile.TemporaryDirectory() as temp:
+            secret_file = Path(temp) / "secret"
+            secret_file.write_text(SECRET)
+            for code, body, label, raises in (
+                (204, b"", "", False),
+                (403, b"error code: 1010", " cf_error_1010", True),
+                (500, json.dumps({"error": "server_error", "private": SECRET}).encode(), " server_error", False),
+                (401, json.dumps({"error": SECRET}).encode(), "", True),
+            ):
+                with self.subTest(code=code), redirect_stdout(io.StringIO()) as logged:
+                    def opener(req, *, timeout):
+                        self.assertEqual(60, timeout)
+                        self.assertEqual("POST", req.get_method())
+                        self.assertEqual(deploy.ALERTS_URL + "?dry_run=1", req.full_url)
+                        self.assertEqual("PitchboardHandoffDaemon/1.0 (+https://pitchboard.soulbound.co.kr)",
+                                         req.get_header("User-agent"))
+                        self.assertEqual("application/json", req.get_header("Content-type"))
+                        self.assertEqual("application/json", req.get_header("Accept"))
+                        self.assertEqual(SECRET, req.get_header("X-pitchboard-cron"))
+                        self.assertEqual(b"{}", req.data)
+                        response = io.BytesIO(body)
+                        if raises:
+                            raise HTTPError(req.full_url, code, "fake", None, response)
+                        response.status = code
+                        return response
+
+                    self.assertEqual(code, deploy.dispatch_alerts(secret_file=secret_file, opener=opener, dry_run=True))
+                    self.assertEqual(f"handoff alerts HTTP {code}{label}\n", logged.getvalue())
+
+    def test_daemon_cli_passes_alerts_dry_run_flag(self):
+        with tempfile.TemporaryDirectory() as temp:
+            alerts = Mock(return_value=204)
+            run = daemon.run
+            with patch.object(daemon, "database_phase"), patch.object(daemon, "run", side_effect=lambda *args, **kwargs:
+                    run(*args, **kwargs, build_site=Mock(), alerts=alerts)):
+                self.assertEqual(0, daemon.main(["--root", temp, "--no-deploy", "--alerts-dry-run", "--cards", "none"],
+                                                lock_held=True))
+            alerts.assert_called_once_with(dry_run=True)
 
 
 if __name__ == "__main__":

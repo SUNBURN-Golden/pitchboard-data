@@ -14,6 +14,7 @@ from pbdata.collect.net import NoRedirect
 TOKEN_FILE = Path("/home/box/.secrets/pitchboard_cf_pages_token.txt")
 ALERTS_SECRET = Path("/home/box/.secrets/pitchboard_alerts_cron_secret")
 ALERTS_URL = "https://pitchboard.soulbound.co.kr/api/internal/alerts/dispatch"
+USER_AGENT = "PitchboardHandoffDaemon/1.0 (+https://pitchboard.soulbound.co.kr)"
 API = "https://api.cloudflare.com/client/v4"
 PROJECT = "/accounts/aa6bf084982ee841c3ea39b45895a15e/pages/projects/pitchboard"
 SPECIAL_FILES = {
@@ -70,7 +71,7 @@ def direct_open():
 def request(opener, path, token, data=None, content_type="application/json"):
     try:
         req = urllib.request.Request(API + path, data=data, headers={
-            "Authorization": "Bearer " + token, "Content-Type": content_type,
+            "Authorization": "Bearer " + token, "Content-Type": content_type, "User-Agent": USER_AGENT,
         })
         with opener(req, timeout=60) as response:
             if not 200 <= response.status < 300:
@@ -139,18 +140,42 @@ def deploy(dist, *, token_file=TOKEN_FILE, opener=None, hasher=None):
     return {"deploy_success": True, "deployment_id": deployment_id, "url": url}
 
 
-def dispatch_alerts(*, secret_file=ALERTS_SECRET, opener=None):
+def alerts_error(response):
+    try:
+        body = response.read(1024).strip()
+        cf_error = re.fullmatch(rb"error code: ([0-9]{4})", body)
+        if cf_error:
+            return "cf_error_" + cf_error[1].decode("ascii")
+        payload = json.loads(body)
+        code = payload.get("error") if isinstance(payload, dict) else None
+        if isinstance(code, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", code):
+            return code
+    except (OSError, ValueError):
+        pass
+    return ""
+
+
+def dispatch_alerts(*, secret_file=ALERTS_SECRET, opener=None, dry_run=False):
+    error = ""
     try:
         secret = secret_file.read_text(encoding="utf-8").strip()
         if not secret:
             return None
-        req = urllib.request.Request(ALERTS_URL, data=b"{}", headers={
-            "X-Pitchboard-Cron": secret, "Content-Type": "application/json",
+        url = ALERTS_URL + ("?dry_run=1" if dry_run else "")
+        req = urllib.request.Request(url, data=b"{}", headers={
+            "X-Pitchboard-Cron": secret, "Content-Type": "application/json", "Accept": "application/json",
+            "User-Agent": USER_AGENT,
         })
         with (opener or direct_open())(req, timeout=60) as response:
-            return response.status
+            http_status = response.status
+            if not 200 <= http_status < 300:
+                error = alerts_error(response)
     except urllib.error.HTTPError as exc:
-        exc.close()
-        return exc.code
+        with exc:
+            http_status = exc.code
+            error = alerts_error(exc)
     except (OSError, ValueError):
         return None
+    detail = f" {error}" if error and secret not in error else ""
+    print(f"handoff alerts HTTP {http_status}{detail}", flush=True)
+    return http_status

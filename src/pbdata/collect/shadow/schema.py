@@ -306,14 +306,15 @@ def request_body(doc, as_of, config, provider="deepseek"):
 
 
 class SchemaRepairCandidate(Stop):
-    def __init__(self, prior):
-        super().__init__("invalid_schema")
+    def __init__(self, prior, code="invalid_schema"):
+        super().__init__(code)
         self.prior = prior
 
 
-def repair_body(body, prior):
+def repair_body(body, prior, validation_error="invalid_schema"):
     correction = (
         "Correct the previous response. Return a single JSON object only.\n"
+        f"Validation error: {validation_error}.\n"
         f"Required top-level keys: {', '.join(FIELDS)}.\n"
         f"JSON skeleton: {dumps(dict.fromkeys(FIELDS))}\n"
         "Follow the schema and use verbatim evidence from page_text for every non-null field.\n"
@@ -331,7 +332,8 @@ def repair_body(body, prior):
     return {**body, "messages": [*body["messages"], {"role": "user", "content": correction}]}
 
 
-def response(raw, doc, as_of, config, provider="deepseek", *, schema_shape=None, strict_repair=False):
+def response(raw, doc, as_of, config, provider="deepseek", *, schema_shape=None, strict_repair=False,
+             capture_repair_candidate=False):
     if schema_shape is not None:
         schema_shape.clear()
     allowed = QWEN_MODELS if provider == "qwen" else DEEPSEEK_MODELS
@@ -352,9 +354,13 @@ def response(raw, doc, as_of, config, provider="deepseek", *, schema_shape=None,
     message = choices[0].get("message")
     if not isinstance(message, dict) or message.get("tool_calls") or message.get("refusal") or message.get("reasoning_content"):
         raise Stop("invalid_completion")
+    model_content = message.get("content")
     try:
-        prior = loads(message["content"])
+        prior = loads(model_content)
     except Exception as exc:
+        if capture_repair_candidate:
+            code = str(exc) if isinstance(exc, Stop) else "invalid_model_json"
+            raise SchemaRepairCandidate(model_content, code) from None
         if strict_repair and isinstance(exc, Stop):
             raise
         raise Stop("invalid_model_json") from None
@@ -366,7 +372,7 @@ def response(raw, doc, as_of, config, provider="deepseek", *, schema_shape=None,
         fields, reasons = validate(content, doc, as_of, schema_shape=schema_shape)
     except Stop as exc:
         if not strict_repair and str(exc) == "invalid_schema" and (
-                (isinstance(content, dict) and set(FIELDS) - content.keys()) or
+                capture_repair_candidate or (isinstance(content, dict) and set(FIELDS) - content.keys()) or
                 (isinstance(content, list) and len(content) != 1)):
             raise SchemaRepairCandidate(prior) from None
         raise

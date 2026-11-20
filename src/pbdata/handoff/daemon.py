@@ -35,7 +35,7 @@ def database_phase(root, record, max_batches, clock):
 
 
 def run(root, site_repo, *, max_batches=MAX_BATCHES, no_deploy=False, clock=timeutil.utcnow,
-        build_site=site.build_site, alerts=deploy.dispatch_alerts, cards_mode="auto",
+        build_site=site.build_site, alerts=deploy.dispatch_alerts, alerts_dry_run=False, cards_mode="auto",
         generate_card=cards.generate_card):
     started = clock()
     record = dict(started_at=timeutil.iso(started), batches_consumed=0, batches_failed=0, items_ok=0, facts_promoted=0,
@@ -56,7 +56,8 @@ def run(root, site_repo, *, max_batches=MAX_BATCHES, no_deploy=False, clock=time
         eastern_date = as_of.astimezone(cards.EASTERN).date()
         for item in record["cards"]:
             try:
-                out_dir = generate_card(item["kind"], today, site_data, deadline_start=eastern_date)
+                out_dir = generate_card(item["kind"], today, site_data, deadline_start=eastern_date,
+                                        site_commit=record["site"]["commit"])
                 item.update(ok=True, out_dir=str(out_dir), error=None)
             except Exception as exc:
                 item["error"] = str(exc) or type(exc).__name__
@@ -71,11 +72,9 @@ def run(root, site_repo, *, max_batches=MAX_BATCHES, no_deploy=False, clock=time
         print(f"handoff site phase failed ({type(exc).__name__})", flush=True)
         record["site"]["error_code"] = "site_phase_error"
     try:
-        record["alerts_status"] = alerts()
+        record["alerts_status"] = alerts(dry_run=True) if alerts_dry_run else alerts()
     except Exception:
         pass
-    if record["alerts_status"] is not None:
-        print(f'handoff alerts HTTP {record["alerts_status"]}', flush=True)
     record["finished_at"] = timeutil.iso(clock())
     if "error_code" in record["site"]:
         record["outcome"] = record["site"]["error_code"]
@@ -114,6 +113,7 @@ def main(argv=None, *, lock_held=False):
     parser.add_argument("--max-batches", type=int, default=MAX_BATCHES, choices=range(MAX_BATCHES + 1))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--no-deploy", action="store_true")
+    parser.add_argument("--alerts-dry-run", action="store_true")
     parser.add_argument("--cards", choices=("auto", *cards.KINDS, "both", "none"), default="auto")
     args = parser.parse_args(argv)
     try:
@@ -126,7 +126,7 @@ def main(argv=None, *, lock_held=False):
                 print("handoff daemon already running")
                 return 0
             record = run(args.root, args.site_repo, max_batches=args.max_batches, no_deploy=args.no_deploy,
-                         cards_mode=args.cards)
+                         alerts_dry_run=args.alerts_dry_run, cards_mode=args.cards)
             return int(bool(record.get("db_error") or record["site"].get("error_code")))
     except Exception:
         print("handoff daemon error")

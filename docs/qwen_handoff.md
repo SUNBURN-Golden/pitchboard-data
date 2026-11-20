@@ -48,8 +48,13 @@ the data root unless specified.
 | `exports/projection_latest.json` | Refreshed service search projection |
 | `backups/pitchboard_kg.pre-qwen-handoff-*.sqlite3` | Up to 14 pre-write service backups |
 
-The caps in `config/qwen_bot.json` include repair calls in the Qwen request
-limit. The bot gives first priority to live deadlines within 21 days. A
+The bot retries a schema-class Qwen failure once with the rejected output
+and validation error. Both passes treat omitted fields as null and check
+every retained field against the page text. Both requests count toward
+`max_llm_calls_per_run` in `config/qwen_bot.json`. If the first request uses
+the last slot, the item records `llm_error` with `repair_skipped_cap`. Items
+record `repair_attempted` and `repair_ok` and the manifest totals both.
+The bot gives first priority to live deadlines within 21 days. A
 failed SOCKS5 probe skips publication after five attempts. Fetch failures that
 occur after a successful probe are included in the batch.
 
@@ -64,10 +69,12 @@ Deployment requires the box's Python `blake3` module and runtime token at
 `/home/box/.secrets/pitchboard_alerts_cron_secret` when present.
 
 The daemon accepts `--root`, `--site-repo`, `--max-batches` (0–10),
-`--dry-run`, and `--no-deploy`. Dry-run prints the pending batch IDs and
-committed site revision using local state. With `--no-deploy`, the daemon
+`--dry-run`, `--no-deploy`, and `--alerts-dry-run`. Dry-run prints the
+pending batch IDs and committed site revision using local state. With `--no-deploy`, the daemon
 still runs the DB phase, builds and verifies the site, and dispatches alerts
-when configured.
+when configured. `--alerts-dry-run` sends the dispatch request with
+`dry_run=1` to suppress alert delivery. Dispatch logs the HTTP status and any
+short error code returned by the service.
 
 ## Weekly share cards
 
@@ -79,8 +86,11 @@ skip card generation. Each attempted card has a `kind`, `ok`, `out_dir`,
 and `error` in the `last_daemon_run.cards` list in `handoff/status.json`.
 Card errors leave the site and alerts phases independent.
 
-Top 10 uses the directory’s `pay_usd_max` ordering and excludes sponsored
-and featured listings. Cards show pay in its original currency. The
+Top 10 uses the directory’s `pay_usd_max` ordering. Open and pitch-first
+outlets qualify, along with periodic-call outlets with a live call that
+closes on or after the card date. Closed, no-public-guidelines, sponsored,
+and featured listings are excluded. The cards and Reddit list show the same
+amounts and units from the outlet’s pay text, in the source currency. The
 deadline window includes the current US Eastern date through seven days
 later. Calls that have yet to open are skipped. The footer and output
 folder use the KST date. A deadlines card requires at least one eligible call.
@@ -88,21 +98,26 @@ folder use the KST date. A deadlines card requires at least one eligible call.
 Each draft goes to
 `/workspace/pitchboard/social/weekly-cards/YYYY-MM-DD/` with landscape and
 portrait SVGs and PNGs, separate X, Threads, and Reddit copy, and a metadata
-file with the source date, rows, and pre-posting checks. The Reddit draft
-includes the full portrait list. Generation is local.
+file with the site commit, data source, source date, rows, and pre-posting
+checks. Top 10 metadata records the eligibility rule and excluded outlets.
+The Reddit draft includes the full portrait list. Generation is local.
 
-To generate a draft manually, point `--site-data` at a directory containing
-the site JSON files. The supplied date sets the output date and the calendar
-date at the start of the Eastern deadline window.
+The standalone CLI archives `data/` from committed site main, preferring
+`origin/main` when it descends from local main, and applies
+`$PB_DATA_ROOT/handoff/site_overlay.json`. Use `--site-repo` to choose the
+checkout and `--root` to choose the data root. `--site-data` explicitly
+selects a directory of JSON files. The supplied date sets the output date
+and the calendar date at the start of the Eastern deadline window.
 
 ```bash
 PYTHONPATH=src python3 -m pbdata.handoff.cards --card top10 --date 2026-11-17 \
-  --site-data /path/to/site/data --out-root /path/to/weekly-cards
+  --out-root /path/to/weekly-cards
 ```
 
 The standalone command also accepts `deadlines` and `auto`. It reuses
-complete drafts for a date and kind unless `--force` is supplied. The
-renderer uses CairoSVG via `/workspace/pitchboard/venvs/cards/bin/python`
+complete drafts for a date, kind, and matching archived inputs unless
+`--force` is supplied. The renderer uses CairoSVG via
+`/workspace/pitchboard/venvs/cards/bin/python`
 or the interpreter set by `PB_CARDS_PYTHON`. Inter and Source Serif Pro
 must be available through fontconfig.
 
