@@ -52,6 +52,18 @@ def kind_for(url: str, ctype: str) -> str:
     return "html"
 
 
+def sniff_kind(kind: str, body: bytes) -> str:
+    """Trust file magic over a generic URL/content-type: PDFs/images served as octet-stream must not be parsed as HTML."""
+    if kind != "html" or not body:
+        return kind
+    head = body[:16].lstrip()
+    if head.startswith(b"%PDF-"):
+        return "pdf"
+    if head.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff")) or (head[:4] == b"RIFF" and head[8:12] == b"WEBP"):
+        return "image"
+    return kind
+
+
 def _accept(url: str) -> str:
     k = kind_for(url, "")
     return {"pdf": "application/pdf", "image": "image/*", "feed": "application/rss+xml,application/atom+xml,application/xml",
@@ -81,7 +93,7 @@ def fetch_page(svc: sqlite3.Connection, fetcher: Fetcher, url: str, site_source_
         prev = store.last_raw(svc, url)
     max_bytes = PDF_MAX if kind_for(url, "") == "pdf" else IMG_MAX if kind_for(url, "") == "image" else 4_000_000
     res: FetchResult = prefetched if prefetched is not None else fetcher.fetch(url, accept=_accept(url), max_bytes=max_bytes, now_iso=now)
-    kind = kind_for(res.final_url, res.content_type)
+    kind = sniff_kind(kind_for(res.final_url, res.content_type), res.body if res.outcome == "ok" else b"")
     method = {"feed": "feed", "sitemap": "structured", "pdf": "pdf", "image": "ocr"}.get(kind, "html")
     doc: Optional[parse.Doc] = None
     if res.outcome == "needs_render":
