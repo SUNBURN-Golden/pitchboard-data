@@ -5,13 +5,14 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import re
+import urllib.parse
 from typing import Dict, List, Optional, Tuple
 
 from ..collect.dates import find_dates
 from ..collect.parse import Doc, Link, Segment
 
 EXTRACTOR_VERSION = "pb-rules-7"   # 7: explicit submission-fee payment instructions can state a fee without an amount
-LABELER_VERSION = "pb-labels-3"    # 3: non-writing titles also block rules-only call creation, even without recruitment cues
+LABELER_VERSION = "pb-labels-4"    # 4: an open call needs writing context (title/heading/URL cue or a literary body); 3: non-writing titles block rules-only calls
 OCR_EXTRACTOR = "ocr:tesseract+rules"
 
 # Fields a Pitchboard call/outlet must eventually have; importance feeds gap priority.
@@ -228,6 +229,32 @@ def non_writing(text: str, writing_context: str = "") -> bool:
     return bool(NONWRITING_TYPE.search(text)
                 or (NONWRITING_DISC.search(text) and not WRITING_CUE.search(text))
                 or (NONWRITING_FINANCE.search(text) and not WRITING_CUE.search(text + " " + writing_context)))
+
+
+# A deadline plus "apply"/"now open"/"rolling basis" is not enough on its own: university, association and HR pages
+# (admissions, fellowships, political-science book nominations, "food pantry now open") carry the same cues. An open call
+# needs writing context: a writing/publishing word in the title, og:title, headings or URL path, or a body that is
+# clearly literary (>= WRITING_CONTEXT_MIN_BODY_CUES writing-word hits). Literary pages hit 25+; those pages hit 0-8.
+PUBLISHING_CUE = re.compile(r"(\bsubmissions?\b|\bstor(?:y|ies)\b|\bnovels?\b|\bbooks?\b|\bpublish\w*|\bantholog\w*|\bmagazines?\b|"
+                            r"\bzines?\b|\bchapbooks?\b|작가|출판|도서|그림책|투고|공모전)", re.I)
+WRITING_CONTEXT_MIN_BODY_CUES = 10
+
+
+def has_writing_context(doc: Doc) -> bool:
+    path = re.sub(r"[-_/.+]+", " ", urllib.parse.urlsplit(doc.canonical or "").path)
+    heads = [s.text for s in doc.segments if s.kind == "h"][:8] + sorted({s.heading for s in doc.segments if getattr(s, "heading", "")})[:8]
+    head = " ".join([doc.title, doc.meta.get("og:title", ""), path] + heads)
+    if WRITING_CUE.search(head) or PUBLISHING_CUE.search(head) or CALL_EN.search(head) or CALL_KO.search(head):
+        return True
+    # a call sentence that itself names writing ("2026 시 공모 ... 원고 응모", "call for submissions: poetry manuscripts")
+    if any(WRITING_CUE.search(s.text) and (CALL_EN.search(s.text) or CALL_KO.search(s.text)) for s in doc.segments):
+        return True
+    n = 0
+    for _ in WRITING_CUE.finditer(doc.text()):
+        n += 1
+        if n >= WRITING_CONTEXT_MIN_BODY_CUES:
+            return True
+    return False
 
 
 def writing_submission_context(doc: Doc) -> str:
@@ -503,8 +530,8 @@ def label_doc(doc: Doc, exts: List[Ext], today: dt.date, source_official: bool =
         if name == "recruitment":
             if results_primary:
                 status = "results_not_call"
-            elif page_nonwriting:
-                status = "not_writing_call"          # venue rental / hiring / admissions / other-discipline notice
+            elif page_nonwriting or not has_writing_context(doc):
+                status = "not_writing_call"          # venue rental / hiring / admissions / other-discipline notice / no writing context
             elif closes:
                 if closes[-1] >= today_s:
                     status, eligible = "current", True

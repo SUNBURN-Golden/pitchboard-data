@@ -34,6 +34,7 @@ class ReconcileTests(unittest.TestCase):
         sid = add_source(self.svc, "https://example.org/notice/%s" % self.sources, outlet=self.outlet)
         doc = Doc("html", segments=[Segment(0, "p", body, heading)])
         with patch.object(prof, "non_writing", return_value=False), \
+                patch.object(prof, "has_writing_context", return_value=True), \
                 patch.object(prof, "EXTRACTOR_VERSION", "synthetic-pre-gate"), \
                 patch.object(prof, "LABELER_VERSION", "synthetic-pre-gate"):
             rev = store.ensure_revision(self.svc, sid, "h1", [], NOW, prof.EXTRACTOR_VERSION)
