@@ -151,7 +151,8 @@ def fetch_page(svc: sqlite3.Connection, fetcher: Fetcher, url: str, site_source_
         change = "unchanged"
     else:
         change = "changed"
-    reextract = change == "unchanged" and (prev["extractor_version"] != EXECUTOR_VERSION or force_reextract)
+    reextract = change == "unchanged" and (prev["extractor_version"] != EXECUTOR_VERSION or force_reextract
+                                           or labels_stale(svc, page_source, text_hash))
     exts: List[prof.Ext] = []
     labels: List[prof.LabelResult] = []
     with transaction(svc):
@@ -169,6 +170,20 @@ def fetch_page(svc: sqlite3.Connection, fetcher: Fetcher, url: str, site_source_
         _breakage_checks(svc, infra, prev, rid, url, exts, doc, now)
     return PageResult(url, rid, "ok", change, base["kind"], doc=doc, exts=exts, labels=labels, requests=res.requests_used,
                       source_id=page_source, revision_id=revision_id, reextracted=reextract, ocr=ocr)
+
+
+def labels_stale(svc: sqlite3.Connection, source_id: Optional[str], text_hash: Optional[str]) -> bool:
+    """True when this exact source content was labeled before, but never by the current labeler.
+
+    EXECUTOR_VERSION does not track LABELER_VERSION, so an unchanged refetch would otherwise keep
+    an older labeler's open-call decision forever (bodies are not retained, so this refetch is the
+    only chance to relabel against the full page). Content that never produced labels is not stale.
+    """
+    if not source_id or not text_hash:
+        return False
+    rows = svc.execute("SELECT DISTINCT l.labeler_version FROM pb_label l JOIN pb_raw_ref r ON r.raw_id=l.raw_id "
+                       "WHERE r.source_id=? AND r.text_hash=? AND r.outcome='ok'", (source_id, text_hash)).fetchall()
+    return bool(rows) and prof.LABELER_VERSION not in {r[0] for r in rows}
 
 
 CORE = ("deadline.closes_on", "fee.submission", "compensation.rate", "rights.simultaneous", "policy.ai", "eligibility.region", "status.declared")
