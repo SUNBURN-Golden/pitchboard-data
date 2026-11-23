@@ -12,7 +12,7 @@ from ..collect.dates import find_dates
 from ..collect.parse import Doc, Link, Segment
 
 EXTRACTOR_VERSION = "pb-rules-7"   # 7: explicit submission-fee payment instructions can state a fee without an amount
-LABELER_VERSION = "pb-labels-4"    # 4: an open call needs writing context (title/heading/URL cue or a literary body); 3: non-writing titles block rules-only calls
+LABELER_VERSION = "pb-labels-5"    # 5: "review" alone does not make a literary body;  4: an open call needs writing context (title/heading/URL cue or a literary body); 3: non-writing titles block rules-only calls
 OCR_EXTRACTOR = "ocr:tesseract+rules"
 
 # Fields a Pitchboard call/outlet must eventually have; importance feeds gap priority.
@@ -238,6 +238,9 @@ def non_writing(text: str, writing_context: str = "") -> bool:
 PUBLISHING_CUE = re.compile(r"(\bsubmissions?\b|\bstor(?:y|ies)\b|\bnovels?\b|\bbooks?\b|\bpublish\w*|\bantholog\w*|\bmagazines?\b|"
                             r"\bzines?\b|\bchapbooks?\b|작가|출판|도서|그림책|투고|공모전)", re.I)
 WRITING_CONTEXT_MIN_BODY_CUES = 10
+# "review" is an everyday verb on admissions/HR/checklist pages ("Review your financial aid offer"), so it alone must not
+# add up to a literary body; heading/title cues above still count it.
+BODY_CUE_WEAK = re.compile(r"\breview(?:s|ed|ing)?\b", re.I)
 
 
 def has_writing_context(doc: Doc) -> bool:
@@ -250,7 +253,9 @@ def has_writing_context(doc: Doc) -> bool:
     if any(WRITING_CUE.search(s.text) and (CALL_EN.search(s.text) or CALL_KO.search(s.text)) for s in doc.segments):
         return True
     n = 0
-    for _ in WRITING_CUE.finditer(doc.text()):
+    for m in WRITING_CUE.finditer(doc.text()):
+        if BODY_CUE_WEAK.fullmatch(m.group(0)):
+            continue
         n += 1
         if n >= WRITING_CONTEXT_MIN_BODY_CUES:
             return True

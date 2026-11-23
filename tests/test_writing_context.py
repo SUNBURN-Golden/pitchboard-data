@@ -68,5 +68,18 @@ class WritingContextTests(unittest.TestCase):
         self.assertFalse(prof.has_writing_context(Doc("html", segments=[Segment(0, "p", "Deadline: December 15, 2026. Apply online.")])))
 
 
+
+class ReviewVerbIsNotLiteraryBodyTests(unittest.TestCase):
+    def test_admissions_checklist_with_review_verbs_is_not_writing_context(self):
+        body = " ".join("Review your financial aid offer." for _ in range(12))
+        doc = Doc("html", title="Admitted Student Checklist", segments=[Segment(0, "p", body)])
+        self.assertFalse(prof.has_writing_context(doc))
+
+    def test_review_does_not_hide_a_literary_body(self):
+        body = "Review. " + " ".join("Send your poems and short fiction manuscripts." for _ in range(6))
+        doc = Doc("html", title="Guidelines", segments=[Segment(0, "p", body)])
+        self.assertTrue(prof.has_writing_context(doc))
+
+
 if __name__ == "__main__":
     unittest.main()
