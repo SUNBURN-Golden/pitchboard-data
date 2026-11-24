@@ -45,7 +45,7 @@ No automatic fetching of social sites. A human drops `$ROOT/inbox/manual_clips/*
 
 ## SOCKS5 egress (zecbot)
 
-Daily collector jobs (`scripts/daily.sh`, `scripts/daemon_daily.sh`, and the DeepSeek shadow wrapper) set
+Daily collector jobs (`scripts/daily.sh`, `scripts/daemon_daily.sh`, and `scripts/llm_extract_shadow_daily.sh`) set
 `PITCHBOARD_SOCKS5_PROXY=socks5h://127.0.0.1:1080` and fail closed if that loopback proxy is down: the run is skipped
 and no fetch falls back to the box IP. DNS for those fetches is resolved by the proxy. LLM API calls
 (`api.deepseek.com` and, on DeepSeek failure only, `token-plan.maas.qwencloudapi.com` via
