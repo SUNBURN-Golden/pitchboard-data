@@ -343,12 +343,16 @@ def refresh_candidates(svc: sqlite3.Connection, now: str, horizon_hours: float =
     refresh_fresh_until is the soonest effective expiry requiring a refresh, or None
     for ordinary round-robin candidates. Prefer a fact source's canonical URL;
     when it has no ok raw, use that source's other ok raw URLs.
+
+    A live-call source whose latest content was labeled only by an older labeler counts as
+    expired now (refresh_fresh_until = now, label_stale = True): bodies are not kept, so a
+    refetch is the only way a labeler fix reaches calls that are already shown as open.
     """
     if horizon_hours < 0:
         raise ValueError("refresh horizon must be nonnegative")
     horizon = timeutil.iso(timeutil.parse_iso(now) + dt.timedelta(hours=horizon_hours))
-    rows = [dict(r, refresh_fresh_until=None) for r in svc.execute(
-        "SELECT url, source_id, depth, fetched_at AS last FROM ("
+    rows = [dict(r, refresh_fresh_until=None, label_stale=False) for r in svc.execute(
+        "SELECT url, source_id, depth, fetched_at AS last, text_hash FROM ("
         "SELECT r.*, row_number() OVER (PARTITION BY r.url ORDER BY r.fetched_at DESC, r.raw_id DESC) AS rn "
         "FROM pb_raw_ref r JOIN pb_source s USING(source_id) WHERE s.retired_reason IS NULL "
         "AND NOT EXISTS (SELECT 1 FROM pb_source retired WHERE retired.canonical_url=r.url AND retired.retired_reason IS NOT NULL) "
@@ -365,14 +369,18 @@ def refresh_candidates(svc: sqlite3.Connection, now: str, horizon_hours: float =
         "AND (f.predicate='status.declared' OR (f.predicate='deadline.closes_on' "
         "AND json_extract(f.value_json,'$.date')>=?))", (now[:10],)).fetchall()
     for f in live:
-        fresh_until = facts.effective_fresh_until(svc, f["fact_id"])
-        if fresh_until is None or fresh_until > horizon:
-            continue
         source_rows = by_source.get(f["source_id"], [])
         preferred = [r for r in source_rows if r["url"] == f["canonical_url"]] or source_rows
+        fresh_until = facts.effective_fresh_until(svc, f["fact_id"])
         for r in preferred:
-            if r["refresh_fresh_until"] is None or fresh_until < r["refresh_fresh_until"]:
-                r["refresh_fresh_until"] = fresh_until
+            due = fresh_until if fresh_until is not None and fresh_until <= horizon else None
+            if executor.labels_stale(svc, r["source_id"], r["text_hash"]):
+                r["label_stale"] = True
+                due = now if due is None else min(due, now)
+            if due is not None and (r["refresh_fresh_until"] is None or due < r["refresh_fresh_until"]):
+                r["refresh_fresh_until"] = due
+    for r in rows:
+        del r["text_hash"]
     return sorted(rows, key=lambda r: (0, r["refresh_fresh_until"], r["url"])
                   if r["refresh_fresh_until"] is not None else (1, r["last"], r["url"]))
 
@@ -392,9 +400,14 @@ def enqueue_refresh(ctx: Ctx, limit: Optional[int] = None, horizon_hours: Option
             continue
         closes = ctx.svc.execute("SELECT min(json_extract(value_json,'$.date')) d FROM pb_fact WHERE predicate='deadline.closes_on' AND superseded_at IS NULL AND subject_id IN "
                                  "(SELECT call_id FROM pb_call_edition WHERE outlet_id=(SELECT owner_outlet_id FROM pb_source WHERE source_id=?)) AND json_extract(value_json,'$.date')>=?", (r["source_id"], now[:10])).fetchone()["d"]
-        urgency = 1.0 if r["refresh_fresh_until"] is not None else scheduler.urgency_from_deadline(closes, now[:10])
+        if r["refresh_fresh_until"] is not None:
+            # A live open call is due (fact expiry or older-labeler label): lease it before discovery/backfill work,
+            # whose computed priorities (max 0.9) otherwise starve refresh jobs (max 0.285) for days.
+            prio = scheduler.LIVE_CALL_REFRESH_PRIORITY
+        else:
+            prio = scheduler.priority(novelty=0.1, urgency=scheduler.urgency_from_deadline(closes, now[:10]), quality=0.5, cost=0.2)
         if scheduler.enqueue(ctx.infra, "fetch_page", "freshness", {"url": r["url"], "site_source_id": owner["source_id"], "depth": r["depth"], "via": "refresh"},
-                             "fetch|%s|%s" % (r["url"], ctx.run_tag), scheduler.priority(novelty=0.1, urgency=urgency, quality=0.5, cost=0.2), now, depth=r["depth"]):
+                             "fetch|%s|%s" % (r["url"], ctx.run_tag), prio, now, depth=r["depth"]):
             n += 1
             if limit is not None and n >= limit:
                 break
