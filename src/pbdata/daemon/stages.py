@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import time
 from typing import Dict, List
 
 from .. import facts, timeutil
@@ -62,11 +63,13 @@ def s_incremental_fetch(c: RunContext) -> dict:
     cctx = _collector_ctx(c)
     out["refresh_jobs"] = collector.enqueue_refresh(cctx, limit=c.opts.get("refresh_limit"))
     before = cctx.fetcher.requests + cctx.api.calls
-    stats = collector.run(cctx, c.opts.get("max_jobs"), log=None if c.opts.get("quiet") else print)
+    stats = collector.run(cctx, c.opts.get("max_jobs"), log=None if c.opts.get("quiet") else print,
+                          time_budget_s=c.opts.get("fetch_budget_s"), monotonic=c.opts.get("monotonic", time.monotonic))
     used = cctx.fetcher.requests + cctx.api.calls - before
     c.ledger.charge("http_requests", used)
     out.update({"requests": used, "jobs_done": stats.get("jobs_done", 0), "pages_ok": stats.get("pages_ok", 0),
-                "facts": stats.get("facts", 0), "verified_facts": stats.get("verified_facts", 0)})
+                "facts": stats.get("facts", 0), "verified_facts": stats.get("verified_facts", 0),
+                "stopped_time_budget": bool(stats.get("stopped_time_budget"))})
     pending = c.infra.execute("SELECT count(*) FROM job WHERE state IN ('pending','retry_wait')").fetchone()[0]
     out["jobs_pending_after"] = pending
     return out

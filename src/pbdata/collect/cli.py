@@ -25,6 +25,7 @@ def main(argv=None) -> int:
     ap.add_argument("--no-seed", action="store_true", help="resume: do not enqueue discovery jobs")
     ap.add_argument("--caps", help='optional JSON request caps per lane, e.g. {"discovery":{"requests":150}}')
     ap.add_argument("--api-cap", type=int, help="maximum Wikimedia API calls (default: unlimited)")
+    ap.add_argument("--time-budget", type=float, help="wall-clock seconds for the job loop; unfinished jobs stay queued (default: unlimited)")
     ap.add_argument("--refresh-limit", type=int, help="maximum refresh jobs to enqueue (default: unlimited)")
     a = ap.parse_args(argv)
     os.environ["PB_DATA_ROOT"] = a.root
@@ -48,7 +49,7 @@ def main(argv=None) -> int:
             print("seeded discover jobs:", collector.seed_discovery(ctx))
         if a.cmd == "refresh":
             print("refresh jobs:", collector.enqueue_refresh(ctx, a.refresh_limit))
-        stats = collector.run(ctx, a.max_jobs)
+        stats = collector.run(ctx, a.max_jobs, time_budget_s=a.time_budget)
     print(json.dumps({"run_id": run_id, "stats": stats, "requests": ctx.fetcher.requests, "api_calls": ctx.api.calls}, indent=1))
     return 0
 

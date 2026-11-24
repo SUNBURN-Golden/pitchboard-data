@@ -7,6 +7,7 @@ import json
 import os
 import re
 import sqlite3
+import time
 from collections import deque
 from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -401,13 +402,23 @@ def enqueue_refresh(ctx: Ctx, limit: Optional[int] = None, horizon_hours: Option
 
 
 # ------------------------------------------------------------------ run loop
-def run(ctx: Ctx, max_jobs: Optional[int] = None, log=print) -> Dict[str, int]:
+def run(ctx: Ctx, max_jobs: Optional[int] = None, log=print, time_budget_s: Optional[float] = None,
+        monotonic: Callable[[], float] = time.monotonic) -> Dict[str, int]:
+    """Lease and run jobs until the queue is empty, max_jobs is reached, or time_budget_s (wall clock) is spent.
+    The budget is checked before each lease, so an in-flight job (bounded by per-request timeouts) finishes and
+    unleased jobs stay pending for the next run; the caller's locks are released on a normal return."""
+    deadline = monotonic() + time_budget_s if time_budget_s is not None else None
     now = ctx.clock()
     scheduler.requeue_expired(ctx.infra, "9999-01-01T00:00:00Z" if os.environ.get("PB_RESUME_FORCE") else now)
     crash_after = int(os.environ.get("PB_CRASH_AFTER_LEASE", "0")) or None
     done = leased = 0
     ctx.infra.execute("INSERT OR IGNORE INTO runs(run_id,started_at) VALUES(?,?)", (ctx.run_id, now))
     while max_jobs is None or done < max_jobs:
+        if deadline is not None and monotonic() >= deadline:
+            ctx.stats["stopped_time_budget"] = 1
+            if log:
+                log("[run] time budget of %ss spent after %d jobs; remaining jobs stay queued" % (time_budget_s, done))
+            break
         now = ctx.clock()
         day = _day(now)
         allowed = [lane for lane in LANES if ctx.request_caps.get(lane) is None

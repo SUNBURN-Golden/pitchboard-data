@@ -51,25 +51,35 @@ def atomic_json(path, value):
 
 
 @contextmanager
-def locks(directory, names, timeout=0):
-    """Wait at most timeout for a group of compatible exclusive flock locks."""
+def locks(directory, names, timeout=0, sleep=time.sleep):
+    """Wait at most timeout for a group of compatible exclusive flock locks, all or nothing.
+
+    Never holds part of the group while waiting: holding daily.lock while waiting for collector.lock made the
+    04:20 daily.sh (flock -n) skip its whole run. Each attempt tries every lock non-blocking and releases the
+    ones it got if any is busy."""
     directory.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + timeout
     handles = []
     try:
-        for name in names:
-            handle = (directory / (name + ".lock")).open("a")
-            handles.append(handle)
-            while True:
+        while True:
+            for name in names:
+                handle = (directory / (name + ".lock")).open("a")
                 try:
                     fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
                 except BlockingIOError:
-                    left = deadline - time.monotonic()
-                    if left <= 0:
-                        yield False
-                        return
-                    time.sleep(min(5, left))
+                    handle.close()
+                    break
+                handles.append(handle)
+            else:
+                break
+            for handle in reversed(handles):
+                handle.close()
+            handles = []
+            left = deadline - time.monotonic()
+            if left <= 0:
+                yield False
+                return
+            sleep(min(5, left))
         yield True
     finally:
         for handle in reversed(handles):
