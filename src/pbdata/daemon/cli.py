@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import sys
 import time
 
@@ -11,6 +12,10 @@ from .. import db, timeutil
 from . import questions
 from .runner import DaemonLock, Ledger, RunContext, StageRunner
 from .stages import STAGES
+
+# Wall-clock budget for stage 2 (incremental fetch / wiki discovery jobs). Without it one run crawled a whole site
+# frontier for 12h+ while holding collector.lock, so the 04:20 collector failed every day. Unfinished jobs stay queued.
+DEFAULT_FETCH_BUDGET_S = 90 * 60
 
 DEFAULT_TARGETS = os.path.join(os.path.dirname(__file__), "..", "..", "..", "config", "targets", "pitchboard.json")
 
@@ -20,6 +25,13 @@ def open_dbs(root):
         os.makedirs(os.path.join(root, d), mode=0o700, exist_ok=True)
     return (db.open_service(os.path.join(root, "service_db", "pitchboard_kg.sqlite3")),
             db.open_infra(os.path.join(root, "infra_db", "infra.sqlite3")))
+
+
+def _exit_on_sigterm():
+    """timeout(1)/kill send SIGTERM: unwind normally so open transactions roll back and both lock files are released."""
+    def handler(signum, frame):
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, handler)
 
 
 def main(argv=None) -> int:
@@ -32,6 +44,8 @@ def main(argv=None) -> int:
     ap.add_argument("--caps", help='optional JSON request caps per lane, e.g. {"discovery":{"requests":150}}')
     ap.add_argument("--api-cap", type=int, help="maximum Wikimedia API calls (default: unlimited)")
     ap.add_argument("--refresh-limit", type=int, help="maximum refresh jobs to enqueue (default: unlimited)")
+    ap.add_argument("--fetch-budget", type=float, default=float(os.environ.get("PB_DAEMON_FETCH_BUDGET_S", DEFAULT_FETCH_BUDGET_S)),
+                    help="wall-clock seconds for the incremental fetch stage (0 = unlimited; default %(default)s)")
     ap.add_argument("--offline", action="store_true", help="skip network stages (recompute/verify only)")
     a = ap.parse_args(argv)
     os.environ["PB_DATA_ROOT"] = a.root
@@ -54,8 +68,9 @@ def main(argv=None) -> int:
     run_id = a.run_id or "dmn_" + time.strftime("%Y%m%dT%H%M%S")
     caps = json.loads(a.caps) if a.caps else None
     opts = {"targets": json.load(open(a.targets)), "caps": caps, "max_jobs": a.max_jobs, "api_cap": a.api_cap,
-            "refresh_limit": a.refresh_limit, "offline": a.offline,
+            "refresh_limit": a.refresh_limit, "offline": a.offline, "fetch_budget_s": a.fetch_budget or None,
             "run_tag": run_id, "quiet": True}
+    _exit_on_sigterm()
     ledger = Ledger(infra, time.strftime("%Y-%m-%d"))
     ctx = RunContext(svc, infra, a.root, run_id, clock, ledger, opts)
     with DaemonLock(os.path.join(a.root, "locks", "daemon.lock")), DaemonLock(os.path.join(a.root, "locks", "collector.lock")):

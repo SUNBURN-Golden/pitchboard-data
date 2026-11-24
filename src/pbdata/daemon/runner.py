@@ -58,7 +58,7 @@ class RunContext:
     def __init__(self, svc, infra, root: str, run_id: str, clock: Callable[[], str], ledger: Ledger, opts: dict):
         self.svc, self.infra, self.root, self.run_id, self.clock, self.ledger, self.opts = svc, infra, root, run_id, clock, ledger, opts
         self.state: Dict[str, dict] = {}     # outputs of earlier stages in this run (reloaded from checkpoints on resume)
-        self.log: Callable[[str], None] = print
+        self.log: Callable[[str], None] = lambda line: print(line, flush=True)
 
 
 class StageRunner:

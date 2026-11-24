@@ -19,6 +19,7 @@ if ! python3 -m pbdata.collect.egress wait; then
   exit 0
 fi
 # resume anything left by a crashed run of today (same tag/run-id), then refresh, then metrics
-timeout 3h python3 -u -m pbdata.collect.cli run --root "$ROOT" --run-tag "d$TAG" --run-id "run_d$TAG" >> "$LOG" 2>&1 || echo "run exit $?" >> "$LOG"
-timeout 1h python3 -u -m pbdata.collect.cli refresh --root "$ROOT" --run-tag "f$TAG" >> "$LOG" 2>&1 || echo "refresh exit $?" >> "$LOG"
+# --time-budget stops leasing new jobs before the hard timeout, so the run ends cleanly (locks released, queue kept)
+timeout -k 60 3h python3 -u -m pbdata.collect.cli run --root "$ROOT" --run-tag "d$TAG" --run-id "run_d$TAG" --time-budget 9900 >> "$LOG" 2>&1 || echo "run exit $?" >> "$LOG"
+timeout -k 60 1h python3 -u -m pbdata.collect.cli refresh --root "$ROOT" --run-tag "f$TAG" --time-budget 3000 >> "$LOG" 2>&1 || echo "refresh exit $?" >> "$LOG"
 python3 -m pbdata.collect.cli metrics --root "$ROOT" > "$ROOT/exports/metrics_$TAG.json" 2>> "$LOG"
