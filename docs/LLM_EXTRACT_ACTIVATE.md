@@ -136,14 +136,38 @@ collector. Use a fresh metadata-only gap export. Inspect it with `--plan-only`
 before running the batch.
 
 ```sh
+PYTHONPATH=src python3 -B scripts/llm_extract_shadow_export.py \
+  --service-db /absolute/service_db/pitchboard_kg.sqlite3 \
+  --output /absolute/private/gaps.json --tmp-dir /absolute/private/tmp
+
 PYTHONPATH=src python3 -B scripts/llm_extract_shadow_batch.py \
   --config /absolute/private/llm_extract.json \
   --shadow-root /absolute/existing/shadow-root \
-  --gaps-json /absolute/private/gaps.json
+  --gaps-json /absolute/private/gaps.json --limit 40
 ```
 
-Keep the log and lock under `~/.local/state/pitchboard-llm-shadow`. Activation
-ends at `window_end_utc`. The private config controls renewal.
+`scripts/llm_extract_shadow_export.py` opens the service database read-only and
+writes only the metadata export. It does not change the source journal mode, does
+not touch collector or daemon locks, and stops if the copy cannot be taken
+consistently. A live WAL database is snapshotted with the SQLite backup API into
+a temporary rollback-journal file, then read with the existing snapshot adapter.
+
+The versioned daily wrapper is `scripts/llm_extract_shadow_daily.sh`. It waits
+for the loopback SOCKS5 proxy and skips the run if the proxy is down, refreshes
+the export, then runs the batch. Override `PB_SHADOW_LIMIT` to change the
+default 40-URL selection. It does not source `~/.config/pitchboard/env`; the
+extractor reads `DEEPSEEK_API_KEY` itself.
+
+The cron entry stays a lock around a thin ops wrapper:
+
+```sh
+15 6 * * * flock -n "$HOME/.local/state/pitchboard-llm-shadow/cron.lock" bash "$HOME/.local/state/pitchboard-llm-shadow/run_daily.sh" # pitchboard-llm-shadow
+```
+
+`run_daily.sh` only execs the versioned wrapper. Keep the log and lock under
+`~/.local/state/pitchboard-llm-shadow`. Activation ends at `window_end_utc`.
+The private window may span at most seven UTC days; renew it by starting at or
+after the previous `window_end_utc`. The private config controls renewal.
 
 ## Fetch and output policy
 

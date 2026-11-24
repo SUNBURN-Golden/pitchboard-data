@@ -139,6 +139,80 @@ class InputSafetyTests(unittest.TestCase):
         with self.assertRaisesRegex(common.Stop, "db_requires_export"):
             planner.read_db(p, NOW)
 
+    def _fixture_db(self, path, *, wal=False):
+        c = sqlite3.connect(path)
+        r = candidate()
+        c.executescript("""CREATE TABLE pb_gap(gap_id,subject_type,subject_id,predicate,scope_ref,state,gap_class,importance);
+        CREATE TABLE pb_call_edition(call_id,outlet_id);
+        CREATE TABLE pb_source(source_id,owner_outlet_id,owner_name,permission);
+        CREATE TABLE pb_outlet(outlet_id,canonical_name);
+        CREATE TABLE pb_raw_ref(raw_id,source_id,url,final_url,kind,outcome,http_status,content_hash,text_hash,fetched_at);
+        CREATE TABLE pb_extraction(raw_id,field,value_json);
+        CREATE TABLE pb_label(raw_id,label,status);""")
+        for table, keys in [("pb_gap", "gap_id subject_type subject_id predicate scope_ref state gap_class importance"),
+                            ("pb_source", "source_id owner_outlet_id owner_name permission"),
+                            ("pb_raw_ref", "raw_id source_id url final_url kind outcome http_status content_hash text_hash fetched_at")]:
+            keys = keys.split()
+            c.execute(f"INSERT INTO {table} VALUES({','.join('?' for _ in keys)})", [r[k] for k in keys])
+        c.execute("INSERT INTO pb_outlet VALUES('out_1','Example')")
+        c.execute("INSERT INTO pb_extraction VALUES('raw_1','signal.cue',?)", ('{"for":"fee.submission"}',))
+        c.commit()
+        if wal:
+            # journal_mode cannot change mid-transaction; WAL files appear after a later write.
+            self.assertEqual(c.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower(), "wal")
+            c.execute("INSERT INTO pb_call_edition VALUES('call_setup','out_1')")
+            c.commit()
+        return c, r
+
+    def test_write_gap_export_from_wal_does_not_write_source(self):
+        db = self.tmp_path / "fixture.sqlite"
+        tmp = self.tmp_path / "tmp"
+        tmp.mkdir()
+        out = self.tmp_path / "gaps.json"
+        conn, row = self._fixture_db(db, wal=True)
+        sources = [db, Path(str(db) + "-wal"), Path(str(db) + "-shm")]
+        self.assertTrue((self.tmp_path / "fixture.sqlite-wal").exists())
+        def snapshot():
+            return tuple((path.name, path.stat().st_size, path.stat().st_mtime_ns, path.read_bytes())
+                         for path in sources if path.exists())
+        before = snapshot()
+        data = planner.write_gap_export(db, out, NOW, tmp_dir=tmp)
+        self.assertEqual(before, snapshot())
+        self.assertEqual(data["schema"], planner.EXPORT_SCHEMA)
+        self.assertEqual(planner.plan(data), planner.plan(export(row)))
+        self.assertEqual(planner.read_json(out, NOW)["rows"], data["rows"])
+        self.assertEqual(out.stat().st_mode & 0o777, 0o600)
+        self.assertFalse(list(tmp.glob("pb-shadow-gaps-*")))
+        conn.close()
+
+    def test_write_gap_export_cli_and_daily_wrapper(self):
+        db = self.tmp_path / "fixture.sqlite"
+        conn, row = self._fixture_db(db)
+        conn.close()
+        out = self.tmp_path / "gaps.json"
+        script = Path(__file__).resolve().parents[1] / "scripts/llm_extract_shadow_export.py"
+        result = subprocess.run([sys.executable, "-B", str(script), "--service-db", str(db),
+                                 "--output", str(out), "--tmp-dir", str(self.tmp_path)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["outcome"], "ok")
+        self.assertEqual(payload["rows"], 1)
+        got = planner.read_json(out, common.utcnow())
+        self.assertEqual([item["gap_id"] for item in got["rows"]], [row["gap_id"]])
+        self.assertEqual(planner.plan({**got, "exported_at_utc": NOW.isoformat()})["targets"],
+                         planner.plan(export(row))["targets"])
+        daily = Path(__file__).resolve().parents[1] / "scripts/llm_extract_shadow_daily.sh"
+        syntax = subprocess.run(["bash", "-n", str(daily)], capture_output=True, text=True)
+        self.assertEqual(syntax.returncode, 0, syntax.stderr)
+        text = daily.read_text()
+        self.assertIn("scripts/llm_extract_shadow_export.py", text)
+        self.assertIn("scripts/llm_extract_shadow_batch.py", text)
+        self.assertIn("pbdata.collect.egress wait", text)
+        self.assertIn("PB_SHADOW_LIMIT:-40", text)
+        self.assertNotIn("daily.lock", text)
+        self.assertNotIn("collector.lock", text)
+
     def test_cli_disabled_and_plan_only(self):
         script = Path(__file__).resolve().parents[1] / "scripts/llm_extract_shadow_batch.py"
         p = self.tmp_path / "gaps.json"

@@ -6,8 +6,9 @@ from pathlib import Path
 import re
 import sqlite3
 import stat
+import tempfile
 
-from .common import Stop, digest, dumps, loads, no_symlinks, sqlite_snapshot, stamp
+from .common import Stop, digest, dumps, loads, no_symlinks, secure_open, sqlite_snapshot, stamp
 from .policy import canonical_url
 
 EXPORT_SCHEMA = "pb-shadow-gaps-1"
@@ -226,3 +227,83 @@ def plan(data, *, limit=None, history=(), config_hash=None):
         targets[r["url"]]["targets"].append(r)
     return {"schema": "pb-shadow-plan-1", "exported_at_utc": data["exported_at_utc"],
             "input_sha256": digest(dumps(data)), "targets": list(targets.values())[:limit], "reasons": dict(reasons)}
+
+
+def write_gap_export(service_db, output, now, *, tmp_dir=None, attempts=5):
+    """Write a metadata-only gap export without writing the service database.
+
+    The source is never opened by SQLite. If WAL or journal sidecars exist, the
+    whole file set is byte-copied into tmp_dir, then the copy is converted to a
+    rollback-journal snapshot and read with read_db. A changed fingerprint
+    during the copy is retried; persistent races stop with db_requires_export.
+    """
+    service_db = no_symlinks(service_db)
+    output = Path(os.path.abspath(output))
+    if any(part.is_symlink() for part in (output, *output.parents)):
+        raise Stop("unsafe_path")
+    folder = no_symlinks(tmp_dir) if tmp_dir is not None else no_symlinks(output.parent)
+    folder.mkdir(parents=True, exist_ok=True)
+    suffixes = ("", "-wal", "-shm", "-journal")
+    sources = [Path(str(service_db) + suffix) for suffix in suffixes]
+
+    def fingerprint():
+        rows = []
+        for path in sources:
+            if path.exists():
+                if path.is_symlink() or not path.is_file():
+                    raise Stop("unsafe_path")
+                info = path.stat()
+                rows.append((path.name, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns))
+            else:
+                rows.append((path.name, None))
+        return tuple(rows)
+
+    snapshot = None
+    last_error = "db_requires_export"
+    for _ in range(attempts):
+        fd, snapshot_name = tempfile.mkstemp(prefix="pb-shadow-gaps-", suffix=".sqlite3", dir=folder)
+        os.close(fd)
+        snapshot = Path(snapshot_name)
+        copied = [snapshot]
+        try:
+            os.chmod(snapshot, 0o600)
+            before = fingerprint()
+            if before[0][1] is None:
+                raise Stop("unsafe_path")
+            for source, suffix in zip(sources, suffixes):
+                if not source.exists():
+                    continue
+                target = Path(str(snapshot) + suffix) if suffix else snapshot
+                raw = _read_regular(source, 256_000_000, "gap_input_too_large")
+                if suffix:
+                    handle = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                    with os.fdopen(handle, "wb") as fh:
+                        fh.write(raw)
+                    copied.append(target)
+                else:
+                    snapshot.write_bytes(raw)
+                    os.chmod(snapshot, 0o600)
+            if fingerprint() != before:
+                raise Stop("db_requires_export")
+            # Convert the private copy only. Sidecars next to the source stay untouched.
+            dst = sqlite3.connect(snapshot)
+            try:
+                dst.execute("PRAGMA journal_mode=DELETE")
+                dst.commit()
+            finally:
+                dst.close()
+            data = read_db(snapshot, now)
+            with secure_open(output, "w") as fh:
+                fh.write(dumps(data) + "\n")
+            return data
+        except Stop as exc:
+            last_error = str(exc)
+            if last_error not in {"db_requires_export"}:
+                raise
+        finally:
+            for path in list(copied) + [Path(str(snapshot) + suffix) for suffix in suffixes]:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+    raise Stop(last_error)
