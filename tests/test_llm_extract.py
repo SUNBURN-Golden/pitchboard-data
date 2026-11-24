@@ -35,6 +35,7 @@ def page(url=URL, body=HTML):
 def proposal():
     return {
         "submission_fee": None,
+        "simultaneous": None,
         "open_call": {"value": {"is_real_call": True, "status": "open"}, "quote": QUOTE},
         "deadline": {"value": {"text": "December 1, 2026", "date": "2026-12-01", "timezone": None}, "quote": QUOTE},
         "pay": {"value": {"text": "USD 100 per story", "state": "paid", "amount_min": "100", "amount_max": "100",
@@ -622,7 +623,7 @@ class SchemaShapeTests(unittest.TestCase):
                         for field in expected_reasons:
                             self.assertIsNone(result[0][field])
                         if raw == proposal():
-                            self.assertTrue(all(result[0][f] is not None for f in schema.FIELDS[:-1]))
+                            self.assertTrue(all(result[0][f] is not None for f in schema.FIELDS if proposal()[f] is not None))
                         results.append(result)
                         self.assertEqual(schema.response(response, doc, "2026-11-05", config), result)
                     self.assertEqual(shape, {**expected_shape, **({"unwrapped_list": True} if wrapped else {})})
@@ -706,7 +707,7 @@ class SchemaShapeTests(unittest.TestCase):
         with self.assertRaisesRegex(Stop, "^invalid_schema$"):
             schema.validate(raw, page().doc(), "2026-11-05", schema_shape=shape)
         self.assertEqual(raw, before)
-        self.assertEqual(shape, shape_summary(missing=schema.FIELDS, extra=safe[:5], redacted=9, omitted=10))
+        self.assertEqual(shape, shape_summary(missing=schema.FIELDS, extra=safe[:10 - len(schema.FIELDS)], redacted=9, omitted=len(safe) - (10 - len(schema.FIELDS))))
         self.assertLessEqual(len(shape["missing"]) + len(shape["extra"]), 10)
         for value in (QUOTE, "nested", "looks_like_key"):
             self.assertNotIn(value, dumps(shape))
@@ -741,13 +742,13 @@ class SchemaShapeTests(unittest.TestCase):
         old_hash = digest(dumps({"version": schema.VERSION, "evidence_version": "verbatim-2.1",
                                  "value_keys": {k: sorted(v) for k, v in schema.VALUE_KEYS.items()}}))
         self.assertNotEqual(schema.SCHEMA_HASH, old_hash)
-        self.assertEqual(schema.PROMPT_HASH, "c82237cc2dafc1ba7c05826f2d9fd78e172f7bf185f05aaecbc82045a4f31331")
-        self.assertEqual(schema.VERSION, "pb-shadow-2")
+        self.assertEqual(schema.PROMPT_HASH, "6d3f511a279d2197669e79caa5bb1fae2a34c6588140bc4f518a4c5c2493bacd")
+        self.assertEqual(schema.VERSION, "pb-shadow-3")
 
     def test_hash_distinguishes_list_unwrapping_from_previous_shape_version(self):
-        old_hash = digest(dumps({"version": schema.VERSION, "evidence_version": "verbatim-2.1",
+        old_hash = digest(dumps({"version": "pb-shadow-2", "evidence_version": "verbatim-2.1",
                                  "shape_version": "missing-null-1",
-                                 "value_keys": {k: sorted(v) for k, v in schema.VALUE_KEYS.items()}}))
+                                 "value_keys": {k: sorted(v) for k, v in schema.VALUE_KEYS.items() if k != "simultaneous"}}))
         self.assertEqual(old_hash, "9c9d1f4c8e8759ef64e6a3060234d5978d8bcc553d9bd93b9f3b9e530661b7d3")
         self.assertNotEqual(schema.SCHEMA_HASH, old_hash)
 

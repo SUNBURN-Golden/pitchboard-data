@@ -14,8 +14,8 @@ from .policy import canonical_url
 EXPORT_SCHEMA = "pb-shadow-gaps-1"
 GAP_JSON_MAX = 64_000_000  # metadata-only; live service DBs already exceed the old 8 MiB cap
 PRIORITY = {p: i for i, p in enumerate(("fee.submission", "deadline.closes_on", "status.declared",
-            "compensation.rate", "eligibility.region", "eligibility.statement"))}
-STATIC = {"fee.submission", "compensation.rate", "eligibility.region", "eligibility.statement"}
+            "compensation.rate", "eligibility.region", "eligibility.statement", "rights.simultaneous"))}
+STATIC = {"fee.submission", "compensation.rate", "eligibility.region", "eligibility.statement", "rights.simultaneous"}
 
 
 def _read_regular(path, maximum, too_large):

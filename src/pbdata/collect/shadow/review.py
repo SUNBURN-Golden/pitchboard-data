@@ -5,7 +5,8 @@ from .common import digest, dumps, loads
 from ...model import EMAIL_RE, PHONE_RE
 
 PREDICATES = {"deadline": "deadline.closes_on", "pay": "compensation.rate",
-              "submission_fee": "fee.submission", "eligibility": "eligibility.statement", "open_call": "status.declared"}
+              "submission_fee": "fee.submission", "eligibility": "eligibility.statement", "open_call": "status.declared",
+              "simultaneous": "rights.simultaneous"}
 
 
 def clean(value):
@@ -59,6 +60,13 @@ def reviews(record):
                 reasons = ["partial_value"]
             elif values != [value["date"]]:
                 reasons = ["ambiguous_rules" if len(values) > 1 else "field_conflict"]
+        elif field == "simultaneous":
+            states = {e["value"].get("state") for e in exts}
+            rule_values = [e["value"] for e in exts]
+            if len(states) > 1:
+                reasons = ["ambiguous_rules"]
+            elif states and value["state"] not in states:
+                reasons = ["field_conflict"]
         elif field in ("pay", "submission_fee"):
             values = {monetary(e["value"]) for e in exts if e["value_state"] == "stated"}
             states = {e["value_state"] for e in exts}

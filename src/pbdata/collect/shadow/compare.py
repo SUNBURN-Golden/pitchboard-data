@@ -297,7 +297,7 @@ def score(items, rows):
                 raise Stop("prediction_text_mismatch")
             proposals = row.get("fields")
             validation = validator(row.get("schema", VERSION))
-            expected = set(FIELDS) - ({"submission_fee"} if row.get("schema") == "pb-shadow-1" else set())
+            expected = set(FIELDS) - {"pb-shadow-1": {"submission_fee", "simultaneous"}, "pb-shadow-2": {"simultaneous"}}.get(row.get("schema"), set())
             if not isinstance(proposals, dict) or set(proposals) != expected:
                 raise Stop("invalid_prediction_fields")
             try:
@@ -308,6 +308,7 @@ def score(items, rows):
                 raise Stop("invalid_prediction_fields") from None
             fields, reasons = validation(raw, item.page.doc(), item.as_of)
             fields.setdefault("submission_fee", None)
+            fields.setdefault("simultaneous", None)
             if reasons:
                 raise Stop("prediction_evidence_invalid")
         call = fields["open_call"]

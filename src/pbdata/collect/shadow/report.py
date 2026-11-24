@@ -184,11 +184,13 @@ def signature(field, value):
     if field in ("pay", "submission_fee"):
         state = value.get("state")
         return dumps([state, monetary(value)])
+    if field == "simultaneous":
+        return value.get("state")
     return value.get("text")
 
 
 def rule_signatures(field, rules):
-    predicate = {"deadline": "deadline.closes_on", "pay": "compensation.rate", "submission_fee": "fee.submission", "eligibility": "eligibility.statement"}[field]
+    predicate = {"deadline": "deadline.closes_on", "pay": "compensation.rate", "submission_fee": "fee.submission", "eligibility": "eligibility.statement", "simultaneous": "rights.simultaneous"}[field]
     result = set()
     for e in rules["extensions"]:
         if e["field"] != predicate:
@@ -320,7 +322,7 @@ def score_shadow(paths, root, now, config, *, gold_path=None, ledger_path=None, 
     extracted = {field: {model: [] for model in ("rules", "llm")} for field in FIELDS[1:]}
     coverage = {field: {"accepted": 0, "verified_pages": len(verified), "targeted_pages": 0, "accepted_targeted": 0} for field in FIELDS}
     predicates = {"open_call": {"status.declared"}, "deadline": {"deadline.closes_on"}, "pay": {"compensation.rate"},
-                  "submission_fee": {"fee.submission"}, "eligibility": {"eligibility.region", "eligibility.statement"}}
+                  "submission_fee": {"fee.submission"}, "simultaneous": {"rights.simultaneous"}, "eligibility": {"eligibility.region", "eligibility.statement"}}
     agreement, conflict_count, second_count, fills = [], 0, 0, Counter()
     strata = Counter()
     stratified_coverage = defaultdict(Counter)

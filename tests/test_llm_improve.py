@@ -35,7 +35,7 @@ class PlannerTests(unittest.TestCase):
     def test_plan_priority_dedup_exclusions_latest(self):
         rows = [candidate(), candidate(gap_id="gap_2", predicate="compensation.rate"),
                 candidate(gap_id="gap_3", url="https://example.net/deadline", predicate="deadline.closes_on"),
-                candidate(gap_id="gap_4", predicate="rights.simultaneous"),
+                candidate(gap_id="gap_4", predicate="policy.ai"),
                 candidate(gap_id="gap_5", owner_name="SOULBOUND", url="https://other.org/"),
                 candidate(gap_id="gap_6", url="https://instagram.com/a"),
                 candidate(gap_id="gap_7", owner_outlet_id=None),
@@ -330,7 +330,7 @@ class ValidationTests(unittest.TestCase):
         v = dict(is_real_call=True, status="open")
         self.assertIsNone(validate_one("open_call", v, "We are not currently open to submissions.")[0]["open_call"])
         self.assertIsNone(validate_one("open_call", dict(is_real_call=False, status="not_call"), "Submissions are open.")[0]["open_call"])
-        raw = proposal(); raw.pop("submission_fee")
+        raw = proposal(); raw.pop("submission_fee"); raw.pop("simultaneous")
         self.assertTrue(schema.validator("pb-shadow-1")(raw, page().doc(), "2026-11-05")[0]["pay"])
 
     def test_ambiguous_currency_does_not_infer_usd(self):
@@ -708,7 +708,7 @@ class CacheIdentityTests(Harness):
 class LegacyScoreTests(unittest.TestCase):
     def test_legacy_heldout_rows_remain_readable(self):
         from pbdata.collect.shadow import compare
-        raw = proposal(); raw.pop("submission_fee")
+        raw = proposal(); raw.pop("submission_fee"); raw.pop("simultaneous")
         fields, _ = schema.validator("pb-shadow-1")(raw, page().doc(), "2026-11-05")
         item = compare.Item("fixture", URL, "2026-11-05", page(), page().body_sha256,
                             common.digest(page().doc().text()), "en", runner.baseline(page().doc(), "2026-11-05"))
