@@ -18,6 +18,9 @@ BUDGET_CLASSES = ("backfill", "discovery", "freshness")
 MAX_ATTEMPTS = 3
 LEASE_SECONDS = 300
 WEIGHTS = dict(novelty=0.30, gap=0.25, urgency=0.20, quality=0.15, cost=0.10, duplication=0.15, failure=0.20)
+# Refetch of a source backing a live open call that is due (expired fact or older-labeler label). Above the
+# largest value priority() can return (sum of positive weights = 0.90), so it is leased before any other work.
+LIVE_CALL_REFRESH_PRIORITY = 1.0
 
 
 def priority(novelty=0.0, gap_importance=0.0, urgency=0.0, quality=0.0, cost=0.0, duplication=0.0, failures=0) -> float:

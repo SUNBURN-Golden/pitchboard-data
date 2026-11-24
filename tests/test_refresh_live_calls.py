@@ -14,6 +14,7 @@ from helpers import NOW, add_call, add_revision, add_source, service
 from pbdata import db, facts
 from pbdata.collect import collector, scheduler, store
 from pbdata.model import FactInput
+from pbdata.profiles import pitchboard as prof
 
 
 REFRESH_NOW = "2026-11-16T00:00:00Z"
@@ -73,7 +74,7 @@ class RefreshLiveCallsTests(unittest.TestCase):
         self.assertEqual(payload, {"url": self.url(live), "site_source_id": self.site, "depth": 1, "via": "refresh"})
         self.assertEqual(job["idem_key"], "fetch|%s|refresh" % self.url(live))
         self.assertEqual(job["budget_class"], "freshness")
-        self.assertEqual(job["priority"], scheduler.priority(novelty=.1, urgency=1, quality=.5, cost=.2))
+        self.assertEqual(job["priority"], scheduler.LIVE_CALL_REFRESH_PRIORITY)
 
     def test_closed_superseded_calls_past_deadlines_and_superseded_facts_not_prioritized(self):
         old = self.source("old", "2026-10-01T00:00:00Z")
@@ -170,6 +171,66 @@ class RefreshLiveCallsTests(unittest.TestCase):
         self.assertEqual(collector.enqueue_refresh(self.ctx, 1), 1)
         self.assertEqual(self.selected(), [self.url(live)])
         self.assertEqual(self.jobs()[0][0]["depth"], 2)
+
+    # ---- pb-labels bump must reach live calls: older-labeler content is due now, and due refreshes outrank discovery
+    def label(self, sid, version, url=None, text_hash="h1"):
+        rid = store.insert_raw(self.svc, REFRESH_NOW, source_id=sid, url=url or self.url(sid), kind="html", fetch_method="html",
+                               outcome="ok", change_state="new", depth=1, fetched_at=REFRESH_NOW, text_hash=text_hash)
+        store.put_labels(self.svc, rid, [prof.LabelResult("recruitment", "fact", "current", True, ["r"], [])], version, NOW)
+        return rid
+
+    def test_live_source_labeled_by_older_labeler_is_due_now(self):
+        old = self.source("old", "2026-10-01T00:00:00Z")
+        sid = self.source("relabel")
+        self.label(sid, "pb-labels-0")
+        self.fact(sid, fresh_until=FUTURE)
+        cands = collector.refresh_candidates(self.svc, REFRESH_NOW)
+        row = next(r for r in cands if r["url"] == self.url(sid))
+        self.assertTrue(row["label_stale"])
+        self.assertEqual(row["refresh_fresh_until"], REFRESH_NOW)
+        self.assertEqual(cands[0]["url"], self.url(sid))
+        self.assertNotIn("text_hash", row)
+        self.assertEqual(collector.enqueue_refresh(self.ctx, 1), 1)
+        self.assertEqual(self.selected(), [self.url(sid)])
+        self.assertEqual(self.jobs()[0][1]["priority"], scheduler.LIVE_CALL_REFRESH_PRIORITY)
+        self.assertNotIn(self.url(old), self.selected())
+
+    def test_current_labeler_or_unlabeled_content_is_not_due(self):
+        old = self.source("old", "2026-10-01T00:00:00Z")
+        cur = self.source("current")
+        self.label(cur, prof.LABELER_VERSION)
+        self.fact(cur, fresh_until=FUTURE)
+        self.fact(self.source("never-labeled"), fresh_until=FUTURE)
+        cands = collector.refresh_candidates(self.svc, REFRESH_NOW)
+        self.assertTrue(all(r["refresh_fresh_until"] is None and not r["label_stale"] for r in cands))
+        self.assertEqual(collector.enqueue_refresh(self.ctx, 1), 1)
+        self.assertEqual(self.selected(), [self.url(old)])
+        self.assertLess(self.jobs()[0][1]["priority"], scheduler.LIVE_CALL_REFRESH_PRIORITY)
+
+    def test_older_label_on_closed_call_source_is_not_due(self):
+        sid = self.source("closed")
+        self.label(sid, "pb-labels-0")
+        self.fact(sid, status="closed", fresh_until=FUTURE)
+        self.assertTrue(all(r["refresh_fresh_until"] is None for r in collector.refresh_candidates(self.svc, REFRESH_NOW)))
+
+    def test_stale_expiry_earlier_than_now_is_kept(self):
+        sid = self.source("both")
+        self.label(sid, "pb-labels-0")
+        self.fact(sid, fresh_until=STALE)
+        row = collector.refresh_candidates(self.svc, REFRESH_NOW)[0]
+        self.assertEqual((row["refresh_fresh_until"], row["label_stale"]), (STALE, True))
+
+    def test_due_refresh_is_leased_before_discovery_and_backfill(self):
+        sid = self.source("relabel")
+        self.label(sid, "pb-labels-0")
+        self.fact(sid, fresh_until=FUTURE)
+        top = scheduler.priority(novelty=1, gap_importance=1, urgency=1, quality=1)
+        for i, cls in enumerate(("discovery", "backfill")):
+            scheduler.enqueue(self.inf, "evaluate", cls, {"i": i}, "eval|%d" % i, top, "2026-11-01T00:00:00Z")
+        self.assertLess(top, scheduler.LIVE_CALL_REFRESH_PRIORITY)
+        collector.enqueue_refresh(self.ctx)
+        job = scheduler.lease_next(self.inf, REFRESH_NOW, list(scheduler.BUDGET_CLASSES))
+        self.assertEqual(json.loads(job["payload"]).get("url"), self.url(sid))
 
     def test_zero_limit(self):
         self.fact(self.source("live"))
