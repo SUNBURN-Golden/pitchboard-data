@@ -12,6 +12,7 @@ from .common import Stop, digest, dumps, loads, no_symlinks, secure_open, sqlite
 from .policy import canonical_url
 
 EXPORT_SCHEMA = "pb-shadow-gaps-1"
+GAP_JSON_MAX = 64_000_000  # metadata-only; live service DBs already exceed the old 8 MiB cap
 PRIORITY = {p: i for i, p in enumerate(("fee.submission", "deadline.closes_on", "status.declared",
             "compensation.rate", "eligibility.region", "eligibility.statement"))}
 STATIC = {"fee.submission", "compensation.rate", "eligibility.region", "eligibility.statement"}
@@ -43,7 +44,7 @@ def _read_regular(path, maximum, too_large):
 
 
 def read_json(path, now, *, allow_stale=False):
-    raw = _read_regular(path, 8_000_000, "gap_input_too_large")
+    raw = _read_regular(path, GAP_JSON_MAX, "gap_input_too_large")
     try:
         data = loads(raw)
         if not isinstance(data, dict) or set(data) != {"schema", "exported_at_utc", "rows"} or data["schema"] != EXPORT_SCHEMA:

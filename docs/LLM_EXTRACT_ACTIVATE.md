@@ -146,11 +146,12 @@ PYTHONPATH=src python3 -B scripts/llm_extract_shadow_batch.py \
   --gaps-json /absolute/private/gaps.json --limit 40
 ```
 
-`scripts/llm_extract_shadow_export.py` opens the service database read-only and
-writes only the metadata export. It does not change the source journal mode, does
-not touch collector or daemon locks, and stops if the copy cannot be taken
-consistently. A live WAL database is snapshotted with the SQLite backup API into
-a temporary rollback-journal file, then read with the existing snapshot adapter.
+`scripts/llm_extract_shadow_export.py` never opens the live service database in
+SQLite. It byte-copies the database and any WAL/SHM/journal sidecars into a
+private temporary snapshot, converts only that copy to rollback-journal format,
+and writes a metadata-only JSON export. Collector and daemon locks are not
+touched. A fingerprint change during the copy is retried, then stops. The JSON
+reader accepts exports up to 64 MiB.
 
 The versioned daily wrapper is `scripts/llm_extract_shadow_daily.sh`. It waits
 for the loopback SOCKS5 proxy and skips the run if the proxy is down, refreshes
