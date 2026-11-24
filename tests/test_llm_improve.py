@@ -210,6 +210,7 @@ class InputSafetyTests(unittest.TestCase):
         self.assertIn("scripts/llm_extract_shadow_batch.py", text)
         self.assertIn("pbdata.collect.egress wait", text)
         self.assertIn("PB_SHADOW_LIMIT:-40", text)
+        self.assertIn("chmod 0700", text)
         self.assertNotIn("daily.lock", text)
         self.assertNotIn("collector.lock", text)
 

@@ -26,6 +26,11 @@ export TMPDIR=$OPS/tmp
 
 cd "$REPO"
 
+# Box restores have left this experiment root at 0755; the runner requires 0700.
+if [ -d "$ROOT" ] && [ -O "$ROOT" ]; then
+  chmod 0700 "$ROOT"
+fi
+
 if ! python3 -m pbdata.collect.egress wait; then
   echo "$(date -Is) socks5 proxy unavailable; skipping shadow run"
   exit 0
