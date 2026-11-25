@@ -738,3 +738,36 @@ class ProjectMetadataTests(unittest.TestCase):
     def test_python_floor_supports_snapshot_fallback(self):
         pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
         self.assertIn('requires-python = ">=3.9"', pyproject)
+
+
+class OpenCallAuditTests(unittest.TestCase):
+    NC = dict(is_real_call=False, status="not_call")
+
+    def run_oc(self, value, quote, text, rejected):
+        from pbdata.collect.parse import Doc, Segment
+        raw = dict.fromkeys(schema.FIELDS)
+        raw["open_call"] = dict(value=value, quote=quote)
+        return schema.validate(raw, Doc("html", segments=[Segment(0, "p", text)]), "2026-11-05", rejected=rejected)
+
+    def test_not_call_accepted_on_page_without_writing_context(self):
+        q = "Graduate admissions are open for fall."
+        rej = {}
+        fields, reasons = self.run_oc(self.NC, q, q + " Tuition and housing information.", rej)
+        self.assertIsNotNone(fields["open_call"])
+        self.assertNotIn("open_call", reasons)
+        self.assertEqual(rej, {})
+
+    def test_not_call_still_rejected_on_writing_page_and_audited(self):
+        q = "Our magazine publishes short stories and novels."
+        text = " ".join([q] + ["Submit your story, poems and novels to our magazine."] * 12)
+        rej = {}
+        fields, reasons = self.run_oc(self.NC, q, text, rej)
+        self.assertIsNone(fields["open_call"])
+        self.assertEqual(reasons["open_call"], "unsupported_status")
+        self.assertEqual(rej["open_call"], {"value": self.NC, "quote": q, "reason": "unsupported_status"})
+
+    def test_quote_not_found_is_audited(self):
+        rej = {}
+        _, reasons = self.run_oc(self.NC, "missing quote", "Some other text", rej)
+        self.assertEqual(reasons["open_call"], "quote_not_found")
+        self.assertEqual(rej["open_call"]["reason"], "quote_not_found")
