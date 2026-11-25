@@ -49,6 +49,7 @@ def main(argv=None) -> int:
             print("seeded discover jobs:", collector.seed_discovery(ctx))
         if a.cmd == "refresh":
             print("refresh jobs:", collector.enqueue_refresh(ctx, a.refresh_limit))
+            print("retry jobs:", collector.enqueue_retries(ctx))
         stats = collector.run(ctx, a.max_jobs, time_budget_s=a.time_budget)
     print(json.dumps({"run_id": run_id, "stats": stats, "requests": ctx.fetcher.requests, "api_calls": ctx.api.calls}, indent=1))
     return 0
