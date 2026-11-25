@@ -127,7 +127,14 @@ def _shape_summary(raw, out):
     out["extra_omitted_count"] = len(safe) - len(out["extra"])
 
 
-def validate(raw, doc, as_of, *, schema_shape=None, fields=None):
+def _audit(value, quote):
+    # Bounded, already-validated shapes only (quote <= 280 chars; value strings <= 280).
+    return {"value": value, "quote": quote}
+
+
+def validate(raw, doc, as_of, *, schema_shape=None, fields=None, rejected=None):
+    """rejected: optional out-dict; receives {field: {value, quote, reason}} for every proposal whose
+    value/quote was well formed but failed evidence checks, so rejections stay auditable."""
     fields = FIELDS if fields is None else fields
     if schema_shape is not None:
         _shape_summary(raw, schema_shape)
@@ -161,6 +168,8 @@ def validate(raw, doc, as_of, *, schema_shape=None, fields=None):
                 start = segment.text.find(quote, start + 1)
         if not occurrences:
             reasons[field] = "cross_segment_quote" if quote in doc.text() else "quote_not_found"
+            if rejected is not None:
+                rejected[field] = dict(_audit(proposal["value"], quote), reason=reasons[field])
             continue
         if field == "deadline" and proposal["value"]["date"]:
             # No inferred year, even if a plausible normalized date was returned.
@@ -170,6 +179,8 @@ def validate(raw, doc, as_of, *, schema_shape=None, fields=None):
             reason = support_reason(field, proposal["value"], quote, doc, as_of)
         if reason:
             reasons[field] = reason
+            if rejected is not None:
+                rejected[field] = dict(_audit(proposal["value"], quote), reason=reason)
             continue
         idx, start = occurrences[0]
         result[field] = {**proposal, "segment_idx": idx, "start": start, "end": start + len(quote),
@@ -179,10 +190,14 @@ def validate(raw, doc, as_of, *, schema_shape=None, fields=None):
     if call and not call["value"]["is_real_call"]:
         for f in fields[1:]:
             if result[f] is not None:
+                if rejected is not None:
+                    rejected[f] = dict(_audit(result[f]["value"], result[f]["quote"]), reason="not_call")
                 result[f], reasons[f] = None, "not_call"
     elif call and call["value"]["status"] == "open" and result["deadline"]:
         date = result["deadline"]["value"]["date"]
         if date and date < as_of:
+            if rejected is not None:
+                rejected["open_call"] = dict(_audit(call["value"], call["quote"]), reason="past_deadline_conflict")
             result["open_call"], reasons["open_call"] = None, "past_deadline_conflict"
     return result, reasons
 
@@ -277,8 +292,15 @@ def support_reason(field, value, quote, doc, as_of):
             if not prof.status_cancel_match(quote):
                 return "unsupported_status"
         elif status == "not_call":
+            # A verbatim quote that itself asserts nothing call-like (no open/standing/call-for/submission/writing
+            # cue) grounds a not_call verdict. It never overrides rules: disagreements with a rules real call
+            # go to review_conflicts (second_opinion_required) instead of changing any live status.
+            call_like = (prof.OPEN_RE.search(quote) or prof.STANDING_RE.search(quote) or prof.CALL_EN.search(quote)
+                         or prof.CALL_KO.search(quote) or prof.PUBLISHING_CUE.search(quote)
+                         or prof.WRITING_CUE.search(quote) or prof.DEADLINE_CUE.search(quote))
             if not (re.search(r"winners? announced|results announced|not (?:a |an? )?(?:writing |submission )?call|수상작 발표|심사 결과", quote, re.I)
-                    or prof.non_writing(quote, prof.writing_submission_context(doc))):
+                    or prof.non_writing(quote, prof.writing_submission_context(doc))
+                    or not call_like):
                 return "unsupported_status"
         elif status in ("unknown", "upcoming"):
             return "unsupported_status"
@@ -387,7 +409,7 @@ def repair_body(body, prior, validation_error="invalid_schema"):
 
 
 def response(raw, doc, as_of, config, provider="deepseek", *, schema_shape=None, strict_repair=False,
-             capture_repair_candidate=False):
+             capture_repair_candidate=False, rejected=None):
     if schema_shape is not None:
         schema_shape.clear()
     allowed = QWEN_MODELS if provider == "qwen" else DEEPSEEK_MODELS
@@ -423,7 +445,7 @@ def response(raw, doc, as_of, config, provider="deepseek", *, schema_shape=None,
     if strict_repair and (not isinstance(content, dict) or content.keys() != set(FIELDS)):
         raise Stop("invalid_schema")
     try:
-        fields, reasons = validate(content, doc, as_of, schema_shape=schema_shape)
+        fields, reasons = validate(content, doc, as_of, schema_shape=schema_shape, rejected=rejected)
     except Stop as exc:
         if not strict_repair and str(exc) == "invalid_schema" and (
                 capture_repair_candidate or (isinstance(content, dict) and set(FIELDS) - content.keys()) or

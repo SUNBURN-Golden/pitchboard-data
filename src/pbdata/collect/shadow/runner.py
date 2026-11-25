@@ -190,7 +190,7 @@ class ShadowRunner:
                           "provider": "deepseek", "provider_calls": 0, "calls": [], "fallback_from": None,
                           "repair_attempted": False, "repair_outcome": None,
                           "reserved_usd": "0", "charged_ceiling_usd": "0", "usage": None,
-                          "fields": None, "validation_reasons": {}, "schema_shape": {}, "outcome": "unknown"}
+                          "fields": None, "validation_reasons": {}, "rejected_candidates": {}, "schema_shape": {}, "outcome": "unknown"}
                 start = time.monotonic()
                 primary = transport or provider
                 # Custom transports stay primary-only unless a fallback is injected.
@@ -219,7 +219,8 @@ class ShadowRunner:
                     dispatch = self._dispatch_time(config, day, now)
                     raw = invoke(primary, body, key, "deepseek", dispatch, phase="primary")
                     fields, reasons, usage = response(raw, doc, as_of, config,
-                                                     schema_shape=record["schema_shape"])
+                                                     schema_shape=record["schema_shape"],
+                                                     rejected=record["rejected_candidates"])
                     record.update(fields=fields, validation_reasons=reasons, usage=usage,
                                   returned_model=raw["model"], outcome="ok", provider="deepseek")
                 except Stop as exc:
@@ -242,7 +243,8 @@ class ShadowRunner:
                             dispatch = self._dispatch_time(config, day, now)
                             raw = invoke(fb_transport, qwen_body, fb_key, "qwen", dispatch, phase="fallback")
                             fields, reasons, usage = response(raw, doc, as_of, config, provider="qwen",
-                                                             schema_shape=record["schema_shape"])
+                                                             schema_shape=record["schema_shape"],
+                                                              rejected=record["rejected_candidates"])
                             record.update(fields=fields, validation_reasons=reasons, usage=usage,
                                           returned_model=raw["model"], outcome="ok")
                         except Stop as exc:
@@ -285,7 +287,8 @@ class ShadowRunner:
                         else:
                             try:
                                 fields, reasons, usage = response(raw, doc, as_of, config,
-                                                                  provider=record["provider"], strict_repair=True)
+                                                                  provider=record["provider"], strict_repair=True,
+                                                                  rejected=record["rejected_candidates"])
                                 record.update(fields=fields, validation_reasons=reasons, usage=usage,
                                               returned_model=raw["model"], outcome="ok", repair_outcome="ok")
                             except Stop as exc:
