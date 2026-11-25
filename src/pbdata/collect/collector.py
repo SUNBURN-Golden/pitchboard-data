@@ -145,7 +145,7 @@ def _site_page_count(ctx, site_source_id: str) -> int:
 def h_fetch_page(ctx: Ctx, p: dict, job) -> dict:
     now = ctx.clock()
     url, site_id, depth = normalize_url(p["url"]), p["site_source_id"], p.get("depth", 1)
-    if (ctx.site_page_cap is not None and p.get("via") not in ("trial", "refresh", "gap")
+    if (ctx.site_page_cap is not None and p.get("via") not in ("trial", "refresh", "gap", "retry")
             and _site_page_count(ctx, site_id) >= ctx.site_page_cap):
         return {"skipped": "site_page_cap"}
     site = store.site_row(ctx.svc, site_id)
@@ -410,6 +410,65 @@ def enqueue_refresh(ctx: Ctx, limit: Optional[int] = None, horizon_hours: Option
                              "fetch|%s|%s" % (r["url"], ctx.run_tag), prio, now, depth=r["depth"]):
             n += 1
             if limit is not None and n >= limit:
+                break
+    return n
+
+
+# A first fetch that failed for a network reason (proxy/DNS hiccup, reset, timeout, 5xx, robots.txt
+# unreachable) was never tried again: refresh only revisits URLs with an ok raw, so the page stayed
+# "never fetched" for good (2026-11-26: 361 of 464 never-fetched sources had one URLError from the
+# 11-20..11-23 proxy outages; 12/12 sampled fetched ok on retry). Deterministic failures (robots
+# disallow, 4xx, login walls, challenges, binary media, encoding bugs) are not retried.
+RETRY_ERROR_CLASSES = ("URLError", "RemoteDisconnected", "robots_unreachable", "ConnectionResetError",
+                       "ConnectionRefusedError", "ConnectionAbortedError", "TimeoutError", "OSError", "IncompleteRead")
+RETRY_MAX_FAILURES = 3          # give up after this many transient failures (with no success) per URL
+RETRY_BACKOFF_HOURS = 24        # wait 24h after the 1st failure, 48h after the 2nd
+RETRY_PRIORITY = 0.4            # above discovery/backfill work (<= ~0.37 in practice), below live-call refresh (1.0)
+
+
+def retry_candidates(svc: sqlite3.Connection, now: str) -> List[dict]:
+    """Active sources never fetched ok whose failures were all transient, due by exponential backoff.
+
+    One row per URL (the source's own failed URLs), oldest last attempt first."""
+    rows = svc.execute(
+        "SELECT r.url, r.source_id, max(r.depth) AS depth, count(*) AS failures, max(r.fetched_at) AS last, "
+        "sum(CASE WHEN r.outcome IN ('timeout','server_error') OR (r.outcome='error' AND r.error_class IN (%s)) "
+        "THEN 0 ELSE 1 END) AS permanent "
+        "FROM pb_raw_ref r JOIN pb_source s USING(source_id) "
+        "WHERE s.retired_reason IS NULL AND s.last_success_at IS NULL AND s.source_type<>'manual_clip' "
+        "AND s.permission IN ('allowed_public','allowed_conditional') "
+        "AND NOT EXISTS (SELECT 1 FROM pb_raw_ref ok WHERE ok.source_id=s.source_id AND ok.outcome='ok') "
+        "GROUP BY r.url, r.source_id ORDER BY last, r.url" % ",".join("?" * len(RETRY_ERROR_CLASSES)),
+        RETRY_ERROR_CLASSES).fetchall()
+    t_now = timeutil.parse_iso(now)
+    out = []
+    for r in rows:
+        if r["permanent"] or r["failures"] >= RETRY_MAX_FAILURES:
+            continue
+        due = timeutil.parse_iso(r["last"]) + dt.timedelta(hours=RETRY_BACKOFF_HOURS * 2 ** (r["failures"] - 1))
+        if due <= t_now:
+            out.append({"url": r["url"], "source_id": r["source_id"], "depth": r["depth"], "failures": r["failures"], "last": r["last"]})
+    return out
+
+
+def enqueue_retries(ctx: Ctx, limit: Optional[int] = None) -> int:
+    """Queue a fresh attempt for transiently failed first fetches (see retry_candidates)."""
+    if limit is None:
+        limit = int(os.environ.get("PB_RETRY_FAILED_LIMIT", "150"))
+    if limit <= 0:
+        return 0
+    now = ctx.clock()
+    n = 0
+    for r in retry_candidates(ctx.svc, now):
+        owner = ctx.svc.execute("SELECT ss.source_id FROM pb_source s JOIN pb_source_site ss ON ss.outlet_id=s.owner_outlet_id "
+                                "WHERE s.source_id=? ORDER BY ss.source_id LIMIT 1", (r["source_id"],)).fetchone()
+        if not owner:
+            continue
+        if scheduler.enqueue(ctx.infra, "fetch_page", "freshness",
+                             {"url": r["url"], "site_source_id": owner["source_id"], "depth": r["depth"], "via": "retry"},
+                             "retry|%s|%d" % (r["url"], r["failures"]), RETRY_PRIORITY, now, depth=r["depth"]):
+            n += 1
+            if n >= limit:
                 break
     return n
 
