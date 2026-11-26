@@ -10,12 +10,34 @@ import time
 
 from .. import db, timeutil
 from . import questions
+from ..collect.scheduler import wait_until_free
 from .runner import DaemonLock, Ledger, RunContext, StageRunner
 from .stages import STAGES
 
 # Wall-clock budget for stage 2 (incremental fetch / wiki discovery jobs). Without it one run crawled a whole site
 # frontier for 12h+ while holding collector.lock, so the 04:20 collector failed every day. Unfinished jobs stay queued.
 DEFAULT_FETCH_BUDGET_S = 90 * 60
+
+# The daemon waits (instead of failing) while daily.sh holds daily.lock or another run holds daemon/collector.lock,
+# and its fetch stage stops leasing before the next 04:20 daily window, so a manual or late run never holds
+# collector.lock when the 04:20 collector starts (2026-11-26: a run started 11-25 22:24 KST held it until 07:34).
+DEFAULT_LOCK_WAIT_S = 4 * 3600
+DAILY_WINDOW = os.environ.get("PB_DAILY_WINDOW", "04:20")            # box-local time daily.sh starts (crontab)
+WINDOW_MARGIN_S = float(os.environ.get("PB_DAEMON_WINDOW_MARGIN_MIN", "30")) * 60
+
+
+def next_window_stop(now: float, window: str = None, margin_s: float = None) -> float:
+    """Epoch seconds at which the fetch stage must stop leasing: margin_s before the next daily window start.
+    Between (window - margin) and window this is in the past, so the fetch stage leases nothing."""
+    window = window or DAILY_WINDOW
+    margin_s = WINDOW_MARGIN_S if margin_s is None else margin_s
+    hh, mm = (int(x) for x in window.split(":"))
+    lt = time.localtime(now)
+    start = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, hh, mm, 0, 0, 0, -1))
+    if start <= now:
+        lt2 = time.localtime(now + 86400)
+        start = time.mktime((lt2.tm_year, lt2.tm_mon, lt2.tm_mday, hh, mm, 0, 0, 0, -1))
+    return start - margin_s
 
 DEFAULT_TARGETS = os.path.join(os.path.dirname(__file__), "..", "..", "..", "config", "targets", "pitchboard.json")
 
@@ -47,6 +69,9 @@ def main(argv=None) -> int:
     ap.add_argument("--fetch-budget", type=float, default=float(os.environ.get("PB_DAEMON_FETCH_BUDGET_S", DEFAULT_FETCH_BUDGET_S)),
                     help="wall-clock seconds for the incremental fetch stage (0 = unlimited; default %(default)s)")
     ap.add_argument("--offline", action="store_true", help="skip network stages (recompute/verify only)")
+    ap.add_argument("--lock-wait", type=float, default=float(os.environ.get("PB_DAEMON_LOCK_WAIT_S", DEFAULT_LOCK_WAIT_S)),
+                    help="seconds to wait for daily.lock / daemon.lock / collector.lock (default %(default)s)")
+    ap.add_argument("--no-window-stop", action="store_true", help="do not stop the fetch stage before the 04:20 daily window")
     a = ap.parse_args(argv)
     os.environ["PB_DATA_ROOT"] = a.root
     svc, infra = open_dbs(a.root)
@@ -71,9 +96,17 @@ def main(argv=None) -> int:
             "refresh_limit": a.refresh_limit, "offline": a.offline, "fetch_budget_s": a.fetch_budget or None,
             "run_tag": run_id, "quiet": True}
     _exit_on_sigterm()
-    ledger = Ledger(infra, time.strftime("%Y-%m-%d"))
-    ctx = RunContext(svc, infra, a.root, run_id, clock, ledger, opts)
-    with DaemonLock(os.path.join(a.root, "locks", "daemon.lock")), DaemonLock(os.path.join(a.root, "locks", "collector.lock")):
+    locks = os.path.join(a.root, "locks")
+    t0 = time.time()
+    if not wait_until_free(os.path.join(locks, "daily.lock"), a.lock_wait):
+        print("daily.lock still held after %ds; daemon not started" % a.lock_wait, file=sys.stderr)
+        return 3
+    left = max(0.0, a.lock_wait - (time.time() - t0))
+    with DaemonLock(os.path.join(locks, "daemon.lock"), left), DaemonLock(os.path.join(locks, "collector.lock"), left):
+        if not a.no_window_stop:
+            opts["stop_at"] = next_window_stop(time.time())
+        ledger = Ledger(infra, time.strftime("%Y-%m-%d"))
+        ctx = RunContext(svc, infra, a.root, run_id, clock, ledger, opts)
         rep = StageRunner(ctx, STAGES).run()
     rep["state"] = {k: v for k, v in ctx.state.items()}
     print(json.dumps(rep, ensure_ascii=False, indent=1, default=str))

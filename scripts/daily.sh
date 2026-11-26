@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Daily Pitchboard collector run (cron). Data root outside the repo.
 set -euo pipefail
+# The whole body is a function so bash parses it before running: the git pull below can rewrite this file
+# mid-run, and bash reads scripts incrementally (2026-11-24: "bdata.collect.cli: command not found").
+main() {
 REPO=${PB_REPO:-/workspace/pitchboard-data-main}
 ROOT=${PB_DATA_ROOT:-/workspace/pitchboard/data-root}
 TAG=$(date +%Y%m%d)
@@ -20,6 +23,12 @@ if ! python3 -m pbdata.collect.egress wait; then
 fi
 # resume anything left by a crashed run of today (same tag/run-id), then refresh, then metrics
 # --time-budget stops leasing new jobs before the hard timeout, so the run ends cleanly (locks released, queue kept)
-timeout -k 60 3h python3 -u -m pbdata.collect.cli run --root "$ROOT" --run-tag "d$TAG" --run-id "run_d$TAG" --time-budget 9900 >> "$LOG" 2>&1 || echo "run exit $?" >> "$LOG"
-timeout -k 60 1h python3 -u -m pbdata.collect.cli refresh --root "$ROOT" --run-tag "f$TAG" --time-budget 3000 >> "$LOG" 2>&1 || echo "refresh exit $?" >> "$LOG"
+# --lock-wait waits for a daemon still holding collector.lock (the daemon stops leasing 30 min before 04:20); the wait
+# is not part of --time-budget, and the outer timeout covers wait + budget.
+timeout -k 60 4h python3 -u -m pbdata.collect.cli run --root "$ROOT" --run-tag "d$TAG" --run-id "run_d$TAG" --time-budget 9900 --lock-wait 3600 >> "$LOG" 2>&1 || echo "run exit $?" >> "$LOG"
+# refresh leases freshness jobs only (live-call pages first, then oldest fetch)
+timeout -k 60 2h python3 -u -m pbdata.collect.cli refresh --root "$ROOT" --run-tag "f$TAG" --time-budget 3000 --lock-wait 3600 >> "$LOG" 2>&1 || echo "refresh exit $?" >> "$LOG"
 python3 -m pbdata.collect.cli metrics --root "$ROOT" > "$ROOT/exports/metrics_$TAG.json" 2>> "$LOG"
+}
+main "$@"
+exit

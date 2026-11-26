@@ -65,7 +65,8 @@ def s_incremental_fetch(c: RunContext) -> dict:
     out["retry_jobs"] = collector.enqueue_retries(cctx)
     before = cctx.fetcher.requests + cctx.api.calls
     stats = collector.run(cctx, c.opts.get("max_jobs"), log=None if c.opts.get("quiet") else print,
-                          time_budget_s=c.opts.get("fetch_budget_s"), monotonic=c.opts.get("monotonic", time.monotonic))
+                          time_budget_s=c.opts.get("fetch_budget_s"), monotonic=c.opts.get("monotonic", time.time),
+                          stop_at=c.opts.get("stop_at"))
     used = cctx.fetcher.requests + cctx.api.calls - before
     c.ledger.charge("http_requests", used)
     out.update({"requests": used, "jobs_done": stats.get("jobs_done", 0), "pages_ok": stats.get("pages_ok", 0),

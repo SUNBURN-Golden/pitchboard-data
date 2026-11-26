@@ -20,15 +20,13 @@ class NonRetryable(Exception):
 
 
 class DaemonLock:
-    def __init__(self, path: str):
-        self.path, self.fh = path, None
+    def __init__(self, path: str, wait_s: float = 0):
+        self.path, self.fh, self.wait_s = path, None, wait_s
 
     def __enter__(self):
-        self.fh = open(self.path, "a+")
-        try:
-            fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            self.fh.close()
+        from ..collect.scheduler import acquire_flock
+        self.fh = acquire_flock(self.path, self.wait_s)
+        if self.fh is None:
             raise RuntimeError("another daemon run holds " + self.path)
         return self
 

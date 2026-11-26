@@ -13,6 +13,20 @@ Rules: newer `status.declared` evidence moves a call to cancelled/closed/reopene
 
 Scheduling: cron `30 5 * * * scripts/daemon_daily.sh` (renewal of public approvals due in 48h, then one run), after the 04:20 collector `daily.sh`.
 
+### Sharing the queue with the daily collector (2026-11-26)
+
+- `pbdata.daemon run` waits (up to `PB_DAEMON_LOCK_WAIT_S`, default 4h) while `daily.lock` is held and for
+  `daemon.lock`/`collector.lock`, instead of failing. Its fetch stage stops leasing at `PB_DAILY_WINDOW` (04:20)
+  minus `PB_DAEMON_WINDOW_MARGIN_MIN` (30), so a manual or late run is out of `collector.lock` before 04:20.
+  `--no-window-stop` disables that for a supervised drain.
+- Budgets are wall-clock (`time.time`): the box can be frozen, and a monotonic budget then stretches over hours.
+  Wikimedia API calls also stop at the deadline, so a long discovery job ends with what it found.
+- Queued copies of the same work (same URL, target+strategy, candidate) collapse to one at the start of every run
+  (`job.result = {"superseded_by": ...}`), and refresh/retry/discovery seeding skips work that is already queued.
+- Every 2nd lease prefers the freshness lane (`PB_FRESHNESS_EVERY`, 0 = pure priority). `collect.cli refresh` leases
+  freshness jobs only. `--lock-wait` makes the collector wait for `collector.lock` outside its `--time-budget`.
+- `daily.sh` and `daemon_daily.sh` are wrapped in `main()` so a mid-run `git pull` cannot change the running script.
+
 ## Caps removed 2026-11-20
 
 `src/pbdata/daemon/{cli,stages}.py` uses unlimited job, API, lane request, and

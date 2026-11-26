@@ -233,6 +233,10 @@ class E2E(unittest.TestCase):
                        "refresh_fresh_until": None} for i in range(45)]
         with patch.object(collector, "refresh_candidates", return_value=candidates):
             self.assertEqual(collector.enqueue_refresh(self.ctx("all")), 45)
+            # a later run does not queue a second copy of a URL that is still queued (any run tag)
+            self.assertEqual(collector.enqueue_refresh(self.ctx("again")), 0)
+        more = [dict(c, url=c["url"] + "?b") for c in candidates]
+        with patch.object(collector, "refresh_candidates", return_value=more):
             self.assertEqual(collector.enqueue_refresh(self.ctx("limited"), limit=3), 3)
 
     def test_resume_after_crash(self):
