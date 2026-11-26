@@ -599,6 +599,25 @@ class BatchIntegrationTests(Harness):
         self.assertEqual(len(fetched), 1)
         self.assertEqual(self.calls, [])
 
+    def test_retry_stops_when_config_changes_during_outage_wait(self):
+        plan = planner.plan(export(*(candidate(gap_id=f"gap_{i}", url=f"https://example.org/{i}") for i in range(2))),
+                            limit=2)
+        fetched = []
+        def flip_config():
+            self.config["timeout_seconds"] = 29  # a different but still valid config
+            self.write_config()
+        with patch.object(runner.PolicyFetcher, "fetch", side_effect=self._fetch_failing_first(fetched)), \
+                patch.object(batch.socks_egress, "configured_proxy", return_value=("127.0.0.1", 1080)), \
+                patch.object(batch.socks_egress, "preflight", side_effect=ConnectionRefusedError()):
+            rows = batch.execute(runner.ShadowRunner(self.config_path, clock=lambda: NOW), self.root, plan,
+                                 key_loader=lambda: KEY, transport=self.transport, proxy_wait=flip_config)
+        # The wait can outlive a config change; the retry is a fresh dispatch and
+        # must honour the batch's config gate instead of recording an attempt
+        # (and spending a provider call) under the superseded configuration.
+        self.assertEqual([r.get("reason") for r in rows], ["fetch_error", "config_changed"])
+        self.assertEqual(len(fetched), 1)
+        self.assertEqual(self.calls, [])
+
     def test_site_fetch_error_with_healthy_proxy_continues_without_retry(self):
         plan = planner.plan(export(*(candidate(gap_id=f"gap_{i}", url=f"https://example.org/{i}") for i in range(2))),
                             limit=2)
@@ -611,6 +630,22 @@ class BatchIntegrationTests(Harness):
                                  proxy_wait=lambda: self.fail("no wait when proxy is up"))
         self.assertEqual([r.get("reason") or r["outcome"] for r in rows], ["fetch_error", "ok"])
         self.assertEqual(len(fetched), 2)
+
+    def test_fetch_error_without_proxy_keeps_batch_behaviour(self):
+        plan = planner.plan(export(*(candidate(gap_id=f"gap_{i}", url=f"https://example.org/{i}") for i in range(2))),
+                            limit=2)
+        fetched = []
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(batch.socks_egress.ENV_PROXY, None)
+            with patch.object(runner.PolicyFetcher, "fetch", side_effect=self._fetch_failing_first(fetched)), \
+                    patch.object(batch.socks_egress, "preflight", side_effect=AssertionError("preflight")), \
+                    patch.object(batch.socks_egress, "wait_for_proxy", side_effect=AssertionError("wait")):
+                rows = batch.execute(runner.ShadowRunner(self.config_path, clock=lambda: NOW), self.root, plan,
+                                     key_loader=lambda: KEY, transport=self.transport,
+                                     proxy_wait=lambda: self.fail("no outage handling without proxy"))
+        self.assertEqual([r.get("reason") or r["outcome"] for r in rows], ["fetch_error", "ok"])
+        self.assertEqual(len(fetched), 2)
+        self.assertEqual(len(self.calls), 1)
 
     def test_key_in_plan_stops_before_persisting(self):
         plan = planner.plan(export(candidate(owner_name=KEY)))

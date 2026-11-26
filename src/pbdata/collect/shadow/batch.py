@@ -83,6 +83,13 @@ def execute(runner, root, plan, *, digest_languages=(), proxy_wait=None, **run_o
                 results.append({"outcome": "skipped", "reason": "proxy_unavailable"})
                 break
             if outage is True:
+                # The outage wait can outlive a config change. A retry is a fresh
+                # dispatch, so it must pass the same gate as the next target or
+                # it would record an attempt under a config the batch rejects.
+                if load_config(runner.config_path, runner.clock()) != config:
+                    results.append(result)
+                    results.append({"outcome": "skipped", "reason": "config_changed"})
+                    break
                 # Halts set while the proxy was down are not the site's fault.
                 fetcher.halted.clear()
                 fetcher.halted.update(halted_before)
