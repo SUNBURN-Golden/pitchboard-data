@@ -1,4 +1,7 @@
 """Fail-closed shared batch outcome classification and serial dispatch."""
+import sys
+
+from .. import egress as socks_egress
 from .common import Stop, digest, dumps, load_config, load_key
 from .policy import PolicyFetcher
 from .state import State
@@ -22,7 +25,30 @@ def terminal(result):
             else result.get("outcome") not in CONTINUE_OUTCOMES)
 
 
-def execute(runner, root, plan, *, digest_languages=(), **run_options):
+def proxy_outage(fetcher, wait=None):
+    """After a fetch_error, tell a proxy outage apart from a site failure.
+
+    Returns None when no loopback proxy is in use or it still answers (the
+    site failed), True when the proxy was down and came back within the wait,
+    and False when it stayed down. Never connects anywhere but the loopback proxy.
+    """
+    if not getattr(fetcher, "proxy", None):
+        return None
+    try:
+        socks_egress.preflight()
+        return None
+    except socks_egress.ProxyConfigError:
+        return False
+    except OSError:
+        pass
+    try:
+        (wait or (lambda: socks_egress.wait_for_proxy(log=lambda m: print(m, file=sys.stderr))))()
+        return True
+    except OSError:
+        return False
+
+
+def execute(runner, root, plan, *, digest_languages=(), proxy_wait=None, **run_options):
     config = load_config(runner.config_path, runner.clock())
     key = (run_options.get("key_loader") or load_key)()
     if key in dumps(plan):
@@ -45,8 +71,30 @@ def execute(runner, root, plan, *, digest_languages=(), **run_options):
         if load_config(runner.config_path, runner.clock()) != config:
             results.append({"outcome": "skipped", "reason": "config_changed"})
             break
-        result = runner.run(shadow_root=root, url=target["url"], fetcher=fetcher,
-                            target=target, digest_languages=digest_languages, batch_day=start_day.isoformat(), **run_options)
+        halted_before = set(fetcher.halted)
+        def run_target():
+            return runner.run(shadow_root=root, url=target["url"], fetcher=fetcher,
+                              target=target, digest_languages=digest_languages, batch_day=start_day.isoformat(), **run_options)
+        result = run_target()
+        if isinstance(result, dict) and result.get("reason") == "fetch_error":
+            outage = proxy_outage(fetcher, proxy_wait)
+            if outage is False:
+                results.append(result)
+                results.append({"outcome": "skipped", "reason": "proxy_unavailable"})
+                break
+            if outage is True:
+                # The outage wait can outlive a config change. A retry is a fresh
+                # dispatch, so it must pass the same gate as the next target or
+                # it would record an attempt under a config the batch rejects.
+                if load_config(runner.config_path, runner.clock()) != config:
+                    results.append(result)
+                    results.append({"outcome": "skipped", "reason": "config_changed"})
+                    break
+                # Halts set while the proxy was down are not the site's fault.
+                fetcher.halted.clear()
+                fetcher.halted.update(halted_before)
+                results.append(result)
+                result = dict(run_target(), proxy_retry=True)
         results.append(result)
         if terminal(result):
             break
