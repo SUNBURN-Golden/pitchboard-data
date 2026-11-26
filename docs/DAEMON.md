@@ -23,6 +23,7 @@ Scheduling: cron `30 5 * * * scripts/daemon_daily.sh` (renewal of public approva
   Wikimedia API calls also stop at the deadline, so a long discovery job ends with what it found.
 - Queued copies of the same work (same URL, target+strategy, candidate) collapse to one at the start of every run
   (`job.result = {"superseded_by": ...}`), and refresh/retry/discovery seeding skips work that is already queued.
+- Each discover job gets at most `PB_DISCOVER_JOB_MAX_S` (600 s) of Wikimedia API calls; `collect.cli run --lanes` limits a run to given lanes.
 - Every 2nd lease prefers the freshness lane (`PB_FRESHNESS_EVERY`, 0 = pure priority). `collect.cli refresh` leases
   freshness jobs only. `--lock-wait` makes the collector wait for `collector.lock` outside its `--time-budget`.
 - `daily.sh` and `daemon_daily.sh` are wrapped in `main()` so a mid-run `git pull` cannot change the running script.

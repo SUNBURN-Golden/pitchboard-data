@@ -146,6 +146,32 @@ class WallClock(Base):
         collector.run(ctx, log=None, time_budget_s=100)
         self.assertIsNone(api.deadline)
 
+    def test_discover_job_api_slice(self):
+        seen = []
+
+        def disc(ctx, payload, job):
+            seen.append(ctx.api.deadline)
+            return {"state": "ok"}
+        scheduler.enqueue(self.infra, "discover", "discovery", {"target_id": "t", "strategy": "s"}, "d", 0.9, NOW)
+        api = Api(sleep=lambda s: None)
+        clock = [1000.0]
+        with patch.dict(collector.HANDLERS, {"discover": disc}), patch.dict(os.environ, {"PB_DISCOVER_JOB_MAX_S": "600"}):
+            collector.run(self.ctx(api), log=None, time_budget_s=7200, monotonic=lambda: clock[0])
+        self.assertEqual([1600.0], seen)          # min(job slice, run deadline 8200)
+        self.assertIsNone(api.deadline)
+
+    def test_cli_lanes_flag(self):
+        from pbdata.collect import cli
+        seen = {}
+        real = collector.run
+
+        def spy(ctx, *a, **k):
+            seen.update(k)
+            return real(ctx, *a, **k)
+        with patch.object(collector, "run", spy), patch("sys.stdout"):
+            cli.main(["run", "--root", self.root, "--no-seed", "--lanes", "freshness,backfill", "--max-jobs", "0"])
+        self.assertEqual(("freshness", "backfill"), seen["lanes"])
+
     def test_next_window_stop(self):
         old = os.environ.get("TZ")
         os.environ["TZ"] = "Asia/Seoul"
