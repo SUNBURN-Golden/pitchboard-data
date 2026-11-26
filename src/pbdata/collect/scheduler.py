@@ -41,17 +41,49 @@ def urgency_from_deadline(closes_on: Optional[str], today: str) -> float:
     return round(max(0.1, 1.0 - days / 60.0), 3)
 
 
+def _try_flock(fh) -> bool:
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        return False
+
+
+def acquire_flock(path: str, wait_s: float = 0, sleep=None, clock=None):
+    """Open path and take an exclusive flock, polling for up to wait_s wall-clock seconds. Returns the open file or None."""
+    import time as _t
+    sleep, clock = sleep or _t.sleep, clock or _t.time
+    fh = open(path, "a+")
+    end = clock() + max(0.0, wait_s or 0)
+    while not _try_flock(fh):
+        if clock() >= end:
+            fh.close()
+            return None
+        sleep(min(1.0, max(0.05, end - clock())))
+    return fh
+
+
+def wait_until_free(path: str, wait_s: float = 0, sleep=None, clock=None) -> bool:
+    """True once nobody holds path (checked by taking and releasing the lock), False after wait_s."""
+    fh = acquire_flock(path, wait_s, sleep, clock)
+    if fh is None:
+        return False
+    fcntl.flock(fh, fcntl.LOCK_UN)
+    fh.close()
+    return True
+
+
 class RunLock:
-    """Single-run lock (flock) so two collectors never run concurrently on the same infra DB."""
-    def __init__(self, path: str):
+    """Single-run lock (flock) so two collectors never run concurrently on the same infra DB.
+    wait_s > 0 waits (outside any job-loop time budget) for the holder to finish instead of failing at once."""
+    def __init__(self, path: str, wait_s: float = 0):
         self.path = path
+        self.wait_s = wait_s
         self.fh = None
 
     def __enter__(self):
-        self.fh = open(self.path, "a+")
-        try:
-            fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
+        self.fh = acquire_flock(self.path, self.wait_s)
+        if self.fh is None:
             raise RuntimeError("another collector run holds the lock: " + self.path)
         return self
 
@@ -86,18 +118,79 @@ def budget_add(infra, day: str, cls: str, resource: str, n: int) -> None:
                   (day, cls, resource, n, n))
 
 
-def lease_next(infra: sqlite3.Connection, now: str, allowed_classes: List[str]) -> Optional[sqlite3.Row]:
+def lease_next(infra: sqlite3.Connection, now: str, allowed_classes: List[str], prefer: Optional[str] = None) -> Optional[sqlite3.Row]:
+    """Lease the highest-priority due job. With prefer (a budget class), that class is tried first and the others
+    only when it has nothing due: the run loop uses this to give freshness a fixed share of leases, because computed
+    refresh priorities (<= 0.285) sit below discovery/backfill (0.3-0.37) and starved for days (2026-11-26: 3,714
+    refresh URLs pending, 3 jobs done in a run)."""
     if not allowed_classes:
         return None
-    q = ",".join("?" * len(allowed_classes))
+    order = [[prefer], allowed_classes] if prefer in allowed_classes else [allowed_classes]
     with transaction(infra):
-        row = infra.execute("SELECT * FROM job WHERE state IN ('pending','retry_wait') AND (next_at IS NULL OR next_at<=?) AND budget_class IN (%s) "
-                            "ORDER BY priority DESC, created_at LIMIT 1" % q, [now] + allowed_classes).fetchone()
+        row = None
+        for classes in order:
+            q = ",".join("?" * len(classes))
+            row = infra.execute("SELECT * FROM job WHERE state IN ('pending','retry_wait') AND (next_at IS NULL OR next_at<=?) AND budget_class IN (%s) "
+                                "ORDER BY priority DESC, created_at LIMIT 1" % q, [now] + list(classes)).fetchone()
+            if row is not None:
+                break
         if row is None:
             return None
         exp = timeutil.iso(timeutil.parse_iso(now) + dt.timedelta(seconds=LEASE_SECONDS))
         infra.execute("UPDATE job SET state='leased', lease_expires=?, attempts=attempts+1, updated_at=? WHERE job_id=?", (exp, now, row["job_id"]))
         return infra.execute("SELECT * FROM job WHERE job_id=?", (row["job_id"],)).fetchone()
+
+
+def dedupe_key(kind: str, payload: dict) -> Optional[str]:
+    """What makes two queued jobs the same work regardless of the run tag in their idem_key."""
+    if kind == "fetch_page":
+        return "fetch|%s|%s" % (payload.get("url"), payload.get("via") or "")
+    if kind == "discover":
+        return "discover|%s|%s|%s" % (payload.get("target_id"), payload.get("strategy"), payload.get("name") or "")
+    if kind == "evaluate":
+        return "evaluate|%s" % payload.get("cand_id")
+    if kind in ("gap_fill", "expand_site"):
+        return "%s|%s" % (kind, json.dumps(payload, sort_keys=True))
+    return None
+
+
+def queued_keys(infra: sqlite3.Connection, kind: str, budget_class: Optional[str] = None) -> Dict[str, tuple]:
+    """dedupe_key -> (job_id, priority) of every pending/retry_wait/leased job of this kind."""
+    sql = "SELECT job_id, kind, payload, priority FROM job WHERE kind=? AND state IN ('pending','retry_wait','leased')"
+    args = [kind]
+    if budget_class:
+        sql += " AND budget_class=?"
+        args.append(budget_class)
+    out = {}
+    for r in infra.execute(sql, args):
+        k = dedupe_key(r["kind"], json.loads(r["payload"]))
+        if k is not None and (k not in out or r["priority"] > out[k][1]):
+            out[k] = (r["job_id"], r["priority"])
+    return out
+
+
+def collapse_duplicates(infra: sqlite3.Connection, now: str) -> int:
+    """Queued copies of the same work (same URL / target+strategy / candidate, enqueued again by a later run under
+    a new run tag) become done with result superseded_by; the copy kept is the highest-priority, oldest one.
+    Leased jobs are never touched. 2026-11-26: 18,663 pending refresh jobs were 3,714 URLs x 6 run tags."""
+    keep: Dict[str, sqlite3.Row] = {}
+    drop = []
+    rows = infra.execute("SELECT job_id, kind, payload, priority, created_at, state FROM job WHERE state IN ('pending','retry_wait','leased') "
+                         "ORDER BY (state='leased') DESC, priority DESC, created_at, job_id").fetchall()
+    for r in rows:
+        k = dedupe_key(r["kind"], json.loads(r["payload"]))
+        if k is None:
+            continue
+        if k in keep:
+            if r["state"] != "leased":
+                drop.append((json.dumps({"superseded_by": keep[k]["job_id"]}), now, r["job_id"]))
+        else:
+            keep[k] = r
+    if drop:
+        with transaction(infra):
+            infra.executemany("UPDATE job SET state='done', result=?, lease_expires=NULL, updated_at=? WHERE job_id=? "
+                              "AND state IN ('pending','retry_wait')", drop)
+    return len(drop)
 
 
 def finish(infra, job_id: str, result: dict, now: str) -> None:

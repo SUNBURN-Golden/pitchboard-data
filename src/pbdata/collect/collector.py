@@ -54,9 +54,12 @@ def _day(now: str) -> str:
 
 def seed_discovery(ctx: Ctx) -> int:
     now, n = ctx.clock(), 0
+    queued = scheduler.queued_keys(ctx.infra, "discover")   # one queued copy per target+strategy, whatever run seeded it
     for tid, t in ctx.targets.items():
         for strat in ("call_index", "wikidata_class", "wiki_category", "query_combo"):
             if strat == "call_index" and not t.get("call_indexes"):
+                continue
+            if scheduler.dedupe_key("discover", {"target_id": tid, "strategy": strat}) in queued:
                 continue
             if scheduler.enqueue(ctx.infra, "discover", "discovery", {"target_id": tid, "strategy": strat}, "discover|%s|%s|%s" % (tid, strat, ctx.run_tag),
                                  scheduler.priority(novelty=1.0, quality=0.6, cost=0.2), now):
@@ -394,6 +397,9 @@ def enqueue_refresh(ctx: Ctx, limit: Optional[int] = None, horizon_hours: Option
         horizon_hours = float(os.environ.get("PB_REFRESH_HORIZON_HOURS", "48"))
     now = ctx.clock()
     n = 0
+    # Each run used to enqueue every URL again under its own run tag, so the queue held one copy per run
+    # (18,663 jobs for 3,714 URLs on 2026-11-26). A URL already queued is skipped; a higher priority is carried over.
+    queued = scheduler.queued_keys(ctx.infra, "fetch_page", "freshness")
     for r in refresh_candidates(ctx.svc, now, horizon_hours):
         owner = ctx.svc.execute("SELECT ss.source_id FROM pb_source s JOIN pb_source_site ss ON ss.outlet_id=s.owner_outlet_id WHERE s.source_id=? ORDER BY ss.source_id LIMIT 1", (r["source_id"],)).fetchone()
         if not owner:
@@ -406,6 +412,11 @@ def enqueue_refresh(ctx: Ctx, limit: Optional[int] = None, horizon_hours: Option
             prio = scheduler.LIVE_CALL_REFRESH_PRIORITY
         else:
             prio = scheduler.priority(novelty=0.1, urgency=scheduler.urgency_from_deadline(closes, now[:10]), quality=0.5, cost=0.2)
+        have = queued.get(scheduler.dedupe_key("fetch_page", {"url": r["url"], "via": "refresh"}))
+        if have is not None:
+            if prio > have[1]:
+                ctx.infra.execute("UPDATE job SET priority=?, updated_at=? WHERE job_id=?", (prio, now, have[0]))
+            continue
         if scheduler.enqueue(ctx.infra, "fetch_page", "freshness", {"url": r["url"], "site_source_id": owner["source_id"], "depth": r["depth"], "via": "refresh"},
                              "fetch|%s|%s" % (r["url"], ctx.run_tag), prio, now, depth=r["depth"]):
             n += 1
@@ -459,7 +470,10 @@ def enqueue_retries(ctx: Ctx, limit: Optional[int] = None) -> int:
         return 0
     now = ctx.clock()
     n = 0
+    queued = scheduler.queued_keys(ctx.infra, "fetch_page", "freshness")
     for r in retry_candidates(ctx.svc, now):
+        if scheduler.dedupe_key("fetch_page", {"url": r["url"], "via": "retry"}) in queued:
+            continue
         owner = ctx.svc.execute("SELECT ss.source_id FROM pb_source s JOIN pb_source_site ss ON ss.outlet_id=s.owner_outlet_id "
                                 "WHERE s.source_id=? ORDER BY ss.source_id LIMIT 1", (r["source_id"],)).fetchone()
         if not owner:
@@ -475,17 +489,52 @@ def enqueue_retries(ctx: Ctx, limit: Optional[int] = None) -> int:
 
 # ------------------------------------------------------------------ run loop
 def run(ctx: Ctx, max_jobs: Optional[int] = None, log=print, time_budget_s: Optional[float] = None,
-        monotonic: Callable[[], float] = time.monotonic) -> Dict[str, int]:
-    """Lease and run jobs until the queue is empty, max_jobs is reached, or time_budget_s (wall clock) is spent.
-    The budget is checked before each lease, so an in-flight job (bounded by per-request timeouts) finishes and
-    unleased jobs stay pending for the next run; the caller's locks are released on a normal return."""
+        monotonic: Callable[[], float] = time.time, *, lanes: Optional[Tuple[str, ...]] = None,
+        stop_at: Optional[float] = None, freshness_every: Optional[int] = None) -> Dict[str, int]:
+    """Lease and run jobs until the queue is empty, max_jobs is reached, or time_budget_s is spent.
+
+    The budget is wall-clock time (time.time by default; the parameter keeps its old name for callers/tests):
+    this box can be frozen for an hour or more, and a CLOCK_MONOTONIC budget does not advance while frozen, so a
+    "90 minute" run stretched over 9 wall-clock hours (11-25 22:24 -> 11-26 07:34 KST) and held collector.lock
+    across the 04:20 collector. stop_at is an absolute deadline on the same clock (the daemon passes the start of
+    the daily window). The budget is checked before each lease, and Wikimedia API calls stop at the deadline, so a
+    long discovery job ends with what it has; unleased jobs stay pending for the next run.
+
+    lanes restricts which budget classes are leased (the daily refresh step leases freshness only). Every
+    freshness_every-th lease prefers the freshness lane (default 2, PB_FRESHNESS_EVERY; 0 = pure priority order)."""
     deadline = monotonic() + time_budget_s if time_budget_s is not None else None
+    if stop_at is not None:
+        deadline = stop_at if deadline is None else min(deadline, stop_at)
+    if freshness_every is None:
+        freshness_every = int(os.environ.get("PB_FRESHNESS_EVERY", "2"))
+    run_lanes = tuple(lanes) if lanes else LANES
     now = ctx.clock()
     scheduler.requeue_expired(ctx.infra, "9999-01-01T00:00:00Z" if os.environ.get("PB_RESUME_FORCE") else now)
+    collapsed = scheduler.collapse_duplicates(ctx.infra, now)
+    if collapsed:
+        ctx.bump("duplicate_jobs_collapsed", collapsed)
     crash_after = int(os.environ.get("PB_CRASH_AFTER_LEASE", "0")) or None
-    done = leased = 0
+    counters = {"done": 0, "leased": 0}
     ctx.infra.execute("INSERT OR IGNORE INTO runs(run_id,started_at) VALUES(?,?)", (ctx.run_id, now))
-    while max_jobs is None or done < max_jobs:
+    prev_api_deadline = getattr(ctx.api, "deadline", None)
+    if deadline is not None and hasattr(ctx.api, "deadline"):
+        ctx.api.deadline, ctx.api.deadline_clock = deadline, monotonic
+    try:
+        _run_loop(ctx, max_jobs, log, time_budget_s, monotonic, deadline, run_lanes, freshness_every, crash_after, counters)
+    finally:
+        if hasattr(ctx.api, "deadline"):
+            ctx.api.deadline = prev_api_deadline
+    done = counters["done"]
+    for outlet, tid in sorted(ctx.touched):         # settle: gap classification reflects the final state of every site touched in this run
+        gaps.compute_gaps(ctx.svc, outlet, tid, ctx.clock())
+    ctx.infra.execute("UPDATE runs SET finished_at=?, outcome=?, report=? WHERE run_id=?", (ctx.clock(), "ok", json.dumps(ctx.stats, sort_keys=True), ctx.run_id))
+    ctx.stats["jobs_done"] = done
+    return ctx.stats
+
+
+def _run_loop(ctx, max_jobs, log, time_budget_s, monotonic, deadline, run_lanes, freshness_every, crash_after, counters):
+    while max_jobs is None or counters["done"] < max_jobs:
+        done, leased = counters["done"], counters["leased"]
         if deadline is not None and monotonic() >= deadline:
             ctx.stats["stopped_time_budget"] = 1
             if log:
@@ -493,12 +542,14 @@ def run(ctx: Ctx, max_jobs: Optional[int] = None, log=print, time_budget_s: Opti
             break
         now = ctx.clock()
         day = _day(now)
-        allowed = [lane for lane in LANES if ctx.request_caps.get(lane) is None
+        allowed = [lane for lane in run_lanes if ctx.request_caps.get(lane) is None
                    or scheduler.budget_used(ctx.infra, day, lane, "requests") < ctx.request_caps[lane]]
-        job = scheduler.lease_next(ctx.infra, now, allowed)
+        prefer = "freshness" if freshness_every and leased % freshness_every == 0 else None
+        job = scheduler.lease_next(ctx.infra, now, allowed, prefer=prefer)
         if job is None:
             break
         leased += 1
+        counters["leased"] = leased
         if crash_after and leased >= crash_after:
             os._exit(137)       # crash injection for the resume proof: job stays 'leased' with an unexpired lease
         payload = json.loads(job["payload"])
@@ -514,10 +565,6 @@ def run(ctx: Ctx, max_jobs: Optional[int] = None, log=print, time_budget_s: Opti
         scheduler.budget_add(ctx.infra, day, job["budget_class"], "requests", used)
         scheduler.checkpoint(ctx.infra, ctx.run_id, "last_job", {"job_id": job["job_id"], "kind": job["kind"], "done": done + 1}, now)
         done += 1
+        counters["done"] = done
         if log:
             log("[%s] %-11s %-9s %s" % (job["budget_class"][:4], job["kind"], res.get("state") or res.get("outcome") or res.get("skipped") or "", {k: v for k, v in res.items() if k in ("new", "relevance", "reason", "change", "facts", "state", "requests", "kind")}))
-    for outlet, tid in sorted(ctx.touched):         # settle: gap classification reflects the final state of every site touched in this run
-        gaps.compute_gaps(ctx.svc, outlet, tid, ctx.clock())
-    ctx.infra.execute("UPDATE runs SET finished_at=?, outcome=?, report=? WHERE run_id=?", (ctx.clock(), "ok", json.dumps(ctx.stats, sort_keys=True), ctx.run_id))
-    ctx.stats["jobs_done"] = done
-    return ctx.stats

@@ -22,9 +22,13 @@ class Api:
         self.cap = cap
         self.sleep = sleep
         self.errors = 0
+        self.deadline: Optional[float] = None       # set by collector.run: no new API calls once the run's deadline passes
+        self.deadline_clock = time.time
 
     def get(self, base: str, params: Dict[str, str], accept: str = "application/json", timeout: float = 40) -> Optional[dict]:
         if self.cap is not None and self.calls >= self.cap:
+            return None
+        if self.deadline is not None and self.deadline_clock() >= self.deadline:
             return None
         wait = self.min_interval - (time.time() - self.last)
         if wait > 0:

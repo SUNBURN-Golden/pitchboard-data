@@ -27,6 +27,8 @@ def main(argv=None) -> int:
     ap.add_argument("--api-cap", type=int, help="maximum Wikimedia API calls (default: unlimited)")
     ap.add_argument("--time-budget", type=float, help="wall-clock seconds for the job loop; unfinished jobs stay queued (default: unlimited)")
     ap.add_argument("--refresh-limit", type=int, help="maximum refresh jobs to enqueue (default: unlimited)")
+    ap.add_argument("--lock-wait", type=float, default=float(os.environ.get("PB_LOCK_WAIT_S", "0")),
+                    help="seconds to wait for collector.lock before giving up (not counted in --time-budget; default 0)")
     a = ap.parse_args(argv)
     os.environ["PB_DATA_ROOT"] = a.root
     for d in ("service_db", "infra_db", "locks"):
@@ -44,13 +46,16 @@ def main(argv=None) -> int:
     run_id = a.run_id or "run_" + a.run_tag
     ctx = collector.Ctx(svc, infra, Fetcher(infra), Api(), targets, run_id, a.run_tag, clock,
                         json.loads(a.caps) if a.caps else None, api_cap=a.api_cap)
-    with RunLock(os.path.join(a.root, "locks", "collector.lock")):
+    with RunLock(os.path.join(a.root, "locks", "collector.lock"), wait_s=a.lock_wait):
         if a.cmd == "run" and not a.no_seed:
             print("seeded discover jobs:", collector.seed_discovery(ctx))
         if a.cmd == "refresh":
             print("refresh jobs:", collector.enqueue_refresh(ctx, a.refresh_limit))
             print("retry jobs:", collector.enqueue_retries(ctx))
-        stats = collector.run(ctx, a.max_jobs, time_budget_s=a.time_budget)
+        # refresh leases freshness jobs only: it used to run the whole queue in priority order, so its hour went to
+        # discovery/evaluation jobs and about 5 refresh jobs ran (2026-11-24).
+        stats = collector.run(ctx, a.max_jobs, time_budget_s=a.time_budget,
+                              lanes=("freshness",) if a.cmd == "refresh" else None)
     print(json.dumps({"run_id": run_id, "stats": stats, "requests": ctx.fetcher.requests, "api_calls": ctx.api.calls}, indent=1))
     return 0
 
