@@ -23,6 +23,7 @@ def main(argv=None) -> int:
     ap.add_argument("--run-id", default=None, help="reuse to resume a run")
     ap.add_argument("--max-jobs", type=int, help="maximum jobs to run (default: unlimited)")
     ap.add_argument("--no-seed", action="store_true", help="resume: do not enqueue discovery jobs")
+    ap.add_argument("--lanes", help="comma-separated budget classes to lease (discovery,backfill,freshness; default all)")
     ap.add_argument("--caps", help='optional JSON request caps per lane, e.g. {"discovery":{"requests":150}}')
     ap.add_argument("--api-cap", type=int, help="maximum Wikimedia API calls (default: unlimited)")
     ap.add_argument("--time-budget", type=float, help="wall-clock seconds for the job loop; unfinished jobs stay queued (default: unlimited)")
@@ -55,7 +56,8 @@ def main(argv=None) -> int:
         # refresh leases freshness jobs only: it used to run the whole queue in priority order, so its hour went to
         # discovery/evaluation jobs and about 5 refresh jobs ran (2026-11-24).
         stats = collector.run(ctx, a.max_jobs, time_budget_s=a.time_budget,
-                              lanes=("freshness",) if a.cmd == "refresh" else None)
+                              lanes=("freshness",) if a.cmd == "refresh" else
+                              (tuple(x.strip() for x in a.lanes.split(",") if x.strip()) if a.lanes else None))
     print(json.dumps({"run_id": run_id, "stats": stats, "requests": ctx.fetcher.requests, "api_calls": ctx.api.calls}, indent=1))
     return 0
 

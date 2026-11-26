@@ -532,6 +532,11 @@ def run(ctx: Ctx, max_jobs: Optional[int] = None, log=print, time_budget_s: Opti
     return ctx.stats
 
 
+def DISCOVER_JOB_MAX_S() -> float:
+    """Wall-clock seconds of Wikimedia API calls one discover job may spend (PB_DISCOVER_JOB_MAX_S, default 600; 0 = no cap)."""
+    return float(os.environ.get("PB_DISCOVER_JOB_MAX_S", "600"))
+
+
 def _run_loop(ctx, max_jobs, log, time_budget_s, monotonic, deadline, run_lanes, freshness_every, crash_after, counters):
     while max_jobs is None or counters["done"] < max_jobs:
         done, leased = counters["done"], counters["leased"]
@@ -554,6 +559,13 @@ def _run_loop(ctx, max_jobs, log, time_budget_s, monotonic, deadline, run_lanes,
             os._exit(137)       # crash injection for the resume proof: job stays 'leased' with an unexpired lease
         payload = json.loads(job["payload"])
         before = ctx.fetcher.requests + ctx.api.calls
+        run_api_deadline = getattr(ctx.api, "deadline", None)
+        if job["kind"] == "discover" and hasattr(ctx.api, "deadline") and DISCOVER_JOB_MAX_S() > 0:
+            # One uncapped query_combo/wiki_category job made Wikimedia calls for hours (11-25: 2,757 requests in 3 jobs;
+            # 11-26: one job ran past the whole fetch budget). Each discover job keeps what it found within its slice.
+            job_end = monotonic() + DISCOVER_JOB_MAX_S()
+            ctx.api.deadline = job_end if run_api_deadline is None else min(job_end, run_api_deadline)
+            ctx.api.deadline_clock = monotonic
         try:
             res = HANDLERS[job["kind"]](ctx, payload, job)
             scheduler.finish(ctx.infra, job["job_id"], res, now)
@@ -561,6 +573,8 @@ def _run_loop(ctx, max_jobs, log, time_budget_s, monotonic, deadline, run_lanes,
             state = scheduler.fail(ctx.infra, job, "%s: %s" % (type(e).__name__, e), now)
             res = {"error": type(e).__name__, "state": state}
             ctx.bump("job_errors")
+        if hasattr(ctx.api, "deadline"):
+            ctx.api.deadline = run_api_deadline
         used = ctx.fetcher.requests + ctx.api.calls - before
         scheduler.budget_add(ctx.infra, day, job["budget_class"], "requests", used)
         scheduler.checkpoint(ctx.infra, ctx.run_id, "last_job", {"job_id": job["job_id"], "kind": job["kind"], "done": done + 1}, now)
