@@ -49,6 +49,9 @@ def main():
                        digest_languages=tuple(filter(None, args.digest_languages.split(","))))
         result.update(attempted=sum("attempt_id" in r for r in rows),
                       successful=sum(r.get("outcome") == "ok" for r in rows),
+                      processed=len(rows), proxy_retries=sum(bool(r.get("proxy_retry")) for r in rows),
+                      outcomes=dict(sorted(__import__("collections").Counter(
+                          r.get("reason") or r.get("outcome") or "unknown" for r in rows).items())),
                       last={k: rows[-1][k] for k in ("outcome", "reason") if k in rows[-1]} if rows else None)
     print(dumps(result))
 

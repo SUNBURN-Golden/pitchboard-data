@@ -561,6 +561,57 @@ class BatchIntegrationTests(Harness):
         self.assertEqual(report["planning"]["selected_urls"], 2)
         self.assertEqual(report["planning"]["selected_without_attempt"], 0)
 
+    def _fetch_failing_first(self, fetched):
+        def fetch(url):
+            fetched.append(url)
+            if len(fetched) == 1:
+                raise common.Stop("fetch_error")
+            return page(url)
+        return fetch
+
+    def test_proxy_outage_waits_and_retries_target(self):
+        plan = planner.plan(export(*(candidate(gap_id=f"gap_{i}", url=f"https://example.org/{i}") for i in range(2))),
+                            limit=2)
+        fetched, waits = [], []
+        with patch.object(runner.PolicyFetcher, "fetch", side_effect=self._fetch_failing_first(fetched)), \
+                patch.object(batch.socks_egress, "configured_proxy", return_value=("127.0.0.1", 1080)), \
+                patch.object(batch.socks_egress, "preflight", side_effect=ConnectionRefusedError()):
+            rows = batch.execute(runner.ShadowRunner(self.config_path, clock=lambda: NOW), self.root, plan,
+                                 key_loader=lambda: KEY, transport=self.transport, proxy_wait=lambda: waits.append(1))
+        self.assertEqual(waits, [1])
+        self.assertEqual(rows[0].get("reason"), "fetch_error")
+        self.assertTrue(rows[1].get("proxy_retry"))
+        self.assertEqual([r["outcome"] for r in rows[1:]], ["ok", "ok"])
+        self.assertEqual(len(fetched), 3)
+
+    def test_proxy_still_down_stops_batch(self):
+        plan = planner.plan(export(*(candidate(gap_id=f"gap_{i}", url=f"https://example.org/{i}") for i in range(3))),
+                            limit=3)
+        fetched = []
+        def wait():
+            raise ConnectionRefusedError()
+        with patch.object(runner.PolicyFetcher, "fetch", side_effect=self._fetch_failing_first(fetched)), \
+                patch.object(batch.socks_egress, "configured_proxy", return_value=("127.0.0.1", 1080)), \
+                patch.object(batch.socks_egress, "preflight", side_effect=ConnectionRefusedError()):
+            rows = batch.execute(runner.ShadowRunner(self.config_path, clock=lambda: NOW), self.root, plan,
+                                 key_loader=lambda: KEY, transport=self.transport, proxy_wait=wait)
+        self.assertEqual([r.get("reason") for r in rows], ["fetch_error", "proxy_unavailable"])
+        self.assertEqual(len(fetched), 1)
+        self.assertEqual(self.calls, [])
+
+    def test_site_fetch_error_with_healthy_proxy_continues_without_retry(self):
+        plan = planner.plan(export(*(candidate(gap_id=f"gap_{i}", url=f"https://example.org/{i}") for i in range(2))),
+                            limit=2)
+        fetched = []
+        with patch.object(runner.PolicyFetcher, "fetch", side_effect=self._fetch_failing_first(fetched)), \
+                patch.object(batch.socks_egress, "configured_proxy", return_value=("127.0.0.1", 1080)), \
+                patch.object(batch.socks_egress, "preflight", return_value=("127.0.0.1", 1080)):
+            rows = batch.execute(runner.ShadowRunner(self.config_path, clock=lambda: NOW), self.root, plan,
+                                 key_loader=lambda: KEY, transport=self.transport,
+                                 proxy_wait=lambda: self.fail("no wait when proxy is up"))
+        self.assertEqual([r.get("reason") or r["outcome"] for r in rows], ["fetch_error", "ok"])
+        self.assertEqual(len(fetched), 2)
+
     def test_key_in_plan_stops_before_persisting(self):
         plan = planner.plan(export(candidate(owner_name=KEY)))
         with self.assertRaisesRegex(common.Stop, "credential_in_record"):
