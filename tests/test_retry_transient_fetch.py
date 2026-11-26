@@ -115,5 +115,45 @@ class RetryTransientFirstFetchTests(unittest.TestCase):
             self.assertFalse(fp.call_args.kwargs["refresh"])
 
 
+class RetryQueuedByEveryCollectorCommandTests(unittest.TestCase):
+    """2026-11-27: PR #56 hooked the retry queue only into `refresh` (and the online daemon). The 11-26 refresh step
+    died on collector.lock and the daemon ran offline, so 0 retries were queued while never-fetched rose 464 -> 506."""
+
+    def setUp(self):
+        import tempfile
+        import shutil
+        self.root = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.root)
+        for d in ("service_db", "infra_db", "locks"):
+            os.makedirs(os.path.join(self.root, d))
+        svc = db.open_service(os.path.join(self.root, "service_db", "pitchboard_kg.sqlite3"))
+        site = store.register_site(svc, "https://retry.example", "Retry Review", NOW, target_id="t1")
+        outlet = store.site_row(svc, site)["site_outlet"]
+        sid = add_source(svc, "https://retry.example/a", outlet=outlet)
+        store.insert_raw(svc, "2026-11-01T00:00:00Z", source_id=sid, url="https://retry.example/a", kind="html",
+                         fetch_method="html", outcome="error", error_class="URLError", change_state="failed", depth=1,
+                         fetched_at="2026-11-01T00:00:00Z")
+        svc.commit()
+        svc.close()
+
+    def cli(self, *args):
+        from pbdata.collect import cli
+        with patch("sys.stdout"):
+            self.assertEqual(0, cli.main(list(args) + ["--root", self.root, "--max-jobs", "0"]))
+        inf = db.open_infra(os.path.join(self.root, "infra_db", "infra.sqlite3"))
+        try:
+            return [json.loads(r["payload"]) for r in inf.execute("SELECT payload FROM job WHERE idem_key LIKE 'retry|%'")]
+        finally:
+            inf.close()
+
+    def test_run_queues_transient_retries(self):
+        jobs = self.cli("run", "--no-seed")
+        self.assertEqual([("https://retry.example/a", "retry")], [(p["url"], p["via"]) for p in jobs])
+
+    def test_run_then_refresh_same_day_queues_once(self):
+        self.cli("run", "--no-seed")
+        self.assertEqual(1, len(self.cli("refresh")))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -52,7 +52,11 @@ def main(argv=None) -> int:
             print("seeded discover jobs:", collector.seed_discovery(ctx))
         if a.cmd == "refresh":
             print("refresh jobs:", collector.enqueue_refresh(ctx, a.refresh_limit))
-            print("retry jobs:", collector.enqueue_retries(ctx))
+        # Transient first-fetch retries are queued by run too, not only by refresh: the daily refresh step
+        # dies whenever run or the daemon still holds collector.lock (2026-11-26), and the daemon runs that
+        # day were offline, so PR #56 queued 0 retries in its first day while never-fetched rose 464 -> 506.
+        # Idempotent per (url, failure count), so run + refresh on the same day never double-queue.
+        print("retry jobs:", collector.enqueue_retries(ctx))
         # refresh leases freshness jobs only: it used to run the whole queue in priority order, so its hour went to
         # discovery/evaluation jobs and about 5 refresh jobs ran (2026-11-24).
         stats = collector.run(ctx, a.max_jobs, time_budget_s=a.time_budget,
