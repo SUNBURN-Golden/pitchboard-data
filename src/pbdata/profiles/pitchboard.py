@@ -11,8 +11,8 @@ from typing import Dict, List, Optional, Tuple
 from ..collect.dates import find_dates
 from ..collect.parse import Doc, Link, Segment
 
-EXTRACTOR_VERSION = "pb-rules-9"   # 9: a board post's 마감일/게시기간 metadata line is not a deadline;  8: academic meeting/conference deadline lines are not writing deadlines;  7: explicit submission-fee payment instructions can state a fee without an amount
-LABELER_VERSION = "pb-labels-7"    # 7: board 마감일/게시기간 metadata is not a deadline (re-labels and re-extracts live calls);  6: academic meeting/conference pages are not writing calls;  5: "review" alone does not make a literary body;  4: an open call needs writing context (title/heading/URL cue or a literary body); 3: non-writing titles block rules-only calls
+EXTRACTOR_VERSION = "pb-rules-10"  # 10: "always open" needs a submission subject; admissions and graphic-art pages are not writing calls;  9: a board post's 마감일/게시기간 metadata line is not a deadline;  8: academic meeting/conference deadline lines are not writing deadlines;  7: explicit submission-fee payment instructions can state a fee without an amount
+LABELER_VERSION = "pb-labels-8"    # 8: admissions / graphic-art pages are not writing calls;  7: board 마감일/게시기간 metadata is not a deadline (re-labels and re-extracts live calls);  6: academic meeting/conference pages are not writing calls;  5: "review" alone does not make a literary body;  4: an open call needs writing context (title/heading/URL cue or a literary body); 3: non-writing titles block rules-only calls
 OCR_EXTRACTOR = "ocr:tesseract+rules"
 
 # Fields a Pitchboard call/outlet must eventually have; importance feeds gap priority.
@@ -56,7 +56,10 @@ RESULT_KO = re.compile(r"(수상작|당선작|당선자|수상자|결과\s*발�
 CORR_RE = re.compile(r"(\bcorrections?\b|\bcorrected\b|\bupdate[d]?:|\berrata\b|정정|수정\s*공고|변경\s*공고|정오표|일정\s*변경)", re.I)
 EXT_RE = re.compile(r"(deadline (has been |is |was )?extended|extended (the )?deadline|extension of the deadline|new deadline|deadline extension|마감\s*(일\s*)?연장|연장\s*공고|기간\s*연장|연장\s*(?:되|됩|합|하였|했))", re.I)
 CANC_RE = re.compile(r"(\bcancel(l)?ed\b|\bcancell?ation\b|no longer (accepting|open|being offered)|discontinued|has been (withdrawn|closed permanently)|취소|폐지|중단\s*(되었|합니다))", re.I)
-STANDING_RE = re.compile(r"(rolling (basis|submissions?|deadline)|year[- ]round|always open|ongoing submissions?|submit (at )?any ?time|상시\s*(접수|모집|투고))", re.I)
+# "always open" alone is conversational ("I'm always open to other takes" in a Writer's Digest blog post became a standing
+# call on 11-27); it needs submissions/reading as its subject or object.
+STANDING_RE = re.compile(r"(rolling (basis|submissions?|deadline)|year[- ]round|(?:submissions?|reading period|we|we're|we are)\s+(?:are\s+|is\s+)?always open|"
+                         r"always open (?:to|for) (?:submissions?|pitches|new work|unsolicited)|ongoing submissions?|submit (at )?any ?time|상시\s*(접수|모집|투고))", re.I)
 OPEN_RE = re.compile(r"(submissions? (are |is )?(now |currently )?open|(now|currently) (accepting|open)|open for submissions|접수\s*중|모집\s*중|현재\s*접수)", re.I)
 # Korean: a bare "접수 마감" / "모집 마감" is usually a schedule label ("접수 마감 : 11월 5일", "접수 마감일", "모집마감시까지"),
 # not a declaration that the call is closed; only count it when no date/label/time word follows (pb-status-1)
@@ -215,8 +218,10 @@ YEAR_RE = re.compile(r"(?<!\d)(20\d{2})(?!\d)")
 # ("대관 공고"), a dance residency, staff hiring or a school admission guide. These are not writing calls:
 #  - NONWRITING_TYPE: notice types that are never a writing call, even when a literary word appears;
 #  - NONWRITING_DISC: other disciplines and events (forum, screening), which are overridden by any writing cue (희곡/극본 = playwriting, 미술 비평 = criticism).
-NONWRITING_TYPE = re.compile(r"(대관|채용|입찰|용역|입학|신입생|신입\s*회원|회원\s*모집|(?:특별|일반|서류|면접|실기)\s*전형|공모\s*직위|임용|venue (hire|rental)|job (opening|vacanc)|we(?:'re| are) hiring)", re.I)
-NONWRITING_DISC = re.compile(r"(행사\s*(?:안내|소개)|포럼|세미나|심포지엄|토론회|설명회|공연\s*실황|상영|무용|댄스|발레|연극|뮤지컬|오페라|공연장|미술|시각\s*예술|공예|음악|국악|전시|영화|\bdance\b|tanz|탄츠|\bballet\b|\btheat(?:re|er)\b|\bvisual arts?\b|\bmusic(?:al)?\b|\bexhibition\b|\bfilm\b|"
+NONWRITING_TYPE = re.compile(r"(대관|채용|입찰|용역|입학|신입생|신입\s*회원|회원\s*모집|(?:특별|일반|서류|면접|실기)\s*전형|공모\s*직위|임용|venue (hire|rental)|job (opening|vacanc)|we(?:'re| are) hiring|"
+                             # university admissions ("Admission Deadlines & Requirements", graduate programs "reviewed on a rolling basis")
+                             r"\b(?:graduate |undergraduate )?admissions?\b(?! (?:is )?free)(?: (?:deadlines?|requirements|process|office))?)", re.I)
+NONWRITING_DISC = re.compile(r"(행사\s*(?:안내|소개)|포럼|세미나|심포지엄|토론회|설명회|공연\s*실황|상영|무용|댄스|발레|연극|뮤지컬|오페라|공연장|미술|시각\s*예술|공예|음악|국악|전시|영화|\bdance\b|tanz|탄츠|\bballet\b|\btheat(?:re|er)\b|\bvisual arts?\b|\bgraphic arts?\b|\bphotography\b|\bmusic(?:al)?\b|\bexhibition\b|\bfilm\b|"
                              # academic meetings: a "call for proposals" for panels/papers at a political-science or other scholarly
                              # meeting is not a writing call (11-27: connect.apsanet.org/apsa2027, "APSA Annual Meeting 2027", stayed open)
                              r"\bannual meetings?\b|\bconferences?\b|\bconventions?\b|\bsymposi(?:um|a)\b|\bcolloqui(?:um|a)\b|\bcongress(?:es)?\b|학술\s*대회|학회)", re.I)
