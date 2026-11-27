@@ -123,6 +123,30 @@ WRITING_PATH = re.compile(r"(poe[mt]|poetry|literar|fiction|essay|writ|manuscrip
                           r"문학|공모|투고|원고|소설|시인|평론)", re.I)
 
 
+# Web-shop listings (Shopify /products/ and /collections/, WooCommerce /product/ and /product-category/, cart/checkout/account).
+# 11-27: one coffeehousepress.org sitemap walk registered 662 book product and collection pages; a 429 halted the host and all
+# of them sat in sources_never_fetched (1028, up from 549). A book title ("poetry", "stories", "write") does not make a product
+# page a call, so WRITING_PATH does not rescue these; only a call word in the slug does (a contest entry product).
+STOREFRONT_SECTION = re.compile(r"^(products?|collections|product-category|product-tag|cart|checkout|checkouts|account)$")
+STOREFRONT_CALL_WORD = re.compile(r"(contest|competition|prize|award|submi|call-for|open-call|fellowship|residenc(y|ies)|"
+                                  r"공모|투고|응모)", re.I)
+
+
+def storefront_page_url(url: str) -> bool:
+    """True for a shop product/collection/cart page whose path names no call (see STOREFRONT_SECTION)."""
+    try:
+        path = unquote(urlparse(url.strip()).path).lower()
+    except ValueError:
+        return False
+    segs = [s for s in re.split(r"/+", path) if s]
+    # The section must be the first path segment, or follow a locale prefix (/en/products/...), so a
+    # journal's /issues/products-of-desire/ or /blog/product-review is not caught.
+    idx = 1 if segs and re.fullmatch(r"[a-z]{2}(-[a-z]{2})?", segs[0]) else 0
+    if len(segs) <= idx or not STOREFRONT_SECTION.match(segs[idx]):
+        return False
+    return not STOREFRONT_CALL_WORD.search(path)
+
+
 def off_topic_page_url(url: str) -> Optional[str]:
     """'off_topic_path' for a URL in an institutional section that never carries a writing call, else None."""
     try:
@@ -131,6 +155,8 @@ def off_topic_page_url(url: str) -> Optional[str]:
         return None
     if not p.scheme:
         return "relative_url"
+    if storefront_page_url(url):
+        return "off_topic_path"     # same deprioritized_reason (schema CHECK); storefront_page_url tells them apart
     path = unquote(p.path).lower()
     if WRITING_PATH.search(path):
         return None
