@@ -373,6 +373,12 @@ class HandoffTest(unittest.TestCase):
             self.assertEqual([URL, unvisited, recent], [url for url, _ in bot.select_targets(svc, NOW, {})])
             self.assertEqual([unvisited, recent], [url for url, _ in bot.select_targets(svc, NOW, {URL: timeutil.iso(NOW)})])
 
+    def test_off_topic_sources_are_not_targets(self):
+        off = "https://www.kent.edu/hr/benefits"
+        with closing(db.connect(self.live)) as svc:
+            add_source(svc, off, outlet=self.outlet_id)
+            self.assertNotIn(off, [url for url, _ in bot.select_targets(svc, NOW, {})])
+
     def test_proxy_probe_retries_socks_only(self):
         sleep = Mock()
         with patch.object(bot.egress, "preflight", return_value=("127.0.0.1", 1080)), \

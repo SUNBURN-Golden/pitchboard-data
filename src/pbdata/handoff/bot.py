@@ -11,7 +11,7 @@ import time
 
 from pbdata import db, timeutil
 from pbdata.collect import egress
-from pbdata.collect.net import junk_page_url
+from pbdata.collect.net import junk_page_url, off_topic_page_url
 from pbdata.collect.parse import Doc
 from pbdata.collect.shadow import common, policy, runner, schema
 from pbdata.model import EMAIL_RE, PHONE_RE
@@ -59,7 +59,7 @@ def select_targets(conn, now, recent):
             GROUP BY f.source_id
         )
         SELECT s.source_id, s.owner_outlet_id AS outlet_id, s.canonical_url AS url,
-            live.urgent, s.last_success_at,
+            live.urgent, live.source_id IS NOT NULL AS is_live, s.last_success_at,
             (SELECT MAX(r.fetched_at) FROM pb_raw_ref r WHERE r.source_id=s.source_id AND r.outcome='ok') AS raw_success
         FROM pb_source s LEFT JOIN live USING(source_id)
         WHERE (s.authority='official_primary' OR live.source_id IS NOT NULL)
@@ -70,6 +70,10 @@ def select_targets(conn, now, recent):
     for row in rows:
         url = row["url"]
         if junk_page_url(url):
+            continue
+        # Same rule as the collector (#63): institutional/off-topic sections (kent.edu hr, admissions, calendars, ...)
+        # are not fetched unless they back a live call; they made the 18:00 run take hours and hold the collector lock.
+        if not row["is_live"] and off_topic_page_url(url):
             continue
         try:
             key = policy.canonical_url(url)
