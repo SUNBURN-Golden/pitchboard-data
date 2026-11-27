@@ -14,7 +14,7 @@ from ..db import transaction
 from ..ids import new_id, sha256_hex, stable_id
 from ..rules import sanitize_excerpt
 from . import names
-from .net import junk_page_url, normalize_url, page_url, registered_domain
+from .net import junk_page_url, normalize_url, off_topic_page_url, page_url, registered_domain
 
 CONFIG = Path(__file__).resolve().parents[3] / "config"
 
@@ -86,6 +86,8 @@ def ensure_page_source(svc: sqlite3.Connection, url: str, site_source_id: str, n
         existing = svc.execute("SELECT source_id, retired_reason FROM pb_source WHERE canonical_url=?", (url,)).fetchone()
         if existing is not None:
             return existing["source_id"] if existing["retired_reason"] is None else None
+        if off_topic_page_url(url):        # HR/payroll/admissions/campus-calendar pages: never registered as a new page source
+            return None
         site = site_row(svc, site_source_id)
         svc.execute("INSERT INTO pb_source(source_id,canonical_url,host,source_type,authority,owner_outlet_id,owner_name,permission,permission_basis,"
                     "permission_checked_on,max_epistemic,refresh_hours) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -108,6 +110,25 @@ def retire_junk_sources(svc: sqlite3.Connection) -> int:
         )
         updates = [(reason, r["source_id"]) for r in rows if (reason := junk_page_url(r["canonical_url"]))]
         svc.executemany("UPDATE pb_source SET retired_reason=? WHERE source_id=?", updates)
+    return len(updates)
+
+
+def deprioritize_off_topic_sources(svc: sqlite3.Connection) -> int:
+    """Mark never-fetched institutional off-topic sources (off_topic_page_url: HR, payroll, admissions, campus calendars or
+    news on .edu hosts, relative URLs) with deprioritized_reason. Rows are kept; retries skip them and the never-fetched
+    metric counts them separately. Same guard as retire_junk_sources: no ok fetch, fact, evidence or site registration."""
+    with transaction(svc):
+        rows = svc.execute(
+            "SELECT s.source_id, s.canonical_url FROM pb_source s "
+            "WHERE s.retired_reason IS NULL AND s.deprioritized_reason IS NULL AND s.last_success_at IS NULL AND s.source_type<>'manual_clip' "
+            "AND NOT EXISTS (SELECT 1 FROM pb_source_site ss WHERE ss.source_id=s.source_id) "
+            "AND NOT EXISTS (SELECT 1 FROM pb_fact f WHERE f.source_id=s.source_id) "
+            "AND NOT EXISTS (SELECT 1 FROM pb_evidence e WHERE e.source_id=s.source_id) "
+            "AND NOT EXISTS (SELECT 1 FROM pb_raw_ref r WHERE r.source_id=s.source_id AND r.outcome='ok') "
+            "ORDER BY s.source_id"
+        )
+        updates = [(reason, r["source_id"]) for r in rows if (reason := off_topic_page_url(r["canonical_url"]))]
+        svc.executemany("UPDATE pb_source SET deprioritized_reason=? WHERE source_id=?", updates)
     return len(updates)
 
 

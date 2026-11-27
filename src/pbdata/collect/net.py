@@ -106,6 +106,43 @@ def junk_page_url(url: str) -> Optional[str]:
     return None
 
 
+# Institutional sections of university/association sites that never hold a writing call: HR, payroll, accounts payable,
+# admissions/aid, housing, policy pages, and on .edu hosts the campus calendar/event/news pages. 11-27: 78 never-fetched
+# kent.edu sources (open-enrollment news, pay ranges, invoices, academic calendars) came in through "deadline"/"open"/"pay"
+# link words and were retried for days. A writing/publishing word anywhere in the path keeps the URL (Wick Poetry Center news).
+OFF_TOPIC_SECTION = re.compile(r"^(hr|human-?resources|people-and-culture|accounts-?payable|payroll|benefits|compensation|policyreg|"
+                               r"academicpersonnel|academic-personnel|faculty-senate|facultyhandbook|admissions?(-aid)?|financial-?aid|"
+                               r"tuition(-aid)?|bursar|registrar|housing|campus-living|residence-life|living-on-campus|dining|parking|"
+                               r"athletics|alumni-and-giving|sustainability|procurement|purchasing|facilities)$")
+OFF_TOPIC_SLUG = re.compile(r"(academic-calendar|open-enrollment|flexible-spending|pay-range|payment-(options|plans|information)|e-payables|"
+                            r"invoice|thanksgiving-break|campus-closed|food-pantry|biometric|flu-shots?|loan-counseling|"
+                            r"residence-facilities-rates|fiscal-year-end)")
+EDU_OFF_TOPIC_SECTION = re.compile(r"^(calendars?|events?|news|[\w-]*important-dates[\w-]*|[\w-]*meeting-dates|[\w-]*calendars?(-[\w-]*)?|registrar[\w-]*)$")
+WRITING_PATH = re.compile(r"(poe[mt]|poetry|literar|fiction|essay|writ|manuscript|submi|antholog|magazine|review|journal|press|(?<![a-z])books?(?![a-z])|novel|"
+                          r"prize|award|contest|competition|call-for|fellowship|residenc(y|ies)|chapbook|story|stories|translat|"
+                          r"문학|공모|투고|원고|소설|시인|평론)", re.I)
+
+
+def off_topic_page_url(url: str) -> Optional[str]:
+    """'off_topic_path' for a URL in an institutional section that never carries a writing call, else None."""
+    try:
+        p = urlparse(url.strip())
+    except ValueError:
+        return None
+    if not p.scheme:
+        return "relative_url"
+    path = unquote(p.path).lower()
+    if WRITING_PATH.search(path):
+        return None
+    segs = [s for s in re.split(r"/+", path) if s and s not in ("index.php",)]
+    if any(OFF_TOPIC_SECTION.match(s) for s in segs) or OFF_TOPIC_SLUG.search(path):
+        return "off_topic_path"
+    host = (p.hostname or "").lower()
+    if (host.endswith(".edu") or re.search(r"\.ac\.[a-z]{2}$", host)) and any(EDU_OFF_TOPIC_SECTION.match(s) for s in segs):
+        return "off_topic_path"
+    return None
+
+
 def page_url(url: str) -> Optional[str]:
     """Canonical URL for a new page, or None for a binary asset."""
     url = normalize_url(strip_tracking_params(url.strip()))
