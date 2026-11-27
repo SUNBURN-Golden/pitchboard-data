@@ -11,6 +11,13 @@ CONTINUE_REASONS = frozenset({
     "fetch_error", "denied_http", "unsupported_content", "invalid_transport_body",
     "invalid_robots", "redirect_limit", "access_wall", "empty_page", "page_too_large",
     "duplicate_page", "invalid_policy_envelope"})
+# Pre-dispatch fetch blocks are not ledger attempts, so the planner never saw
+# them and re-picked the same walled/denied pages every day. They are logged per
+# URL and the planner cools them down (days) until the service source changes.
+FETCH_BLOCK_COOLDOWN_DAYS = {
+    "access_wall": 7, "denied_robots": 7, "denied_http": 7, "invalid_robots": 7, "page_too_large": 7,
+    "unsupported_content": 7, "redirect_limit": 7, "empty_page": 7, "blocked_host": 7, "bad_url": 7,
+    "fetch_error": 2}
 CONTINUE_OUTCOMES = frozenset({"ok", "provider_http_error", "provider_too_large", "provider_error",
     "duplicate_json_key", "invalid_json_number", "invalid_usage", "invalid_completion",
     "invalid_model_json", "invalid_schema"})
@@ -63,6 +70,17 @@ def execute(runner, root, plan, *, digest_languages=(), proxy_wait=None, **run_o
         with secure_open(path, "a+") as f:
             append_sync(f, {"plan_id": digest(dumps(plan)), "plan": plan})
     fetcher = PolicyFetcher(egress=config["egress"])
+    skips_path = path.with_name("fetch_skips_" + start_day.strftime("%Y%m%d") + ".jsonl")
+
+    def record_block(result):
+        if not (isinstance(result, dict) and result.get("outcome") == "skipped"
+                and result.get("reason") in FETCH_BLOCK_COOLDOWN_DAYS):
+            return
+        with state.locked():
+            with secure_open(skips_path, "a+") as f:
+                append_sync(f, {"url": target["url"], "content_hash": target.get("content_hash"),
+                                "reason": result["reason"], "day": start_day.isoformat(),
+                                "timestamp_utc": runner.clock().isoformat()})
     results = []
     for target in plan["targets"]:
         if runner.clock().date() != start_day:
@@ -79,6 +97,7 @@ def execute(runner, root, plan, *, digest_languages=(), proxy_wait=None, **run_o
         if isinstance(result, dict) and result.get("reason") == "fetch_error":
             outage = proxy_outage(fetcher, proxy_wait)
             if outage is False:
+                # The proxy is down, not the site: no cooldown for this URL.
                 results.append(result)
                 results.append({"outcome": "skipped", "reason": "proxy_unavailable"})
                 break
@@ -96,6 +115,7 @@ def execute(runner, root, plan, *, digest_languages=(), proxy_wait=None, **run_o
                 results.append(result)
                 result = dict(run_target(), proxy_retry=True)
         results.append(result)
+        record_block(result)
         if terminal(result):
             break
     return results

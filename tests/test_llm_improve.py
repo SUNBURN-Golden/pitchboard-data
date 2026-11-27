@@ -647,6 +647,62 @@ class BatchIntegrationTests(Harness):
         self.assertEqual(len(fetched), 2)
         self.assertEqual(len(self.calls), 1)
 
+    def test_fetch_blocked_url_cools_down_and_frees_the_slot(self):
+        rows = [candidate(gap_id=f"gap_{i}", url=f"https://example.org/{i}") for i in range(3)]
+        plan = planner.plan(export(*rows), limit=2)
+        def fetch(url):
+            if url.endswith("/0"):
+                raise common.Stop("access_wall")
+            return page(url)
+        with patch.object(runner.PolicyFetcher, "fetch", side_effect=fetch):
+            out = batch.execute(runner.ShadowRunner(self.config_path, clock=lambda: NOW), self.root, plan,
+                                key_loader=lambda: KEY, transport=self.transport)
+        self.assertEqual([r.get("reason") or r["outcome"] for r in out], ["access_wall", "ok"])
+        log = next(self.root.glob("data/shadow/fetch_skips_*.jsonl"))
+        self.assertEqual(log.stat().st_mode & 0o077, 0)
+        self.assertNotIn(KEY, log.read_text())
+        skips = state.read_fetch_skips(self.root)
+        self.assertEqual([(s["url"], s["reason"]) for s in skips], [("https://example.org/0", "access_wall")])
+        history = state.read_history(self.root)
+        again = planner.plan(export(*rows), limit=2, history=history, fetch_skips=skips)
+        # The walled page no longer takes a slot; the never-tried page gets it.
+        self.assertEqual([t["url"] for t in again["targets"]][0], "https://example.org/2")
+        self.assertNotIn("https://example.org/0", [t["url"] for t in again["targets"]])
+        self.assertEqual(again["reasons"]["skip_recent_fetch_block"], 1)
+
+    def test_fetch_block_cooldown_expires_per_reason_and_ignores_rehash(self):
+        row = candidate(url="https://example.org/w")
+        day = NOW.date()
+        def skip(reason, age, content_hash=row["content_hash"]):
+            return {"url": "https://example.org/w", "content_hash": content_hash, "reason": reason,
+                    "day": (day - dt.timedelta(days=age)).isoformat()}
+        def picked(*skips, url="https://example.org/w"):
+            return [t["url"] for t in planner.plan(export(candidate(url=url)),
+                                                   fetch_skips=skips)["targets"]]
+        self.assertEqual(picked(skip("access_wall", 6)), [])
+        self.assertEqual(picked(skip("access_wall", 7)), ["https://example.org/w"])
+        self.assertEqual(picked(skip("fetch_error", 1)), [])
+        self.assertEqual(picked(skip("fetch_error", 2)), ["https://example.org/w"])
+        self.assertEqual(picked(skip("host_halted", 0)), ["https://example.org/w"])
+        # Dynamic pages are re-hashed daily; a new hash does not lift a wall.
+        self.assertEqual(picked(skip("denied_http", 0, "f" * 64)), [])
+        self.assertEqual(picked(skip("access_wall", 0), url="https://example.org/other"), ["https://example.org/other"])
+        self.assertEqual(picked(skip("denied_http", 0, None)), [])
+        self.assertEqual(picked({"url": "https://example.org/w", "reason": "access_wall", "day": "bad"}),
+                         ["https://example.org/w"])
+
+    def test_proxy_down_fetch_error_is_not_cooled_down(self):
+        plan = planner.plan(export(*(candidate(gap_id=f"gap_{i}", url=f"https://example.org/{i}") for i in range(2))),
+                            limit=2)
+        def wait():
+            raise ConnectionRefusedError()
+        with patch.object(runner.PolicyFetcher, "fetch", side_effect=self._fetch_failing_first([])), \
+                patch.object(batch.socks_egress, "configured_proxy", return_value=("127.0.0.1", 1080)), \
+                patch.object(batch.socks_egress, "preflight", side_effect=ConnectionRefusedError()):
+            batch.execute(runner.ShadowRunner(self.config_path, clock=lambda: NOW), self.root, plan,
+                          key_loader=lambda: KEY, transport=self.transport, proxy_wait=wait)
+        self.assertEqual(state.read_fetch_skips(self.root), [])
+
     def test_key_in_plan_stops_before_persisting(self):
         plan = planner.plan(export(candidate(owner_name=KEY)))
         with self.assertRaisesRegex(common.Stop, "credential_in_record"):

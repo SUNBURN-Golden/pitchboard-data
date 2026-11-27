@@ -108,12 +108,32 @@ def read_db(path, now):
         raise Stop("invalid_gap_database") from None
 
 
-def plan(data, *, limit=None, history=(), config_hash=None):
+def recent_fetch_blocks(fetch_skips, day):
+    """URLs still cooling down on ``day``.
+
+    Keyed on URL only: the service crawler re-hashes dynamic pages daily, so a
+    changed content hash does not mean a walled or denied page became readable.
+    """
+    from .batch import FETCH_BLOCK_COOLDOWN_DAYS
+    blocked = set()
+    for s in fetch_skips or ():
+        try:
+            days = FETCH_BLOCK_COOLDOWN_DAYS[s["reason"]]
+            age = (day - dt.date.fromisoformat(s["day"])).days
+        except (KeyError, TypeError, ValueError):
+            continue
+        if 0 <= age < days and isinstance(s.get("url"), str):
+            blocked.add(s["url"])
+    return blocked
+
+
+def plan(data, *, limit=None, history=(), config_hash=None, fetch_skips=()):
     if limit is not None and (type(limit) is not int or limit < 0):
         raise Stop("invalid_limit")
     from .schema import PROMPT_HASH, SCHEMA_HASH
     reasons, candidates = Counter(), []
     rows = data["rows"]
+    blocked = recent_fetch_blocks(fetch_skips, stamp(data["exported_at_utc"]).date())
     latest = {}
     for row in rows:
         if not isinstance(row, dict):
@@ -187,6 +207,8 @@ def plan(data, *, limit=None, history=(), config_hash=None):
                        and same_source(h) and h.get("prompt_sha256") == PROMPT_HASH
                        and h.get("schema_sha256") == SCHEMA_HASH
                        and (config_hash is None or h.get("config_sha256") == config_hash) for h in history)
+            if r["url"] in blocked:
+                raise Stop("skip_recent_fetch_block")
             if done and r["predicate"] in STATIC:
                 raise Stop("skip_static_already_done")
             if done:
