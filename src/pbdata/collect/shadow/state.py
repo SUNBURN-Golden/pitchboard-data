@@ -16,7 +16,7 @@ from .common import (Stop, append_sync, dumps, loads, no_symlinks, pricing_at,
 
 def reservation(config, now, provider):
     """Optional legacy ceiling estimate for logging a dispatch before usage arrives."""
-    p = config.get("qwen_pricing" if provider == "qwen" else "pricing")
+    p = config.get({"qwen": "qwen_pricing", "codex": "codex_pricing"}.get(provider, "pricing"))
     rates = pricing_at(p, now)
     if rates is None or "input_token_reservation_ceiling" not in p:
         return None

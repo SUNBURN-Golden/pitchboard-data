@@ -412,17 +412,31 @@ def response(raw, doc, as_of, config, provider="deepseek", *, schema_shape=None,
              capture_repair_candidate=False, rejected=None):
     if schema_shape is not None:
         schema_shape.clear()
-    allowed = QWEN_MODELS if provider == "qwen" else DEEPSEEK_MODELS
+    if provider == "codex":
+        from .codex import CODEX_MODELS as allowed
+    else:
+        allowed = QWEN_MODELS if provider == "qwen" else DEEPSEEK_MODELS
     if not isinstance(raw, dict) or raw.get("model") not in allowed:
         raise Stop("model_mismatch")
     usage = raw.get("usage")
     if not isinstance(usage, dict) or not all(type(usage.get(k)) is int and usage[k] >= 0 for k in ("prompt_tokens", "completion_tokens", "total_tokens")):
         raise Stop("invalid_usage")
-    if (usage["total_tokens"] != usage["prompt_tokens"] + usage["completion_tokens"] or
-            usage["completion_tokens"] > config["max_output_tokens"]):
-        raise Stop("usage_invariant")
     details = usage.get("completion_tokens_details", {})
-    if not isinstance(details, dict) or details.get("reasoning_tokens", 0) != 0:
+    if not isinstance(details, dict):
+        raise Stop("usage_invariant")
+    reasoning = details.get("reasoning_tokens", 0)
+    # Codex runs GPT-6.2-Sol at reasoning effort high by design: reasoning tokens
+    # are expected there and the output cap applies to the visible answer only.
+    if provider == "codex":
+        if type(reasoning) is not int or not 0 <= reasoning <= usage["completion_tokens"]:
+            raise Stop("usage_invariant")
+        visible = usage["completion_tokens"] - reasoning
+    elif reasoning != 0:
+        raise Stop("usage_invariant")
+    else:
+        visible = usage["completion_tokens"]
+    if (usage["total_tokens"] != usage["prompt_tokens"] + usage["completion_tokens"] or
+            visible > config["max_output_tokens"]):
         raise Stop("usage_invariant")
     choices = raw.get("choices")
     if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict) or choices[0].get("finish_reason") != "stop":
@@ -455,4 +469,7 @@ def response(raw, doc, as_of, config, provider="deepseek", *, schema_shape=None,
     finally:
         if unwrapped_list and schema_shape is not None:
             schema_shape["unwrapped_list"] = True
-    return fields, reasons, {k: usage[k] for k in ("prompt_tokens", "completion_tokens", "total_tokens")}
+    kept = {k: usage[k] for k in ("prompt_tokens", "completion_tokens", "total_tokens")}
+    if provider == "codex":
+        kept["reasoning_tokens"] = reasoning
+    return fields, reasons, kept
