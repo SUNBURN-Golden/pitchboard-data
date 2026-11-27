@@ -11,8 +11,8 @@ from typing import Dict, List, Optional, Tuple
 from ..collect.dates import find_dates
 from ..collect.parse import Doc, Link, Segment
 
-EXTRACTOR_VERSION = "pb-rules-7"   # 7: explicit submission-fee payment instructions can state a fee without an amount
-LABELER_VERSION = "pb-labels-5"    # 5: "review" alone does not make a literary body;  4: an open call needs writing context (title/heading/URL cue or a literary body); 3: non-writing titles block rules-only calls
+EXTRACTOR_VERSION = "pb-rules-8"   # 8: academic meeting/conference deadline lines are not writing deadlines;  7: explicit submission-fee payment instructions can state a fee without an amount
+LABELER_VERSION = "pb-labels-6"    # 6: academic meeting/conference pages are not writing calls;  5: "review" alone does not make a literary body;  4: an open call needs writing context (title/heading/URL cue or a literary body); 3: non-writing titles block rules-only calls
 OCR_EXTRACTOR = "ocr:tesseract+rules"
 
 # Fields a Pitchboard call/outlet must eventually have; importance feeds gap priority.
@@ -216,7 +216,10 @@ YEAR_RE = re.compile(r"(?<!\d)(20\d{2})(?!\d)")
 #  - NONWRITING_TYPE: notice types that are never a writing call, even when a literary word appears;
 #  - NONWRITING_DISC: other disciplines and events (forum, screening), which are overridden by any writing cue (희곡/극본 = playwriting, 미술 비평 = criticism).
 NONWRITING_TYPE = re.compile(r"(대관|채용|입찰|용역|입학|신입생|신입\s*회원|회원\s*모집|(?:특별|일반|서류|면접|실기)\s*전형|공모\s*직위|임용|venue (hire|rental)|job (opening|vacanc)|we(?:'re| are) hiring)", re.I)
-NONWRITING_DISC = re.compile(r"(행사\s*(?:안내|소개)|포럼|세미나|심포지엄|토론회|설명회|공연\s*실황|상영|무용|댄스|발레|연극|뮤지컬|오페라|공연장|미술|시각\s*예술|공예|음악|국악|전시|영화|\bdance\b|tanz|탄츠|\bballet\b|\btheat(?:re|er)\b|\bvisual arts?\b|\bmusic(?:al)?\b|\bexhibition\b|\bfilm\b)", re.I)
+NONWRITING_DISC = re.compile(r"(행사\s*(?:안내|소개)|포럼|세미나|심포지엄|토론회|설명회|공연\s*실황|상영|무용|댄스|발레|연극|뮤지컬|오페라|공연장|미술|시각\s*예술|공예|음악|국악|전시|영화|\bdance\b|tanz|탄츠|\bballet\b|\btheat(?:re|er)\b|\bvisual arts?\b|\bmusic(?:al)?\b|\bexhibition\b|\bfilm\b|"
+                             # academic meetings: a "call for proposals" for panels/papers at a political-science or other scholarly
+                             # meeting is not a writing call (11-27: connect.apsanet.org/apsa2027, "APSA Annual Meeting 2027", stayed open)
+                             r"\bannual meetings?\b|\bconferences?\b|\bconventions?\b|\bsymposi(?:um|a)\b|\bcolloqui(?:um|a)\b|\bcongress(?:es)?\b|학술\s*대회|학회)", re.I)
 # Scholarships may be literary awards: a writing title or writing-submission segment overrides this gate.
 # Generic award/prize words alone are deliberately absent.
 NONWRITING_FINANCE = re.compile(r"\b(scholarships?|bursar(?:y|ies)|entrance[- ]awards?|financial[- ]aid|tuition|fees[- ]and[- ]finances)\b", re.I)
