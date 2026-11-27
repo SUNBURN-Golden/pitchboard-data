@@ -16,6 +16,7 @@ from .common import (CONFIG, Stop, call_usage, digest, dumps, load_config, load_
 from .policy import PolicyFetcher, canonical_url
 from .schema import VERSION, PROMPT_HASH, SCHEMA_HASH, SchemaRepairCandidate, repair_body, request_body, response
 from .state import State
+from .codex import BalanceGate, CODEX_EFFORT, CODEX_MODEL, codex_provider
 from . import source_cache
 from ..net import NoRedirect
 from ..parse import PARSER_VERSION
@@ -26,10 +27,12 @@ ENDPOINT = "https://api.deepseek.com/chat/completions"
 QWEN_ENDPOINT = "https://token-plan.maas.qwencloudapi.com/compatible-mode/v1/chat/completions"
 ALLOWED_PROVIDER_HOSTS = frozenset({"api.deepseek.com", "token-plan.maas.qwencloudapi.com"})
 FALLBACK_CODES = frozenset({"provider_error", "provider_http_error"})
+# DeepSeek is blocked (no balance): run the same request through Codex instead of Qwen.
+UNAVAILABLE_CODES = frozenset({"provider_insufficient_balance"})
 REPAIR_SCHEMA_CODES = frozenset({"invalid_schema", "invalid_model_json", "duplicate_json_key", "invalid_json_number"})
 RECORD_STOPS = frozenset({
     "provider_http_error", "provider_too_large", "provider_error", "duplicate_json_key",
-    "invalid_json_number", "model_mismatch", "invalid_usage", "usage_invariant",
+    "invalid_json_number", "provider_insufficient_balance", "model_mismatch", "invalid_usage", "usage_invariant",
     "invalid_completion", "invalid_model_json", "invalid_schema", "credential_in_response",
     "dispatch_clock_changed", "inactive_window", "disabled", "invalid_config", "config_changed"})
 
@@ -80,12 +83,27 @@ def provider(body, key, timeout, endpoint=ENDPOINT):
             data = resp.read(262145)
             if len(data) > 262144:
                 raise Stop("provider_too_large")
-        return loads(data)
+        data = loads(data)
+        if insufficient_balance(data):
+            raise Stop("provider_insufficient_balance")
+        return data
     except Stop:
         raise
+    except urllib.error.HTTPError as exc:
+        # DeepSeek answers an empty account with HTTP 402; nothing else is read.
+        if exc.code == 402:
+            raise Stop("provider_insufficient_balance") from None
+        raise Stop("provider_error") from None
     except Exception:
         # No exception text/headers/body: provider errors can contain credentials.
         raise Stop("provider_error") from None
+
+
+def insufficient_balance(data):
+    """DeepSeek reports an empty account as HTTP 402 or an 'Insufficient Balance' error."""
+    err = data.get("error") if isinstance(data, dict) else None
+    text = " ".join(str(err.get(k, "")) for k in ("message", "type", "code")) if isinstance(err, dict) else ""
+    return "insufficient" in text.lower() and "balance" in text.lower()
 
 
 def qwen_provider(body, key, timeout):
@@ -97,8 +115,10 @@ def _stop_code(exc):
 
 
 class ShadowRunner:
-    def __init__(self, config=CONFIG, clock=utcnow):
+    def __init__(self, config=CONFIG, clock=utcnow, balance_gate=None):
         self.config_path, self.clock = config, clock
+        # One gate per runner, so a batch checks the DeepSeek balance ~every 10 min.
+        self.balance_gate = balance_gate or BalanceGate()
 
     def _dispatch_time(self, config, day, reserved_at):
         dispatch = self.clock()
@@ -110,7 +130,7 @@ class ShadowRunner:
 
     def run(self, *, shadow_root, url=None, page=None, as_of=None, fetcher=None,
             transport=None, key_loader=None, fallback_transport=None, fallback_key_loader=None,
-            extra_protected=(), target=None, digest_languages=(), batch_day=None):
+            codex_transport=None, deepseek_available=None, extra_protected=(), target=None, digest_languages=(), batch_day=None):
         """Disabled path has no side effects. A Page is accepted for cached eval only."""
         try:
             config = load_config(self.config_path, self.clock())
@@ -187,7 +207,8 @@ class ShadowRunner:
                           "as_of_source": "frozen cohort KST calendar date" if page.provenance == "offline_cached" else "UTC calendar date",
                           "baseline": rules, "gap_target": target,
                           "requested_model": config["model"], "returned_model": None,
-                          "provider": "deepseek", "provider_calls": 0, "calls": [], "fallback_from": None,
+                          "provider": "deepseek", "provider_model": "deepseek-flash", "reasoning_effort": None,
+                          "provider_calls": 0, "calls": [], "fallback_from": None,
                           "repair_attempted": False, "repair_outcome": None,
                           "reserved_usd": "0", "charged_ceiling_usd": "0", "usage": None,
                           "fields": None, "validation_reasons": {}, "rejected_candidates": {}, "schema_shape": {}, "outcome": "unknown"}
@@ -195,6 +216,13 @@ class ShadowRunner:
                 primary = transport or provider
                 # Custom transports stay primary-only unless a fallback is injected.
                 fb_transport = fallback_transport or (qwen_provider if transport is None else None)
+                cx_transport = codex_transport or (codex_provider if transport is None else None)
+                if deepseek_available is not None:
+                    available = deepseek_available
+                elif transport is None:
+                    available = self.balance_gate.available
+                else:
+                    available = None
                 secrets = [key]
                 repair = None
 
@@ -204,18 +232,28 @@ class ShadowRunner:
                                   provider_calls=record["provider_calls"] + 1)
                     if phase == "fallback":
                         record.update(provider=provider_name, fallback_from=record["outcome"])
+                        if provider_name == "codex":
+                            record.update(provider_model=CODEX_MODEL, reasoning_effort=CODEX_EFFORT,
+                                          requested_model=CODEX_MODEL)
+                        elif provider_name == "qwen":
+                            record.update(provider_model=request_body(doc, as_of, config, provider="qwen")["model"])
                     elif phase == "repair":
                         record.update(repair_attempted=True, repair_outcome="provider_error")
                     telemetry = dict(call_usage(provider_name, None, None), phase=phase)
+                    if provider_name == "codex":
+                        telemetry.update(model=CODEX_MODEL, reasoning_effort=CODEX_EFFORT)
                     record["calls"].append(telemetry)
                     raw = send(request, credential, config["timeout_seconds"])
-                    rates = config.get("qwen_pricing" if provider_name == "qwen" else "pricing")
+                    rates = config.get({"qwen": "qwen_pricing", "codex": "codex_pricing"}.get(provider_name, "pricing"))
                     telemetry.update(call_usage(provider_name, raw, pricing_at(rates, dispatch)))
                     if any(secret in dumps(raw) for secret in secrets):
                         raise Stop("credential_in_response")
                     return raw
 
                 try:
+                    if available is not None and cx_transport is not None and not available(key):
+                        # Balance check says DeepSeek is blocked: no DeepSeek call is made.
+                        raise Stop("deepseek_unavailable")
                     dispatch = self._dispatch_time(config, day, now)
                     raw = invoke(primary, body, key, "deepseek", dispatch, phase="primary")
                     fields, reasons, usage = response(raw, doc, as_of, config,
@@ -225,12 +263,31 @@ class ShadowRunner:
                                   returned_model=raw["model"], outcome="ok", provider="deepseek")
                 except Stop as exc:
                     # Only local fixed reasons; an injected transport cannot leak text.
-                    record["outcome"] = _stop_code(exc)
+                    record["outcome"] = "deepseek_unavailable" if str(exc) == "deepseek_unavailable" else _stop_code(exc)
                     if isinstance(exc, SchemaRepairCandidate):
                         repair = (exc.prior, primary, key, body)
                 except Exception:
                     record["outcome"] = "provider_error"
-                if record["outcome"] in FALLBACK_CODES and fb_transport is not None:
+                if record["outcome"] == "provider_insufficient_balance" and available is self.balance_gate.available:
+                    self.balance_gate.mark_unavailable()
+                if (record["outcome"] in UNAVAILABLE_CODES or record["outcome"] == "deepseek_unavailable") and cx_transport is not None:
+                    # Same prompt, same messages, same grounding checks; only the provider differs.
+                    try:
+                        dispatch = self._dispatch_time(config, day, now)
+                        raw = invoke(cx_transport, body, key, "codex", dispatch, phase="fallback")
+                        fields, reasons, usage = response(raw, doc, as_of, config, provider="codex",
+                                                          schema_shape=record["schema_shape"],
+                                                          rejected=record["rejected_candidates"])
+                        record.update(fields=fields, validation_reasons=reasons, usage=usage,
+                                      returned_model=raw["model"], outcome="ok")
+                    except Stop as exc:
+                        if record["fallback_from"] is not None:
+                            record["outcome"] = _stop_code(exc)
+                            if isinstance(exc, SchemaRepairCandidate):
+                                repair = (exc.prior, cx_transport, key, body)
+                    except Exception:
+                        record.update(outcome="provider_error", provider="codex")
+                elif record["outcome"] in FALLBACK_CODES and fb_transport is not None:
                     fb_key = ""
                     try:
                         fb_key = (fallback_key_loader or load_qwen_key)()
