@@ -41,6 +41,8 @@ class Ctx:
         site_page_cap = os.environ.get("PB_MAX_PAGES_PER_SITE")
         self.site_page_cap = int(site_page_cap) if site_page_cap is not None else self.limits.get("max_pages_per_site")
         self.sitemap_cache: Dict[Tuple[str, Optional[int]], List[str]] = {}
+        self.job_deadline: Optional[float] = None      # wall-clock end of the current site job's slice (set by run)
+        self.job_clock: Callable[[], float] = time.time
         self.stats: Dict[str, int] = {}
         self.touched = set()
 
@@ -258,6 +260,20 @@ def _enqueue_gap_jobs(ctx: Ctx, site, now: str) -> None:
                           "gap|%s|%d|%s" % (g["gap_id"], g["attempts"], ctx.run_tag), scheduler.priority(novelty=0.5, gap_importance=g["importance"], quality=0.6, cost=0.3), now)
 
 
+def _job_time_up(ctx: Ctx) -> bool:
+    d = getattr(ctx, "job_deadline", None)
+    return d is not None and ctx.job_clock() >= d
+
+
+def SITE_JOB_MAX_S() -> float:
+    """Wall-clock seconds one sitemap-walking job (gap_fill / expand_site) may spend (PB_SITE_JOB_MAX_S, default 600; 0 = no cap).
+
+    11-27: with no sitemap_files limit one gap_fill job walked every georgetown.edu subdomain sitemap (2 s throttle
+    per host plus robots per host) for 1-2 h per chunk, ran each 30-min drain chunk to 1-2 pages, and came back
+    after every lease expiry. The run budget was only checked between jobs."""
+    return float(os.environ.get("PB_SITE_JOB_MAX_S", "600"))
+
+
 def _sitemap_urls(ctx: Ctx, origin: str, limit: Optional[int] = None) -> List[str]:
     if limit is None:
         limit = ctx.limits.get("sitemap_urls")
@@ -269,6 +285,9 @@ def _sitemap_urls(ctx: Ctx, origin: str, limit: Optional[int] = None) -> List[st
     queue, seen = deque(cands), set()
     max_files = ctx.limits.get("sitemap_files")
     while queue and (max_files is None or len(seen) < max_files) and (limit is None or len(urls) < limit):
+        if _job_time_up(ctx):
+            ctx.bump("sitemap_walk_time_up")
+            break
         sm = queue.popleft()
         if sm in seen or not _same_site(sm, origin):
             continue
@@ -289,6 +308,8 @@ def h_expand_site(ctx: Ctx, p: dict, job) -> dict:
     origin = site["origin"]
     urls = _sitemap_urls(ctx, origin)
     for f in p.get("feeds", [])[:ctx.limits.get("feeds")]:
+        if _job_time_up(ctx):
+            break
         res = ctx.fetcher.fetch(f, accept="application/rss+xml,application/atom+xml,application/xml", now_iso=now)
         if res.outcome == "ok":
             urls += [it["link"] for it in parse.parse_feed(res.body)[:ctx.limits.get("feed_items")] if it["link"]]
@@ -322,7 +343,12 @@ def h_gap_fill(ctx: Ctx, p: dict, job) -> dict:
     scored = sorted(((sum(1 for h in hints if h in u.lower()), u) for u in dict.fromkeys(map(page_url, urls))
                      if u is not None and u not in fetched and not re.search(r"/(19|20(0\d|1\d))/|/tag/|/category/", u)), reverse=True)
     pick = [u for s, u in scored if s > 0][:ctx.limits.get("gap_pages")]
+    tried = []
     for u in pick:
+        if _job_time_up(ctx):
+            ctx.bump("gap_fill_time_up")
+            break
+        tried.append(u)
         r = executor.fetch_page(ctx.svc, ctx.fetcher, u, p["site_source_id"], now, run_id=ctx.run_id, depth=3, infra=ctx.infra)
         if r.outcome == "ok" and r.change_state != "unchanged":
             promote.promote_raw(ctx.svc, r.raw_id, now)
@@ -333,7 +359,7 @@ def h_gap_fill(ctx: Ctx, p: dict, job) -> dict:
     ctx.bump("gap_fill_attempts")
     if st == "filled":
         ctx.bump("gaps_filled_by_search")
-    return {"tried": pick, "state": st, "requests": len(pick)}
+    return {"tried": tried, "state": st, "requests": len(tried)}
 
 
 HANDLERS = {"discover": h_discover, "evaluate": h_evaluate, "fetch_page": h_fetch_page, "expand_site": h_expand_site, "gap_fill": h_gap_fill}
@@ -566,6 +592,12 @@ def _run_loop(ctx, max_jobs, log, time_budget_s, monotonic, deadline, run_lanes,
             job_end = monotonic() + DISCOVER_JOB_MAX_S()
             ctx.api.deadline = job_end if run_api_deadline is None else min(job_end, run_api_deadline)
             ctx.api.deadline_clock = monotonic
+        ctx.job_deadline, ctx.job_clock = None, monotonic
+        if job["kind"] in ("gap_fill", "expand_site") and SITE_JOB_MAX_S() > 0:
+            job_end = monotonic() + SITE_JOB_MAX_S()
+            ctx.job_deadline = job_end if deadline is None else min(job_end, deadline)
+        elif deadline is not None:
+            ctx.job_deadline = deadline
         try:
             res = HANDLERS[job["kind"]](ctx, payload, job)
             scheduler.finish(ctx.infra, job["job_id"], res, now)
@@ -575,6 +607,7 @@ def _run_loop(ctx, max_jobs, log, time_budget_s, monotonic, deadline, run_lanes,
             ctx.bump("job_errors")
         if hasattr(ctx.api, "deadline"):
             ctx.api.deadline = run_api_deadline
+        ctx.job_deadline = None
         used = ctx.fetcher.requests + ctx.api.calls - before
         scheduler.budget_add(ctx.infra, day, job["budget_class"], "requests", used)
         scheduler.checkpoint(ctx.infra, ctx.run_id, "last_job", {"job_id": job["job_id"], "kind": job["kind"], "done": done + 1}, now)
