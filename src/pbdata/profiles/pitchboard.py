@@ -11,8 +11,8 @@ from typing import Dict, List, Optional, Tuple
 from ..collect.dates import find_dates
 from ..collect.parse import Doc, Link, Segment
 
-EXTRACTOR_VERSION = "pb-rules-8"   # 8: academic meeting/conference deadline lines are not writing deadlines;  7: explicit submission-fee payment instructions can state a fee without an amount
-LABELER_VERSION = "pb-labels-6"    # 6: academic meeting/conference pages are not writing calls;  5: "review" alone does not make a literary body;  4: an open call needs writing context (title/heading/URL cue or a literary body); 3: non-writing titles block rules-only calls
+EXTRACTOR_VERSION = "pb-rules-9"   # 9: a board post's 마감일/게시기간 metadata line is not a deadline;  8: academic meeting/conference deadline lines are not writing deadlines;  7: explicit submission-fee payment instructions can state a fee without an amount
+LABELER_VERSION = "pb-labels-7"    # 7: board 마감일/게시기간 metadata is not a deadline (re-labels and re-extracts live calls);  6: academic meeting/conference pages are not writing calls;  5: "review" alone does not make a literary body;  4: an open call needs writing context (title/heading/URL cue or a literary body); 3: non-writing titles block rules-only calls
 OCR_EXTRACTOR = "ocr:tesseract+rules"
 
 # Fields a Pitchboard call/outlet must eventually have; importance feeds gap priority.
@@ -303,6 +303,26 @@ class Ext:
     confidence: float = 1.0
 
 
+# Korean board view pages print the post's display period in a metadata block next to the view count and posting date:
+# "시작일 2026.11.11 / 마감일 2026.11.12 / 조회수 976 / 등록일 2026.11.03 / 담당부서 ...". That 마감일 is when the post stops
+# being shown, not an application deadline (11-27: ARKO 성과공유회 and ESG 공유회 notices became calls "closing" on their
+# posting end date). A real deadline is stated in the body ("모집 마감 : 2026년 10월 5일").
+POSTING_PERIOD_LINE = re.compile(r"^\s*(?:마감일|종료일|시작일|게시\s*(?:시작|종료|마감)\s*일?|게시\s*기간|공고\s*기간|노출\s*기간)\s*[:：]?\s*"
+                                 r"\d{4}[.\-/]\s*\d{1,2}[.\-/]\s*\d{1,2}\.?(?:\s*[~∼–-]\s*\d{4}[.\-/]\s*\d{1,2}[.\-/]\s*\d{1,2}\.?)?\s*$")
+BOARD_META_LINE = re.compile(r"^\s*(?:조회수?|등록일|작성일|작성자|게시일|담당\s*부서|담당자|글쓴이|views?|hits?)\s*[:：]?\s*\S", re.I)
+BOARD_META_SPAN = 3
+
+
+def board_posting_period(segments, i: int) -> bool:
+    """True when segment i is a bare 마감일/게시기간 date line inside a board post's metadata block."""
+    if not POSTING_PERIOD_LINE.match(segments[i].text):
+        return False
+    if re.match(r"^\s*게시|^\s*공고\s*기간|^\s*노출", segments[i].text):
+        return True
+    near = segments[max(0, i - BOARD_META_SPAN):i] + segments[i + 1:i + 1 + BOARD_META_SPAN]
+    return any(BOARD_META_LINE.match(s.text) for s in near)
+
+
 def window(text: str, start: int, end: int, width: int = 270) -> str:
     if len(text) <= width:
         return text
@@ -333,6 +353,7 @@ def extract(doc: Doc, ocr: bool = False) -> List[Ext]:
         hits = find_dates(t)
         if hits and DEADLINE_CUE.search(t) and not (NOT_DEADLINE_CUE.search(t) and not re.search(r"deadline|마감|접수|submit|due", t, re.I)) \
                 and not page_nonwriting \
+                and not board_posting_period(doc.segments, si) \
                 and not non_writing(t + " " + seg.heading, writing_context) \
                 and not (len(t) <= ROW_LINE_MAX and non_writing(row_context(doc.segments, si) + " " + t, writing_context)):
             # e.g. a dance-residency board row, '마감일' under an event/hiring notice heading, or a short '접수 :' line under a
