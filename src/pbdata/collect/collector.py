@@ -16,7 +16,7 @@ from .. import facts, timeutil
 from ..db import transaction
 from ..profiles import pitchboard as prof
 from . import discover, evaluate, executor, gaps, names, parse, promote, resolve, scheduler, store
-from .net import Fetcher, FetchResult, normalize_url, origin_of, page_url, registered_domain
+from .net import Fetcher, FetchResult, normalize_url, off_topic_page_url, origin_of, page_url, registered_domain
 from .wiki import Api
 
 LANES = ("discovery", "backfill", "freshness")
@@ -147,12 +147,20 @@ def _site_page_count(ctx, site_source_id: str) -> int:
                            (site["site_outlet"], ctx.run_id)).fetchone()[0]
 
 
+def _backs_live_call(svc: sqlite3.Connection, url: str) -> bool:
+    return svc.execute("SELECT 1 FROM pb_fact f JOIN pb_source s ON s.source_id=f.source_id JOIN pb_call_edition c ON c.call_id=f.subject_id "
+                       "WHERE s.canonical_url=? AND f.subject_type='call' AND f.superseded_at IS NULL "
+                       "AND c.status IN ('announced','open','extended','standing') LIMIT 1", (url,)).fetchone() is not None
+
+
 def h_fetch_page(ctx: Ctx, p: dict, job) -> dict:
     now = ctx.clock()
     url, site_id, depth = normalize_url(p["url"]), p["site_source_id"], p.get("depth", 1)
     if (ctx.site_page_cap is not None and p.get("via") not in ("trial", "refresh", "gap", "retry")
             and _site_page_count(ctx, site_id) >= ctx.site_page_cap):
         return {"skipped": "site_page_cap"}
+    if p.get("via") in ("refresh", "retry") and off_topic_page_url(url) and not _backs_live_call(ctx.svc, url):
+        return {"skipped": "off_topic_path"}
     site = store.site_row(ctx.svc, site_id)
     ctx.touched.add((site["site_outlet"], site["target_id"]))
     if site["permission"] not in ("allowed_public", "allowed_conditional") or store.is_blocked(urlparse(url).netloc):
@@ -408,6 +416,9 @@ def refresh_candidates(svc: sqlite3.Connection, now: str, horizon_hours: float =
                 due = now if due is None else min(due, now)
             if due is not None and (r["refresh_fresh_until"] is None or due < r["refresh_fresh_until"]):
                 r["refresh_fresh_until"] = due
+    # Off-topic institutional pages (HR, payroll, admissions, campus calendars) are refreshed only while they back a live
+    # call; 11-27: 912 of 4,228 queued refresh jobs were such pages (779 on kent.edu).
+    rows = [r for r in rows if r["refresh_fresh_until"] is not None or not off_topic_page_url(r["url"])]
     for r in rows:
         del r["text_hash"]
     return sorted(rows, key=lambda r: (0, r["refresh_fresh_until"], r["url"])
@@ -472,7 +483,7 @@ def retry_candidates(svc: sqlite3.Connection, now: str) -> List[dict]:
         "sum(CASE WHEN r.outcome IN ('timeout','server_error') OR (r.outcome='error' AND r.error_class IN (%s)) "
         "THEN 0 ELSE 1 END) AS permanent "
         "FROM pb_raw_ref r JOIN pb_source s USING(source_id) "
-        "WHERE s.retired_reason IS NULL AND s.last_success_at IS NULL AND s.source_type<>'manual_clip' "
+        "WHERE s.retired_reason IS NULL AND s.deprioritized_reason IS NULL AND s.last_success_at IS NULL AND s.source_type<>'manual_clip' "
         "AND s.permission IN ('allowed_public','allowed_conditional') "
         "AND NOT EXISTS (SELECT 1 FROM pb_raw_ref ok WHERE ok.source_id=s.source_id AND ok.outcome='ok') "
         "GROUP BY r.url, r.source_id ORDER BY last, r.url" % ",".join("?" * len(RETRY_ERROR_CLASSES)),

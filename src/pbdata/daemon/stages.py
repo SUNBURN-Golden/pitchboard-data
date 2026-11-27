@@ -57,7 +57,8 @@ def s_discovery(c: RunContext) -> dict:
 # 2 ---------------------------------------------------------------- incremental fetch (+ manual clips)
 def s_incremental_fetch(c: RunContext) -> dict:
     out = {"clips": clips.ingest_dir(c.svc, c.root, c.clock()),
-           "junk_sources_retired": store.retire_junk_sources(c.svc)}
+           "junk_sources_retired": store.retire_junk_sources(c.svc),
+           "off_topic_sources_deprioritized": store.deprioritize_off_topic_sources(c.svc)}
     if c.opts.get("offline"):
         return out
     cctx = _collector_ctx(c)
@@ -269,7 +270,7 @@ def s_quality_check(c: RunContext) -> dict:
     q["dead_letter_jobs"] = c.infra.execute("SELECT count(*) FROM job WHERE state='dead'").fetchone()[0]
     q["failure_queue_open"] = c.infra.execute("SELECT count(*) FROM failure_queue WHERE state='open'").fetchone()[0]
     # Raw history is authoritative: historical successful writers left last_success_at NULL.
-    q["sources_never_succeeded"] = svc.execute("SELECT count(*) FROM pb_source s WHERE s.retired_reason IS NULL "
+    q["sources_never_succeeded"] = svc.execute("SELECT count(*) FROM pb_source s WHERE s.retired_reason IS NULL AND s.deprioritized_reason IS NULL "
                                               "AND s.permission IN ('allowed_public','allowed_conditional') "
                                               "AND NOT EXISTS (SELECT 1 FROM pb_raw_ref r WHERE r.source_id=s.source_id AND r.outcome='ok')").fetchone()[0]
     q.update(metrics.source_fetch_counts(svc))
