@@ -10,4 +10,4 @@ mkdir -p "$ROOT/logs" "$ROOT/locks"
 exec >>"$ROOT/logs/qwen_bot.log" 2>&1
 exec 9>>"$ROOT/locks/qwen_bot.lock"
 flock -n 9 || { echo "$(date -Is) qwen bot already running"; exit 0; }
-exec python3 -u -c 'from pbdata.handoff.bot import main; raise SystemExit(main(lock_held=True))' --root "$ROOT"
+exec python3 -u -c 'from pbdata.handoff.bot import main; raise SystemExit(main(lock_held=True))' --root "$ROOT" "$@"

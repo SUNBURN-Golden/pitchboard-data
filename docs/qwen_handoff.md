@@ -1,18 +1,36 @@
-# Pitchboard Qwen handoff
+# Pitchboard handoff bot (Codex) and daemon
+
+> Provider change 2026-11-28: the bot no longer calls Qwen. Extraction runs on
+> Codex `gpt-6.2-sol` at reasoning effort `high`, through the same tool-less
+> `codex exec` call the DeepSeek shadow uses as its fallback
+> (`src/pbdata/collect/shadow/codex.py`, PR #62). Prompt, request messages,
+> grounding checks and the batch/item format are unchanged. Every item records
+> `provider`, `model`, `reasoning_effort` and `returned_model`, every call
+> records `provider`, token usage and `seconds`, and each run record in
+> `usage.jsonl` carries `provider`, `model`, `reasoning_effort`,
+> `targets_total` and `stopped`. File and folder names (`handoff/qwen`,
+> `config/qwen_bot.json`, `scripts/qwen_bot.sh`, the item key `qwen`) are kept
+> for compatibility with the daemon, replay and existing batches. Qwen remains
+> only as an explicit `--provider qwen` option; it is never used as a fallback.
 
 The collection bot reads a temporary SQLite backup of the service DB. It
 selects active official sources and sources with live call deadlines, then
 fetches through Pitchboard's SOCKS5 egress and robots policy. It runs the
-deterministic rules and sends sanitized page text to Qwen for a second opinion.
-A published batch contains the page records and a checksummed manifest. The
-daemon re-runs the rules on the stored text, applies the verified results to the
-service DB, updates its projection, and rebuilds the site from a committed Git
-tree with the evidence-backed overlay.
+deterministic rules and sends sanitized page text to Codex for a second
+opinion. A published batch contains the page records and a checksummed
+manifest. The daemon re-runs the rules on the stored text, applies the verified
+results to the service DB, updates its projection, and rebuilds the site from a
+committed Git tree with the evidence-backed overlay.
 
-Qwen uses the existing token-plan key loader. The Qwen API, Cloudflare Pages
-API, and alerts dispatch use direct egress. Page fetches require the SOCKS5
-proxy. No assistant tokens or assistant services are used at runtime. The site
-fetch from GitHub is best effort and falls back to committed local main.
+Codex runs with the box's Codex CLI login (`/home/box/.local/bin/codex`); no
+API key is read. Pages are fetched in priority order on one thread and
+extracted on `--workers` (default 4) parallel Codex turns. Because the bot
+holds the daily and collector locks while it runs, a run stops dispatching new
+pages after `--time-budget` seconds (default 3 h; in-flight extractions
+finish, up to the 300 s Codex timeout). Unvisited targets are taken first in
+the next run. `--max-pages` and `--lock-wait` are available for test runs.
+The Cloudflare Pages API and alerts dispatch use direct egress. Page fetches
+require the SOCKS5 proxy.
 
 ## Schedule
 
@@ -22,7 +40,7 @@ daemon runs at 13:00 KST.
 These are the proposed cron entries for the box operator.
 
 ```cron
-# Pitchboard Qwen bot / handoff daemon (Qwen only; no assistant tokens)
+# Pitchboard handoff bot (Codex gpt-6.2-sol high) / handoff daemon
 0 11,18 * * * PATH=/usr/local/bin:/usr/bin:/bin /workspace/pitchboard-data-main/scripts/qwen_bot.sh # pb-qwen-bot
 0 13 * * * PATH=/usr/local/bin:/usr/bin:/bin /workspace/pitchboard-data-main/scripts/handoff_daemon.sh # pb-handoff-daemon
 ```
@@ -43,12 +61,12 @@ the data root unless specified.
 | `handoff/qwen/inbox/` | Batches awaiting processing |
 | `handoff/qwen/processed/`, `handoff/qwen/failed/` | Batches with a terminal ledger entry |
 | `handoff/qwen/ledger.sqlite3` | One terminal state and outcome detail per batch |
-| `handoff/qwen/review/<batch_id>.json` | Rules agreement by field and advisory Qwen values and evidence |
+| `handoff/qwen/review/<batch_id>.json` | Rules agreement by field and advisory LLM (Codex) values and evidence |
 | `handoff/site_overlay.json` | Accepted source checks and verified call deadlines with evidence IDs |
 | `exports/projection_latest.json` | Refreshed service search projection |
 | `backups/pitchboard_kg.pre-qwen-handoff-*.sqlite3` | Up to 14 pre-write service backups |
 
-The bot retries a schema-class Qwen failure once with the rejected output
+The bot retries a schema-class LLM failure once with the rejected output
 and validation error. Both passes treat omitted fields as null and check
 every retained field against the page text. Both requests count toward
 `max_llm_calls_per_run` in `config/qwen_bot.json`. If the first request uses
