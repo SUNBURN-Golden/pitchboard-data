@@ -19,6 +19,7 @@ import fixture_site
 from helpers import add_outlet, add_source, service
 from pbdata import db, timeutil
 from pbdata.collect.shadow import policy, schema
+from pbdata.collect.shadow.codex import CODEX_MODEL
 from pbdata.handoff import batch, bot, daemon, deploy, replay, site, status
 
 NOW = timeutil.parse_iso("2026-11-20T04:00:00Z")
@@ -27,7 +28,7 @@ SECRET = "qwen-fixture-key-should-never-be-persisted"
 
 
 def provider_response(fields):
-    return {"model": schema.QWEN_MODEL, "usage": {"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25},
+    return {"model": CODEX_MODEL, "usage": {"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25},
             "choices": [{"finish_reason": "stop", "message": {"content": json.dumps(fields)}}]}
 
 
@@ -291,6 +292,42 @@ class HandoffTest(unittest.TestCase):
         self.assertEqual((len(data.splitlines()), manifest["llm_calls"], manifest["total_tokens"]), (45, 45, 1125))
         self.assertIsNone(manifest["estimated_cost_usd"])
         self.assertEqual(json.loads((self.folder / "usage.jsonl").read_bytes()), result)
+
+    def test_bot_runs_on_codex_and_records_provider_per_item(self):
+        with closing(db.connect(self.live)) as svc:
+            for i in range(7):
+                add_source(svc, f"https://fixture.example/calls/codex-{i}", outlet=self.outlet_id)
+        fetcher = FakeFetcher()
+        transport = Mock(return_value=provider_response(dict.fromkeys(schema.FIELDS)))
+        # No key loader: Codex needs no API key.
+        result = bot.run(self.root, probe=lambda: True, fetcher_factory=Mock(return_value=fetcher),
+                         transport=transport, clock=lambda: NOW, workers=3)
+        self.assertEqual(("ok", 8, 8), (result["outcome"], result["pages_ok"], result["llm_calls"]))
+        self.assertEqual(("codex", CODEX_MODEL, "high"),
+                         (result["provider"], result["model"], result["reasoning_effort"]))
+        path, data = next(batch.ready_batches(self.inbox))
+        items = [json.loads(line) for line in data.splitlines()]
+        self.assertEqual(fetcher.urls, [item["url"] for item in items])
+        for item in items:
+            self.assertEqual(("codex", CODEX_MODEL, "high", CODEX_MODEL),
+                             (item["provider"], item["model"], item["reasoning_effort"], item["returned_model"]))
+            self.assertEqual(["codex"], [call["provider"] for call in item["calls"]])
+            self.assertEqual(dict.fromkeys(schema.FIELDS), item["qwen"])
+
+    def test_bot_time_budget_and_max_pages(self):
+        with closing(db.connect(self.live)) as svc:
+            for i in range(5):
+                add_source(svc, f"https://fixture.example/calls/budget-{i}", outlet=self.outlet_id)
+        transport = Mock(return_value=provider_response(dict.fromkeys(schema.FIELDS)))
+        result = bot.run(self.root, probe=lambda: True, fetcher_factory=Mock(return_value=FakeFetcher()),
+                         transport=transport, clock=lambda: NOW, max_pages=2, workers=1)
+        self.assertEqual((2, 2, 6), (result["pages_ok"], transport.call_count, result["targets_total"]))
+        ticks = iter([0, 0, 0, 10_000, 10_000, 10_000])
+        transport.reset_mock()
+        result = bot.run(self.root, probe=lambda: True, fetcher_factory=Mock(return_value=FakeFetcher()),
+                         transport=transport, clock=lambda: NOW + dt.timedelta(days=1), time_budget=60,
+                         monotonic=lambda: next(ticks), workers=1)
+        self.assertEqual(("time_budget", 2), (result["stopped"], result["pages_ok"]))
 
     def test_default_daemon_consumes_more_than_ten_batches(self):
         for i in range(12):
