@@ -83,9 +83,15 @@ def ensure_page_source(svc: sqlite3.Connection, url: str, site_source_id: str, n
         return None
     sid = stable_id("src", url)
     with transaction(svc):
-        existing = svc.execute("SELECT source_id, retired_reason FROM pb_source WHERE canonical_url=?", (url,)).fetchone()
+        existing = svc.execute("SELECT source_id, retired_reason, deprioritized_reason, last_success_at FROM pb_source WHERE canonical_url=?", (url,)).fetchone()
         if existing is not None:
-            return existing["source_id"] if existing["retired_reason"] is None else None
+            if existing["retired_reason"] is not None:
+                return None
+            # A never-fetched source deprioritized as off-topic is not fetched again through a fresh link
+            # (expand_site/gap_fill re-find the same product pages every walk); it stays in the table.
+            if existing["deprioritized_reason"] is not None and existing["last_success_at"] is None:
+                return None
+            return existing["source_id"]
         if off_topic_page_url(url):        # HR/payroll/admissions/campus-calendar pages: never registered as a new page source
             return None
         site = site_row(svc, site_source_id)
@@ -115,7 +121,7 @@ def retire_junk_sources(svc: sqlite3.Connection) -> int:
 
 def deprioritize_off_topic_sources(svc: sqlite3.Connection) -> int:
     """Mark never-fetched institutional off-topic sources (off_topic_page_url: HR, payroll, admissions, campus calendars or
-    news on .edu hosts, relative URLs) with deprioritized_reason. Rows are kept; retries skip them and the never-fetched
+    news on .edu hosts, web-shop product/collection pages, relative URLs) with deprioritized_reason. Rows are kept; retries skip them and the never-fetched
     metric counts them separately. Same guard as retire_junk_sources: no ok fetch, fact, evidence or site registration."""
     with transaction(svc):
         rows = svc.execute(
