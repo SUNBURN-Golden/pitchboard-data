@@ -15,9 +15,10 @@ def _scoped(svc, target_ids):
 
 def source_fetch_counts(svc: sqlite3.Connection) -> dict:
     return dict(svc.execute(
-        "SELECT count(CASE WHEN s.retired_reason IS NULL AND s.last_success_at IS NULL "
+        "SELECT count(CASE WHEN s.retired_reason IS NULL AND s.deprioritized_reason IS NULL AND s.last_success_at IS NULL "
         "AND NOT EXISTS (SELECT 1 FROM pb_raw_ref r WHERE r.source_id=s.source_id AND r.outcome='ok') "
-        "THEN 1 END) AS sources_never_fetched, count(s.retired_reason) AS sources_retired_junk "
+        "THEN 1 END) AS sources_never_fetched, count(s.retired_reason) AS sources_retired_junk, "
+        "count(CASE WHEN s.retired_reason IS NULL THEN s.deprioritized_reason END) AS sources_deprioritized_off_topic "
         "FROM pb_source s"
     ).fetchone())
 
