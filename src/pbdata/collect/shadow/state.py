@@ -87,6 +87,25 @@ def read_history(root):
         raise Stop("corrupt_budget_state") from None
 
 
+def read_fetch_skips(root, max_files=60):
+    """Read the private per-URL fetch-block log (newest files first), read-only."""
+    path = no_symlinks(root)
+    folder = path / "data" / "shadow"
+    if not folder.is_dir() or folder.is_symlink():
+        return []
+    rows = []
+    for log in sorted(folder.glob("fetch_skips_*.jsonl"), reverse=True)[:max_files]:
+        with secure_open(log, "r", create=False) as f:
+            for line in f:
+                try:
+                    row = loads(line)
+                except Exception:
+                    continue
+                if isinstance(row, dict) and isinstance(row.get("url"), str) and isinstance(row.get("day"), str):
+                    rows.append(row)
+    return rows
+
+
 def comparison_output(root, extra_protected=()):
     """Validate the shadow root and return the report path.
 

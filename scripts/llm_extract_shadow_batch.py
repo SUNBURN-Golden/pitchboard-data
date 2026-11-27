@@ -28,7 +28,7 @@ def main():
     now = utcnow()
     data = (read_json(args.gaps_json, now, allow_stale=args.allow_stale and args.plan_only)
             if args.gaps_json else read_db(args.service_db, now))
-    history = []
+    history, fetch_skips = [], []
     if not args.plan_only:
         from pbdata.collect.shadow.state import State
         state = State(args.shadow_root)
@@ -36,12 +36,17 @@ def main():
             state.preflight(conn, now)
             from pbdata.collect.shadow.common import loads
             history = [loads(r[0]) for r in conn.execute("SELECT result FROM attempts WHERE result IS NOT NULL")]
+        from pbdata.collect.shadow.state import read_fetch_skips
+        fetch_skips = read_fetch_skips(args.shadow_root)
     elif args.shadow_root is not None:
         # Plan-only counts should reflect prior static completions (F3). This is
         # a read-only ledger snapshot: no lock, root initialization or writes.
         from pbdata.collect.shadow.state import read_history
         history = read_history(args.shadow_root)
-    selected = plan(data, limit=args.limit, history=history, config_hash=digest(dumps(config)) if config else None)
+        from pbdata.collect.shadow.state import read_fetch_skips
+        fetch_skips = read_fetch_skips(args.shadow_root)
+    selected = plan(data, limit=args.limit, history=history, config_hash=digest(dumps(config)) if config else None,
+                    fetch_skips=fetch_skips)
     result = {"selected": len(selected["targets"]), "reasons": selected["reasons"]}
     if not args.plan_only:
         from pbdata.collect.shadow.runner import ShadowRunner
